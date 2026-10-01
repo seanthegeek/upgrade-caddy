@@ -20,10 +20,18 @@ reproduced from them. `check` still works on those and says so.
 ## check
 
 ```
-upgrade-caddy check [--binary PATH] [--json] [--timeout 60s]
+upgrade-caddy check [--binary PATH] [--json] [--timeout 60s] [--include-major]
 ```
 
 Exit status: `0` everything is current, `2` updates are available, `1` error.
+
+Go keeps the major version in the module path (`.../caddy/v2`), so a plain
+latest-version query never sees a new major. `check` also probes the next
+major path for Caddy and every plugin and reports any it finds. A newer major
+is shown but does not affect the exit status unless `--include-major` is
+given, because `build` will never cross a major on its own: plugins built for
+one major do not compile against the next, and Caddy has not historically
+backported security fixes to a previous major.
 
 Latest versions come from the first proxy in `$GOPROXY`, defaulting to
 `proxy.golang.org`. Plugins pinned to an untagged commit are reported as

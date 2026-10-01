@@ -18,8 +18,15 @@ import (
 
 // Options controls a check run.
 type Options struct {
-	Binary string // explicit path, or "" to search PATH
-	Proxy  *goproxy.Client
+	Binary       string // explicit path, or "" to search PATH
+	Proxy        *goproxy.Client
+	IncludeMajor bool // count a newer major version as an available update
+}
+
+// Major describes a newer major version living at a different module path.
+type Major struct {
+	Package string `json:"package"`
+	Version string `json:"version"`
 }
 
 // Status of one versioned component.
@@ -30,30 +37,40 @@ type Status struct {
 	Latest    string `json:"latest,omitempty"`
 	Outdated  bool   `json:"outdated"`
 	Pseudo    bool   `json:"pseudo_version"` // installed is pinned to an untagged commit
+	Major     *Major `json:"major_available,omitempty"`
 	Note      string `json:"note,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
 
 // Report is the result of a check.
 type Report struct {
-	Binary   *caddybin.Info `json:"binary"`
-	Caddy    Status         `json:"caddy"`
-	Plugins  []Status       `json:"plugins"`
-	Services []systemd.Unit `json:"services"`
-	Warnings []string       `json:"warnings"`
+	Binary       *caddybin.Info `json:"binary"`
+	Caddy        Status         `json:"caddy"`
+	Plugins      []Status       `json:"plugins"`
+	Services     []systemd.Unit `json:"services"`
+	Warnings     []string       `json:"warnings"`
+	IncludeMajor bool           `json:"include_major"`
+
+	mu sync.Mutex // guards Warnings during concurrent lookups
 }
 
-// UpdatesAvailable reports whether Caddy or any plugin is behind.
+// UpdatesAvailable reports whether Caddy or any plugin is behind. A newer
+// major version counts only when IncludeMajor is set, because build never
+// crosses a major on its own.
 func (r *Report) UpdatesAvailable() bool {
-	if r.Caddy.Outdated {
-		return true
-	}
-	for _, p := range r.Plugins {
-		if p.Outdated {
+	all := append([]Status{r.Caddy}, r.Plugins...)
+	for _, s := range all {
+		if s.Outdated || (r.IncludeMajor && s.Major != nil) {
 			return true
 		}
 	}
 	return false
+}
+
+func (r *Report) warn(msg string) {
+	r.mu.Lock()
+	r.Warnings = append(r.Warnings, msg)
+	r.mu.Unlock()
 }
 
 // Run inspects the binary and looks up latest versions.
@@ -70,7 +87,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	if proxy == nil {
 		proxy = goproxy.New()
 	}
-	r := &Report{Binary: bin}
+	r := &Report{Binary: bin, IncludeMajor: opts.IncludeMajor}
 
 	if units, err := systemd.UnitsUsing(ctx, bin.ResolvedPath); err != nil {
 		r.Warnings = append(r.Warnings, "could not query systemd: "+err.Error())
@@ -111,6 +128,14 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		if s.Outdated && s.Pseudo && semver.IsPseudo(s.Latest) {
 			s.Note = "untagged module: newer commit on default branch"
 		}
+		path, minfo, ok, err := proxy.NewerMajor(ctx, s.Package)
+		if err != nil {
+			r.warn(fmt.Sprintf("%s: could not probe for newer major versions: %v", s.Name, err))
+			return
+		}
+		if ok {
+			s.Major = &Major{Package: path, Version: minfo.Version}
+		}
 	}
 	wg.Add(1)
 	go lookup(&r.Caddy)
@@ -130,6 +155,13 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		}
 	}
 	wg.Wait()
+
+	if r.Caddy.Major != nil {
+		r.Warnings = append(r.Warnings, fmt.Sprintf(
+			"Caddy %s exists at %s; Caddy has not historically backported security fixes to a previous major version, "+
+				"and plugins built for the current major will not compile against it, so 'build' will not cross majors on its own",
+			r.Caddy.Major.Version, r.Caddy.Major.Package))
+	}
 	return r, nil
 }
 
@@ -200,6 +232,9 @@ func writeRow(w io.Writer, s Status) {
 	}
 	if s.Note != "" {
 		status += " (" + s.Note + ")"
+	}
+	if s.Major != nil {
+		status += " (major " + s.Major.Version + " at " + s.Major.Package + ")"
 	}
 	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Package, short(s.Installed), short(s.Latest), status)
 }
