@@ -444,12 +444,14 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+	_, copyErr := io.Copy(out, in)
+	// Close can report a write failure of its own, so its error matters on
+	// both paths, not just the successful one.
+	if err := errors.Join(copyErr, out.Close()); err != nil {
 		os.Remove(dst)
 		return err
 	}
-	return out.Close()
+	return nil
 }
 
 // validate runs `<new binary> validate` against the plan's config.
