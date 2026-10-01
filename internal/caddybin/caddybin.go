@@ -209,9 +209,15 @@ func ParseListModules(out string) (standard int, nonstandard, unknown []Plugin) 
 func parseModuleLine(line string) Plugin {
 	var p Plugin
 	line = strings.TrimSpace(line)
+	// Caddy appends " [error]" after the fields; a line that is only an
+	// error (no module ID) is not something Caddy prints, but is handled
+	// rather than mistaken for a module called "[error".
 	if i := strings.Index(line, " ["); i >= 0 {
 		p.Error = strings.TrimSuffix(strings.TrimSpace(line[i+2:]), "]")
 		line = line[:i]
+	} else if strings.HasPrefix(line, "[") {
+		p.Error = strings.TrimSuffix(line[1:], "]")
+		line = ""
 	}
 	f := strings.Fields(line)
 	if len(f) == 0 {

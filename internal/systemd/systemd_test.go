@@ -93,3 +93,9 @@ func TestConfigArgs(t *testing.T) {
 		t.Errorf("short flags: %q %q", config, adapter)
 	}
 }
+
+func TestExecArgsNoArgv(t *testing.T) {
+	if got := execArgs("garbage"); got != nil {
+		t.Errorf("no argv: %v", got)
+	}
+}

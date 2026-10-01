@@ -126,17 +126,22 @@ func TestSwapFirstInstall(t *testing.T) {
 
 // fakeCtl records calls and answers IsActive from a script.
 type fakeCtl struct {
-	restarts []string
-	active   []bool
-	pid      int
+	restarts   []string
+	active     []bool
+	pid        int
+	restartErr error
+	activeErr  error
 }
 
 func (f *fakeCtl) Restart(_ context.Context, unit string) error {
 	f.restarts = append(f.restarts, unit)
-	return nil
+	return f.restartErr
 }
 
 func (f *fakeCtl) IsActive(_ context.Context, _ string) (bool, error) {
+	if f.activeErr != nil {
+		return false, f.activeErr
+	}
 	if len(f.active) == 0 {
 		return false, nil
 	}
@@ -252,5 +257,58 @@ func TestRefuseSystemPackageMessage(t *testing.T) {
 	err := refuseSystemPackage("/usr/bin/caddy", nil)
 	if !strings.Contains(err.Error(), "--fresh --target /usr/bin/caddy") {
 		t.Errorf("distro message: %v", err)
+	}
+}
+
+func TestRestartAndVerifyErrors(t *testing.T) {
+	settleDelay = 10 * time.Millisecond
+	t.Cleanup(func() { settleDelay = time.Second })
+	ctx := context.Background()
+	boom := errors.New("boom")
+	if err := restartAndVerify(ctx, &fakeCtl{restartErr: boom}, "x.service", "/x", time.Second); !errors.Is(err, boom) {
+		t.Errorf("restart error should propagate: %v", err)
+	}
+	if err := restartAndVerify(ctx, &fakeCtl{activeErr: boom}, "x.service", "/x", time.Second); !errors.Is(err, boom) {
+		t.Errorf("is-active error should propagate: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := restartAndVerify(cancelled, &fakeCtl{active: []bool{false}}, "x.service", "/x", time.Second); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled context while waiting: %v", err)
+	}
+	// A PID whose /proc entry cannot be read: being active is enough.
+	if err := restartAndVerify(ctx, &fakeCtl{active: []bool{true, true}, pid: 2147483000}, "x.service", "/x", time.Second); err != nil {
+		t.Errorf("unreadable /proc entry should not fail: %v", err)
+	}
+}
+
+func TestStageAndCopyErrors(t *testing.T) {
+	dst := t.TempDir()
+	if _, _, err := stage(filepath.Join(dst, "missing"), filepath.Join(dst, "caddy")); err == nil || !strings.Contains(err.Error(), "staging") {
+		t.Errorf("missing source: %v", err)
+	}
+	src := filepath.Join(dst, "src")
+	os.WriteFile(src, []byte("x"), 0o644)
+	if err := copyFile(src, filepath.Join(dst, "no", "such", "dir", "out"), 0o644); err == nil {
+		t.Error("unwritable destination should fail")
+	}
+	if err := copyFile(filepath.Join(dst, "nope"), filepath.Join(dst, "out"), 0o644); err == nil {
+		t.Error("unreadable source should fail")
+	}
+}
+
+func TestSwapErrors(t *testing.T) {
+	dir := t.TempDir()
+	// Target exists but the new file is missing: nothing to rename.
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("old"), 0o755)
+	if _, err := swap(target, filepath.Join(dir, "missing"), ""); err == nil {
+		t.Error("missing new binary should fail")
+	}
+	if _, err := os.Stat(target + ".previous"); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a failed rename must not leave .previous behind")
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old" {
+		t.Error("target must be untouched after a failed swap")
 	}
 }

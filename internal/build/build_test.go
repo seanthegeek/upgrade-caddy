@@ -266,3 +266,84 @@ func TestVerify(t *testing.T) {
 		t.Errorf("non-semver version should only check presence: %v", err)
 	}
 }
+
+func TestResolveErrorBranches(t *testing.T) {
+	// An empty --with path.
+	if _, err := resolve(t, installed(), Options{With: []string{"@v1.0.0"}}); err == nil || !strings.Contains(err.Error(), "empty module path") {
+		t.Errorf("empty --with: %v", err)
+	}
+	// A plugin Caddy reported an error for cannot be pinned.
+	src := installed()
+	src.Plugins[0].Error = "module registered twice"
+	if _, err := resolve(t, src, Options{}); err == nil || !strings.Contains(err.Error(), "reported an error") {
+		t.Errorf("plugin error: %v", err)
+	}
+	// A plugin without module info cannot be pinned.
+	src = installed()
+	src.Plugins[0].Version = ""
+	if _, err := resolve(t, src, Options{}); err == nil || !strings.Contains(err.Error(), "cannot pin") {
+		t.Errorf("plugin without version: %v", err)
+	}
+	// Latest Caddy unknown to the proxy.
+	opts := Options{Proxy: fakeProxy(t, map[string]string{}), Output: filepath.Join(t.TempDir(), "caddy")}
+	if _, err := Resolve(context.Background(), installed(), opts); err == nil || !strings.Contains(err.Error(), "looking up latest Caddy") {
+		t.Errorf("caddy lookup failure: %v", err)
+	}
+	// --upgrade of a plugin the proxy does not know.
+	src = installed()
+	src.Plugins = append(src.Plugins, caddybin.Plugin{ModuleID: "x", Package: "github.com/example/unknown", Version: "v1.0.0"})
+	if _, err := resolve(t, src, Options{Upgrade: []string{"x"}}); err == nil || !strings.Contains(err.Error(), "--upgrade github.com/example/unknown") {
+		t.Errorf("upgrade lookup failure: %v", err)
+	}
+}
+
+func TestResolveOneGoModuleSeveralCaddyModules(t *testing.T) {
+	// A plugin like caddy-l4 registers many Caddy module IDs from one Go
+	// module; list-modules prints one line each, and the build must pin the
+	// Go module once.
+	src := installed()
+	src.Plugins = []caddybin.Plugin{
+		{ModuleID: "layer4", Package: "github.com/example/other", Version: "v0.5.0"},
+		{ModuleID: "layer4.handlers.proxy", Package: "github.com/example/other", Version: "v0.5.0"},
+		{ModuleID: "layer4.matchers.tls", Package: "github.com/example/other", Version: "v0.5.0"},
+	}
+	p, err := resolve(t, src, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Plugins) != 1 || p.Plugins[0].ModuleID != "layer4" {
+		t.Errorf("want one pinned Go module keeping the first module ID, got %+v", p.Plugins)
+	}
+}
+
+func TestResolveDefaultOutputAndNotes(t *testing.T) {
+	p, err := Resolve(context.Background(), nil, Options{Proxy: fakeProxy(t, versions)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(p.Output) != "caddy" {
+		t.Errorf("default output should be ./caddy, got %s", p.Output)
+	}
+	// Already at latest within its major, with a newer major: both notes.
+	src := installed()
+	src.Plugins = []caddybin.Plugin{{ModuleID: "x", Package: "github.com/example/plugin", Version: "v1.3.0"}}
+	p, err = resolve(t, src, Options{Upgrade: []string{"x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl := plugin(p, "github.com/example/plugin")
+	if pl.Source != Pinned || !strings.Contains(pl.Note, "already at latest; newer major v2.0.1") {
+		t.Errorf("both notes expected: %+v", pl)
+	}
+}
+
+func TestVerifyMoreBranches(t *testing.T) {
+	p := &Plan{CaddyVersion: "v2.11.6", Plugins: []Plugin{{Package: "github.com/caddy-dns/cloudflare", Version: "v0.2.4"}}}
+	if err := p.verify(&caddybin.Info{}); err == nil || !strings.Contains(err.Error(), "no Go module information") {
+		t.Errorf("no module info: %v", err)
+	}
+	wrongPlugin := &caddybin.Info{HasModuleInfo: true, MainVersion: "v2.11.6", Plugins: []caddybin.Plugin{{Package: "github.com/caddy-dns/cloudflare", Version: "v0.2.3"}}}
+	if err := p.verify(wrongPlugin); err == nil || !strings.Contains(err.Error(), "wanted v0.2.4") {
+		t.Errorf("plugin version mismatch: %v", err)
+	}
+}

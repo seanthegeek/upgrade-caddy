@@ -101,3 +101,12 @@ func TestIsCaddyModule(t *testing.T) {
 		}
 	}
 }
+
+func TestParseModuleLineEdgeCases(t *testing.T) {
+	if p := parseModuleLine(" [only an error]"); p.ModuleID != "" || p.Error != "only an error" {
+		t.Errorf("error-only line: %+v", p)
+	}
+	if p := parseModuleLine("a.b v1.0.0+incompatible github.com/x/y"); p.Version != "v1.0.0+incompatible" || p.Package != "github.com/x/y" {
+		t.Errorf("incompatible version: %+v", p)
+	}
+}

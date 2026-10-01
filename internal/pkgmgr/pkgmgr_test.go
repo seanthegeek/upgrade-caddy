@@ -59,3 +59,16 @@ func TestParseApkOwner(t *testing.T) {
 		t.Error("unowned file should give nil")
 	}
 }
+
+func TestParseOwnerEdgeCases(t *testing.T) {
+	if parsePacmanOwner("/usr/bin/caddy is owned by ") != nil {
+		t.Error("pacman with no package name should give nil")
+	}
+	if parseApkOwner("/usr/bin/caddy is owned by ") != nil {
+		t.Error("apk with no package name should give nil")
+	}
+	// No "-digit" boundary: the whole string is the package, no version.
+	if o := parseApkOwner("/usr/bin/caddy is owned by caddy"); o == nil || o.Package != "caddy" || o.Version != "" {
+		t.Errorf("apk without version: %+v", o)
+	}
+}
