@@ -42,10 +42,19 @@ fixes to a previous major: staying on the old one means going unpatched.
 major do not compile against the next, so a major upgrade is a deliberate
 step with explicit flags.
 
-Latest versions come from the first proxy in `$GOPROXY`, defaulting to
-`proxy.golang.org`. Plugins pinned to an untagged commit are reported as
-pseudo-versions and flagged as "newer commit on default branch" rather than
-as a release.
+Latest versions come from the Go module proxy, following the same
+`GOPROXY` rules as the `go` command: proxies are tried in order, a comma
+falls through to the next source after a 404 or 410, a pipe after any
+error. `GOPROXY=off` and `GOPROXY=direct` mean nothing can be looked up and
+the component is reported as "not checked", as is any module matching
+`GONOPROXY` or `GOPRIVATE`, which is never sent to a proxy. A module a proxy
+answers 404 for is reported as not found even when `direct` follows, since
+this tool does not consult version control. Resolution uses the proxy's
+`@latest` endpoint, which the protocol marks optional but every mainstream
+proxy implements; retractions are not applied.
+
+Plugins pinned to an untagged commit are reported as pseudo-versions and
+flagged as "newer commit on default branch" rather than as a release.
 
 ## build
 

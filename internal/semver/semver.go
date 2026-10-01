@@ -1,21 +1,17 @@
-// Package semver implements the small subset of semantic version handling
-// needed to compare Go module versions, including pseudo-versions.
+// Package semver is a thin layer over golang.org/x/mod, which is the Go
+// team's own implementation of module version rules and what the go
+// command itself uses. The helpers here only add the conveniences this
+// tool needs: tolerating a missing "v" prefix and returning the major as a
+// number.
 package semver
 
 import (
-	"regexp"
 	"strconv"
 	"strings"
+
+	"golang.org/x/mod/module"
+	xsemver "golang.org/x/mod/semver"
 )
-
-var pseudoRe = regexp.MustCompile(`(^|[.-])\d{14}-[0-9a-f]{12}$`)
-
-// IsPseudo reports whether v looks like a Go pseudo-version
-// (e.g. v0.0.0-20240814120000-0123456789ab), which means the module
-// was pinned to an untagged commit.
-func IsPseudo(v string) bool {
-	return pseudoRe.MatchString(strings.TrimSuffix(v, "+incompatible"))
-}
 
 // Canonical returns v with a leading "v" and no surrounding whitespace.
 func Canonical(v string) string {
@@ -29,104 +25,38 @@ func Canonical(v string) string {
 	return v
 }
 
-type parsed struct {
-	nums [3]int
-	pre  string
-	ok   bool
+// IsValid reports whether v is a valid semantic version once a "v" prefix
+// is supplied.
+func IsValid(v string) bool {
+	return xsemver.IsValid(Canonical(v))
 }
 
-func parse(v string) parsed {
-	v = strings.TrimPrefix(Canonical(v), "v")
-	v = strings.TrimSuffix(v, "+incompatible")
-	if i := strings.IndexByte(v, '+'); i >= 0 {
-		v = v[:i]
-	}
-	var p parsed
-	if i := strings.IndexByte(v, '-'); i >= 0 {
-		p.pre = v[i+1:]
-		v = v[:i]
-	}
-	parts := strings.Split(v, ".")
-	if len(parts) == 0 || len(parts) > 3 {
-		return p
-	}
-	for i, s := range parts {
-		n, err := strconv.Atoi(s)
-		if err != nil || n < 0 {
-			return p
-		}
-		p.nums[i] = n
-	}
-	p.ok = true
-	return p
+// IsPseudo reports whether v is a Go pseudo-version (e.g.
+// v0.0.0-20240814120000-0123456789ab), which means the module was pinned
+// to an untagged commit. Build metadata such as +incompatible or Go 1.24's
+// +dirty does not affect the answer.
+func IsPseudo(v string) bool {
+	return module.IsPseudoVersion(Canonical(v))
 }
 
 // Compare returns -1 if a < b, 0 if a == b, +1 if a > b, following
-// semver precedence rules. Unparseable versions sort before parseable ones
-// and are compared as plain strings against each other.
+// semantic version precedence as the go command applies it. Build metadata
+// is ignored. An invalid version sorts before any valid one, and invalid
+// versions compare equal to each other.
 func Compare(a, b string) int {
-	pa, pb := parse(a), parse(b)
-	switch {
-	case !pa.ok && !pb.ok:
-		return strings.Compare(a, b)
-	case !pa.ok:
-		return -1
-	case !pb.ok:
-		return 1
-	}
-	for i := 0; i < 3; i++ {
-		if pa.nums[i] != pb.nums[i] {
-			if pa.nums[i] < pb.nums[i] {
-				return -1
-			}
-			return 1
-		}
-	}
-	return comparePre(pa.pre, pb.pre)
+	return xsemver.Compare(Canonical(a), Canonical(b))
 }
 
-func comparePre(a, b string) int {
-	switch {
-	case a == b:
-		return 0
-	case a == "":
-		return 1 // release > prerelease
-	case b == "":
-		return -1
-	}
-	as, bs := strings.Split(a, "."), strings.Split(b, ".")
-	for i := 0; i < len(as) && i < len(bs); i++ {
-		if as[i] == bs[i] {
-			continue
-		}
-		an, aerr := strconv.Atoi(as[i])
-		bn, berr := strconv.Atoi(bs[i])
-		switch {
-		case aerr == nil && berr == nil:
-			if an < bn {
-				return -1
-			}
-			return 1
-		case aerr == nil:
-			return -1 // numeric < alphanumeric
-		case berr == nil:
-			return 1
-		default:
-			return strings.Compare(as[i], bs[i])
-		}
-	}
-	if len(as) < len(bs) {
-		return -1
-	}
-	return 1
-}
-
-// Major returns the major version number of v, or -1 when v is not a
-// parseable semantic version (a branch name or commit hash, for example).
+// Major returns the major version number of v, or -1 when v is not a valid
+// semantic version (a branch name or commit hash, for example).
 func Major(v string) int {
-	p := parse(v)
-	if !p.ok {
+	m := xsemver.Major(Canonical(v))
+	if m == "" {
 		return -1
 	}
-	return p.nums[0]
+	n, err := strconv.Atoi(m[1:])
+	if err != nil {
+		return -1
+	}
+	return n
 }

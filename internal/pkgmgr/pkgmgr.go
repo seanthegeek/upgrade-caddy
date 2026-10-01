@@ -63,18 +63,24 @@ func dpkg(ctx context.Context, path string) *Owner {
 	return &Owner{Manager: "dpkg", Package: pkg, Version: ver}
 }
 
-// parseDpkgSearch extracts the package name from `dpkg -S` output such as
-// "caddy: /usr/bin/caddy" or "caddy:amd64: /usr/bin/caddy". Diversion
-// lines ("diversion by caddy from: /usr/bin/caddy") are skipped, since the
-// file is then not the package's own copy.
+// parseDpkgSearch extracts the first package name from `dpkg -S` output.
+// dpkg-query(1) documents the forms "pkgname1, pkgname2: pathname",
+// "pkgname:arch: pathname", and the diversion lines "diversion by pkgname
+// from: path", "diversion by pkgname to: path" and "local diversion ...",
+// which are skipped since the file is then not the package's own copy.
 func parseDpkgSearch(out string) string {
 	for _, line := range strings.Split(out, "\n") {
-		pkg, rest, ok := strings.Cut(line, ": ")
-		if !ok || !strings.HasPrefix(rest, "/") || strings.ContainsAny(pkg, " \t") {
+		if strings.HasPrefix(line, "diversion by ") || strings.HasPrefix(line, "local diversion") {
 			continue
 		}
-		pkg, _, _ = strings.Cut(pkg, ":") // drop ":amd64"
-		if pkg != "" {
+		pkgs, rest, ok := strings.Cut(line, ": ")
+		if !ok || !strings.HasPrefix(rest, "/") {
+			continue
+		}
+		pkg, _, _ := strings.Cut(pkgs, ", ") // first of several owners
+		pkg, _, _ = strings.Cut(pkg, ":")    // drop ":amd64"
+		pkg = strings.TrimSpace(pkg)
+		if pkg != "" && !strings.ContainsAny(pkg, " \t") {
 			return pkg
 		}
 	}
@@ -82,7 +88,9 @@ func parseDpkgSearch(out string) string {
 }
 
 func rpm(ctx context.Context, path string) *Owner {
-	out, ok := run(ctx, "rpm", "-qf", "--qf", "%{NAME} %{VERSION}-%{RELEASE}", path)
+	// rpm prints the format once per owning package, so end it with a
+	// newline and take the first line.
+	out, ok := run(ctx, "rpm", "-qf", "--qf", "%{NAME} %{VERSION}-%{RELEASE}\n", path)
 	if !ok {
 		return nil
 	}
@@ -90,9 +98,11 @@ func rpm(ctx context.Context, path string) *Owner {
 }
 
 // parseRpmQuery parses "caddy 2.8.4-1.fc40" as produced by the query format
-// used in rpm above.
+// used in rpm above, taking only the first line when several packages own
+// the file.
 func parseRpmQuery(out string) *Owner {
-	name, ver, _ := strings.Cut(strings.TrimSpace(out), " ")
+	first, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	name, ver, _ := strings.Cut(strings.TrimSpace(first), " ")
 	if name == "" {
 		return nil
 	}

@@ -41,6 +41,7 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           awk -v v="$v" '
             /^## \[/ { if (found) exit; found = ($0 ~ "^## \\[" v "\\]") ; next }
+            /^\[[^]]+\]: / { if (found) exit; next }
             found { print }
           ' CHANGELOG.md > notes.md
           if [ ! -s notes.md ]; then

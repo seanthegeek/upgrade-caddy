@@ -1,4 +1,5 @@
-// Package goproxy queries a Go module proxy for the latest version of a module.
+// Package goproxy queries Go module proxies for the latest version of a
+// module, following the go command's GOPROXY rules.
 package goproxy
 
 import (
@@ -12,51 +13,166 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/module"
 )
 
-// ErrNotFound is returned when the proxy has no such module. Proxies answer
-// 404 or 410 for a module path that does not exist.
-var ErrNotFound = errors.New("module not found")
+// Errors a lookup can end with. ErrNotFound means every proxy consulted
+// answered 404 or 410 for the module path, which the proxy protocol defines
+// as "not available on this proxy, but it may be found elsewhere". The
+// other three mean the module could not be looked up at all, and callers
+// report them as "not checked" rather than as failures.
+var (
+	ErrNotFound = errors.New("module not found on the proxy")
+	ErrOff      = errors.New("version lookups are disabled by GOPROXY=off")
+	ErrDirect   = errors.New("GOPROXY=direct names no module proxy to query")
+	ErrPrivate  = errors.New("module matches GONOPROXY or GOPRIVATE and is not sent to a proxy")
+)
 
-const defaultProxy = "https://proxy.golang.org"
+// NotChecked reports whether err is one of the "could not look up" errors,
+// with a short reason for display.
+func NotChecked(err error) (reason string, ok bool) {
+	switch {
+	case errors.Is(err, ErrOff):
+		return "GOPROXY=off", true
+	case errors.Is(err, ErrDirect):
+		return "GOPROXY=direct", true
+	case errors.Is(err, ErrPrivate):
+		return "matches GONOPROXY/GOPRIVATE", true
+	}
+	return "", false
+}
 
-// Client talks to a single module proxy.
+// Source is one entry of a GOPROXY list: a proxy URL, or the keyword "off"
+// or "direct". FallbackOnAnyError records that a "|" followed the entry,
+// which the go command defines as "fall back to the next source after any
+// error"; a "," means fall back only after a 404 or 410.
+type Source struct {
+	URL                string
+	FallbackOnAnyError bool
+}
+
+const defaultGOPROXY = "https://proxy.golang.org,direct"
+
+// Client resolves versions through a GOPROXY list.
 type Client struct {
-	BaseURL string
+	Sources []Source
+	NoProxy string // GONOPROXY (or GOPRIVATE when GONOPROXY is unset) glob list
 	HTTP    *http.Client
 }
 
-// New returns a client for the first usable proxy in $GOPROXY, falling back
-// to proxy.golang.org. "direct" and "off" entries are skipped.
+// New builds a client from GOPROXY, GONOPROXY and GOPRIVATE in the
+// environment, with the go command's defaults when they are unset.
 func New() *Client {
-	base := defaultProxy
-	for _, p := range strings.FieldsFunc(os.Getenv("GOPROXY"), func(r rune) bool { return r == ',' || r == '|' }) {
-		p = strings.TrimSpace(p)
-		if p == "" || p == "direct" || p == "off" {
-			continue
-		}
-		base = strings.TrimRight(p, "/")
-		break
-	}
-	return &Client{BaseURL: base, HTTP: &http.Client{Timeout: 30 * time.Second}}
+	return FromEnv(os.Getenv("GOPROXY"), os.Getenv("GONOPROXY"), os.Getenv("GOPRIVATE"))
 }
 
-// Info is the proxy's answer for @latest.
+// FromEnv builds a client from explicit GOPROXY, GONOPROXY and GOPRIVATE
+// values. GONOPROXY defaults to GOPRIVATE, as it does for the go command.
+func FromEnv(goproxy, gonoproxy, goprivate string) *Client {
+	noProxy := gonoproxy
+	if noProxy == "" {
+		noProxy = goprivate
+	}
+	return &Client{
+		Sources: ParseGOPROXY(goproxy),
+		NoProxy: noProxy,
+		HTTP:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// ParseGOPROXY splits a GOPROXY value into sources, keeping track of
+// whether each is followed by "," or "|". An empty value means the go
+// command's default, "https://proxy.golang.org,direct".
+func ParseGOPROXY(s string) []Source {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		s = defaultGOPROXY
+	}
+	var sources []Source
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] != ',' && s[i] != '|' {
+			continue
+		}
+		entry := strings.TrimSpace(s[start:i])
+		if entry != "" {
+			if entry != "off" && entry != "direct" {
+				entry = strings.TrimRight(entry, "/")
+			}
+			sources = append(sources, Source{URL: entry, FallbackOnAnyError: i < len(s) && s[i] == '|'})
+		}
+		start = i + 1
+	}
+	return sources
+}
+
+// Info is a proxy's answer for @latest.
 type Info struct {
 	Version string    `json:"Version"`
 	Time    time.Time `json:"Time"`
 }
 
-// Latest returns the latest version of modPath known to the proxy. For
-// untagged modules the proxy answers with a pseudo-version of the default
-// branch head.
+// Latest returns the latest version of modPath, walking the GOPROXY list
+// the way the go command does: each proxy is asked in turn, a 404 or 410
+// moves on to the next source, and any other error moves on only when the
+// entry was followed by "|". Reaching "off" or "direct" ends the walk:
+// "direct" after a proxy's 404 is reported as ErrNotFound, since this tool
+// does not consult version control; "direct" or "off" first is ErrDirect or
+// ErrOff. Modules matching GONOPROXY/GOPRIVATE are never sent to a proxy.
+//
+// Resolution relies on the proxy's @latest endpoint, which the protocol
+// marks optional but every mainstream proxy implements. Retractions are not
+// applied.
 func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
-	url := c.BaseURL + "/" + EscapePath(modPath) + "/@latest"
+	if c.NoProxy != "" && module.MatchPrefixPatterns(c.NoProxy, modPath) {
+		return Info{}, fmt.Errorf("%s: %w", modPath, ErrPrivate)
+	}
+	escaped, err := module.EscapePath(modPath)
+	if err != nil {
+		return Info{}, fmt.Errorf("%s: %w", modPath, err)
+	}
+	sources := c.Sources
+	if len(sources) == 0 {
+		sources = ParseGOPROXY("")
+	}
+	var lastErr error
+	for i, s := range sources {
+		switch s.URL {
+		case "off":
+			return Info{}, fmt.Errorf("%s: %w", modPath, ErrOff)
+		case "direct":
+			if lastErr != nil {
+				return Info{}, lastErr // a proxy said not found; direct is not consulted
+			}
+			return Info{}, fmt.Errorf("%s: %w", modPath, ErrDirect)
+		}
+		info, err := c.fetch(ctx, s.URL+"/"+escaped+"/@latest", modPath)
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+		if i == len(sources)-1 {
+			break
+		}
+		if errors.Is(err, ErrNotFound) || s.FallbackOnAnyError {
+			continue
+		}
+		return Info{}, err
+	}
+	return Info{}, lastErr
+}
+
+func (c *Client) fetch(ctx context.Context, url, modPath string) (Info, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return Info{}, err
 	}
-	resp, err := c.HTTP.Do(req)
+	httpc := c.HTTP
+	if httpc == nil {
+		httpc = http.DefaultClient
+	}
+	resp, err := httpc.Do(req)
 	if err != nil {
 		return Info{}, err
 	}
@@ -79,18 +195,14 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 }
 
 // EscapePath applies the module proxy's case encoding: every upper-case
-// letter becomes "!" followed by its lower-case form.
+// letter becomes "!" followed by its lower-case form. An invalid module
+// path is returned unchanged.
 func EscapePath(p string) string {
-	var b strings.Builder
-	for _, r := range p {
-		if 'A' <= r && r <= 'Z' {
-			b.WriteByte('!')
-			b.WriteRune(r + ('a' - 'A'))
-		} else {
-			b.WriteRune(r)
-		}
+	escaped, err := module.EscapePath(p)
+	if err != nil {
+		return p
 	}
-	return b.String()
+	return escaped
 }
 
 // maxMajorProbe bounds how many major paths above the current one
@@ -110,15 +222,11 @@ type MajorVersion struct {
 }
 
 // NewerMajors lists every newer major version of modPath, lowest first.
-// Go puts the major version in the module path (".../v3"), so a plain
-// @latest query never sees one. This probes successive major paths above
-// the module's own, stopping after missTolerance consecutive paths the
-// proxy does not have. Modules that cannot use the /vN scheme, such as
-// gopkg.in paths, are never probed.
+// Go puts the major version in the module path (".../v3", or ".v3" for
+// gopkg.in), so a plain @latest query never sees one. This probes
+// successive major paths above the module's own, stopping after
+// missTolerance consecutive paths the proxy does not have.
 func (c *Client) NewerMajors(ctx context.Context, modPath string) ([]MajorVersion, error) {
-	if strings.HasPrefix(modPath, "gopkg.in/") {
-		return nil, nil
-	}
 	base, cur := SplitMajor(modPath)
 	var found []MajorVersion
 	misses := 0
@@ -138,27 +246,29 @@ func (c *Client) NewerMajors(ctx context.Context, modPath string) ([]MajorVersio
 	return found, nil
 }
 
-// SplitMajor separates a module path from its major-version suffix.
-// "example.com/m/v3" gives ("example.com/m", 3); a path with no suffix is
-// major 1 (which also covers v0 modules, since both live on the bare path).
+// SplitMajor separates a module path from its major-version suffix using
+// the go command's rules: "example.com/m/v3" gives ("example.com/m", 3),
+// "gopkg.in/yaml.v3" gives ("gopkg.in/yaml", 3), and a path with no suffix
+// is major 1 (which also covers v0 modules, since both live on the bare
+// path). "/v1", "/v0" and suffixes with leading zeros are not suffixes.
 func SplitMajor(modPath string) (base string, major int) {
-	i := strings.LastIndexByte(modPath, '/')
-	if i < 0 {
+	prefix, pathMajor, ok := module.SplitPathVersion(modPath)
+	if !ok || pathMajor == "" {
 		return modPath, 1
 	}
-	suffix := modPath[i+1:]
-	if len(suffix) < 2 || suffix[0] != 'v' {
-		return modPath, 1
+	n, err := strconv.Atoi(pathMajor[2:]) // after "/v" or ".v"
+	if err != nil || n < 1 {
+		return prefix, 1
 	}
-	n, err := strconv.Atoi(suffix[1:])
-	if err != nil || n < 2 {
-		return modPath, 1
-	}
-	return modPath[:i], n
+	return prefix, n
 }
 
-// MajorPath is the inverse of SplitMajor.
+// MajorPath is the inverse of SplitMajor. gopkg.in paths always carry a
+// dot suffix, even at v1.
 func MajorPath(base string, major int) string {
+	if strings.HasPrefix(base, "gopkg.in/") {
+		return base + ".v" + strconv.Itoa(major)
+	}
 	if major < 2 {
 		return base
 	}

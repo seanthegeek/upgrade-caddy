@@ -117,8 +117,14 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    checksums. The binary is only executed to map Caddy module IDs to Go
    module paths, which build info does not contain.
 9. **Latest versions come from the Go module proxy, not the GitHub API.**
-   One mechanism covers Caddy and every plugin, it needs no credentials, and
-   `GOPROXY` is honoured so air-gapped and corporate setups work.
+   One mechanism covers Caddy and every plugin and it needs no credentials.
+   `GOPROXY`, `GONOPROXY` and `GOPRIVATE` are followed the way the `go`
+   command follows them: ordered sources, comma versus pipe fallback, `off`
+   and `direct` meaning "cannot look up" (reported as not checked, never
+   silently redirected to the public proxy), and private patterns never sent
+   to a proxy. A 404 from a proxy is final; `direct` is not consulted.
+   Lookups use the proxy's optional `@latest` endpoint and do not apply
+   retractions; both are documented limitations, not bugs to fix quietly.
 10. **Exit codes are a contract.** `0` current, `1` error, `2` updates
     available. Scripts and cron jobs rely on them. Report output goes to
     stdout and errors to stderr, and `--json` output must stay parseable.
@@ -207,12 +213,19 @@ every collaborator picks them up the same way.
 
 - Formatter: `gofmt`. Static checks: `go vet`. Both must be clean. No
   third-party linters are required.
-- Standard library only unless a dependency earns its place. The one
-  exception is the xcaddy library (`github.com/caddyserver/xcaddy`), which
-  `build` uses. Read its `builder.go` and `environment.go` in the module
-  cache before changing how it is driven; its `OnStep` callback and the way
-  it derives the Caddy module path from the version's major are the parts
-  this tool depends on.
+- Standard library only unless a dependency earns its place. Two do:
+  - the xcaddy library (`github.com/caddyserver/xcaddy`), which `build`
+    uses. Read its `builder.go` and `environment.go` in the module cache
+    before changing how it is driven; its `OnStep` callback and the way it
+    derives the Caddy module path from the version's major are the parts
+    this tool depends on;
+  - `golang.org/x/mod`, the Go team's own implementation of module version
+    rules, used for version comparison, pseudo-version detection,
+    major-version path suffixes (including the `gopkg.in` dot form), proxy
+    path escaping and `GONOPROXY` matching. `internal/semver` and
+    `internal/goproxy` are thin layers over it; do not reimplement any of
+    those rules by hand, a review found four edge-case deviations in the
+    previous hand-rolled versions.
 - `go.mod` declares Go 1.22 and the local toolchain is 1.22 with
   `GOTOOLCHAIN=auto`. Building Caddy itself needs whatever Caddy's own
   `go.mod` asks for (1.26 at the time of writing); xcaddy shells out to `go`
@@ -294,10 +307,13 @@ way to exercise check's plugin table against real data.
   archives for linux/amd64, linux/arm64, linux/armv7, darwin/amd64,
   darwin/arm64 and freebsd/amd64 plus `checksums.txt`. Windows is not a
   target: `install` uses Unix-only calls and there is no systemd.
-- To release: set `version` in `main.go`, turn the `[Unreleased]` section of
-  `CHANGELOG.md` into `[X.Y.Z] - YYYY-MM-DD`, commit, tag `vX.Y.Z`, push the
-  tag. The workflow refuses if the tag and `main.go` disagree or the
-  changelog has no section for the version.
+- To release: set `version` in `main.go`; in `CHANGELOG.md` turn the
+  `[Unreleased]` section into `[X.Y.Z] - YYYY-MM-DD`, add an empty
+  `[Unreleased]` above it, and update the link definitions at the bottom
+  (`[Unreleased]: .../compare/vX.Y.Z...HEAD` and
+  `[X.Y.Z]: .../releases/tag/vX.Y.Z`); commit, tag `vX.Y.Z`, push the tag.
+  The workflow refuses if the tag and `main.go` disagree or the changelog
+  has no section for the version.
 - Verify `.goreleaser.yaml` changes locally with
   `goreleaser release --snapshot --clean` (output in `dist/`, ignored).
 - `go install github.com/seanthegeek/upgrade-caddy@<tag>` must keep working,

@@ -14,7 +14,7 @@ import (
 // Unit is a systemd service that runs the binary of interest.
 type Unit struct {
 	Name             string   `json:"name"`
-	ExecStart        string   `json:"exec_start"`
+	ExecStart        string   `json:"exec_start"`     // every ExecStart= line, newline-joined
 	Args             []string `json:"args,omitempty"` // argv of the first ExecStart command
 	WorkingDirectory string   `json:"working_directory,omitempty"`
 	MainPID          int      `json:"main_pid,omitempty"`
@@ -86,8 +86,10 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 }
 
 // parseShow turns `systemctl show` output, one "Key=Value" block per unit
-// separated by blank lines, into Units. Units without an ExecStart are
-// dropped.
+// separated by blank lines, into Units. A unit with several ExecStart
+// commands (only Type=oneshot allows that) prints one ExecStart= line per
+// command; they are all kept, newline-joined, and Args comes from the
+// first. Units without an ExecStart are dropped.
 func parseShow(out string) []Unit {
 	var units []Unit
 	for _, block := range strings.Split(out, "\n\n") {
@@ -101,8 +103,12 @@ func parseShow(out string) []Unit {
 			case "Id":
 				u.Name = v
 			case "ExecStart":
-				u.ExecStart = v
-				u.Args = execArgs(v)
+				if u.ExecStart == "" {
+					u.ExecStart = v
+					u.Args = execArgs(v)
+				} else {
+					u.ExecStart += "\n" + v
+				}
 			case "ActiveState":
 				u.ActiveState = v
 			case "SubState":
@@ -120,9 +126,9 @@ func parseShow(out string) []Unit {
 	return units
 }
 
-// execPaths extracts every "path=..." from systemd's ExecStart rendering:
-// "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run ... }". A unit with
-// several ExecStart lines renders them as consecutive "{ ... }" groups.
+// execPaths extracts every "path=..." from systemd's ExecStart rendering,
+// "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run ... }", one such group
+// per line when a unit has several ExecStart commands.
 func execPaths(execStart string) []string {
 	var paths []string
 	rest := execStart

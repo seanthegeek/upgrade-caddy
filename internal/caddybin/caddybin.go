@@ -35,12 +35,13 @@ func IsCaddyModule(path string) bool {
 
 // Plugin is a non-standard Caddy module compiled into the binary.
 type Plugin struct {
-	ModuleID string `json:"module_id"`         // e.g. dns.providers.cloudflare
-	Package  string `json:"package,omitempty"` // Go module path
-	Version  string `json:"version,omitempty"` // Go module version as built
-	Replace  string `json:"replace,omitempty"` // replacement path if a replace directive was used
-	Sum      string `json:"sum,omitempty"`     // h1: checksum from build info
-	Err      string `json:"error,omitempty"`   // error Caddy reported for this module
+	ModuleID       string `json:"module_id"`                 // e.g. dns.providers.cloudflare
+	Package        string `json:"package,omitempty"`         // Go module path
+	Version        string `json:"version,omitempty"`         // Go module version as built
+	Replace        string `json:"replace,omitempty"`         // replacement path if a replace directive was used
+	ReplaceVersion string `json:"replace_version,omitempty"` // version of the replacement, if it is a module
+	Sum            string `json:"sum,omitempty"`             // h1: checksum from build info, of the replacement when replaced
+	Err            string `json:"error,omitempty"`           // error Caddy reported for this module
 }
 
 // Info is everything the tool can learn about a Caddy binary.
@@ -105,6 +106,9 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 		info.MainVersion = bi.Main.Version
 		info.MainSum = bi.Main.Sum
 	}
+	// When a module is replaced, build info records the original under
+	// Path/Version and the effective module under Replace; checksums come
+	// from the replacement, which is what was actually compiled in.
 	deps := map[string]*debug.Module{}
 	for _, d := range bi.Deps {
 		deps[d.Path] = d
@@ -113,6 +117,9 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 			info.MainPath = d.Path
 			info.MainVersion = d.Version
 			info.MainSum = d.Sum
+			if d.Replace != nil {
+				info.MainSum = d.Replace.Sum
+			}
 		}
 	}
 
@@ -135,6 +142,13 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 			nonstd[i].Sum = d.Sum
 			if nonstd[i].Version == "" {
 				nonstd[i].Version = d.Version
+			}
+			if d.Replace != nil {
+				nonstd[i].Sum = d.Replace.Sum
+				nonstd[i].ReplaceVersion = d.Replace.Version
+				if nonstd[i].Replace == "" {
+					nonstd[i].Replace = d.Replace.Path
+				}
 			}
 		}
 	}

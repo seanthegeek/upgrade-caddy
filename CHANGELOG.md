@@ -8,8 +8,6 @@ and this project adheres to
 
 ## [Unreleased]
 
-Initial version, 0.1.0.
-
 ### Added
 
 - `check` command: reports whether the installed Caddy, or any plugin
@@ -31,3 +29,5 @@ Initial version, 0.1.0.
   test on throwaway runners, CodeQL, and a release workflow that builds
   archives for Linux, macOS and FreeBSD with GoReleaser on every `v*` tag.
 - Apache License 2.0.
+
+[Unreleased]: https://github.com/seanthegeek/upgrade-caddy/commits/main

@@ -8,6 +8,7 @@ func TestShort(t *testing.T) {
 		{"v2.11.6", "v2.11.6"},
 		{"v0.0.0-20240814120000-0123456789ab", "v0.0.0-20240814-0123456789ab"},
 		{"v1.2.3-0.20240814120000-0123456789ab", "v1.2.3-0.20240814-0123456789ab"},
+		{"v2.10.0-0.20250101120000-abcdefabcdef+dirty", "v2.10.0-0.20250101-abcdefabcdef+dirty"},
 	}
 	for _, c := range cases {
 		if got := short(c.in); got != c.want {

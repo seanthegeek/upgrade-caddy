@@ -484,11 +484,12 @@ type Lockfile struct {
 
 // LockModule is one module in a Lockfile.
 type LockModule struct {
-	ModuleID string `json:"module_id,omitempty"`
-	Package  string `json:"package"`
-	Version  string `json:"version"`
-	Sum      string `json:"sum,omitempty"`
-	Source   Source `json:"source,omitempty"`
+	ModuleID   string `json:"module_id,omitempty"`
+	Package    string `json:"package"`
+	Version    string `json:"version"`
+	Sum        string `json:"sum,omitempty"`
+	ReplacedBy string `json:"replaced_by,omitempty"` // "path@version" of a replace directive, whose checksum Sum then is
+	Source     Source `json:"source,omitempty"`
 }
 
 // LockSource is the binary a build reproduced.
@@ -510,7 +511,14 @@ func writeLockfile(path string, p *Plan, built *caddybin.Info) error {
 		source[pl.Package] = pl.Source
 	}
 	for _, bp := range built.Plugins {
-		lf.Plugins = append(lf.Plugins, LockModule{ModuleID: bp.ModuleID, Package: bp.Package, Version: bp.Version, Sum: bp.Sum, Source: source[bp.Package]})
+		lm := LockModule{ModuleID: bp.ModuleID, Package: bp.Package, Version: bp.Version, Sum: bp.Sum, Source: source[bp.Package]}
+		if bp.Replace != "" {
+			lm.ReplacedBy = bp.Replace
+			if bp.ReplaceVersion != "" {
+				lm.ReplacedBy += "@" + bp.ReplaceVersion
+			}
+		}
+		lf.Plugins = append(lf.Plugins, lm)
 	}
 	if p.SourcePath != "" {
 		lf.Source = &LockSource{Path: p.SourcePath, Version: p.CaddyInstalled}
@@ -569,7 +577,7 @@ func (l *stepLog) onStep(e *xcaddy.StepEvent) error {
 		l.lines[e.Step] = append(l.lines[e.Step], line)
 		l.mu.Unlock()
 	}
-	return nil
+	return sc.Err()
 }
 
 // failedStep is the last step that ran before cleanup.

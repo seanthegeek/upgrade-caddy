@@ -26,7 +26,7 @@ func fakeProxy(t *testing.T, versions map[string]string) *goproxy.Client {
 		http.NotFound(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	return &goproxy.Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	return &goproxy.Client{Sources: goproxy.ParseGOPROXY(srv.URL), HTTP: srv.Client()}
 }
 
 // installed mimics an xcaddy-built Caddy v2.10.2 with two plugins.

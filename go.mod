@@ -2,7 +2,10 @@ module github.com/seanthegeek/upgrade-caddy
 
 go 1.22
 
-require github.com/caddyserver/xcaddy v0.4.7
+require (
+	github.com/caddyserver/xcaddy v0.4.7
+	golang.org/x/mod v0.20.0
+)
 
 require (
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect

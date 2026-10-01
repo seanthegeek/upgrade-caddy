@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"text/tabwriter"
 
@@ -125,6 +126,10 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		defer wg.Done()
 		info, err := proxy.Latest(ctx, s.Package)
 		if err != nil {
+			if reason, ok := goproxy.NotChecked(err); ok {
+				s.Note = reason
+				return
+			}
 			s.Error = err.Error()
 			return
 		}
@@ -254,16 +259,22 @@ func writeRow(w io.Writer, s Status) {
 }
 
 // short trims pseudo-versions for display: v0.0.0-20240814120000-0123456789ab
-// becomes v0.0.0-20240814-0123456789ab.
+// becomes v0.0.0-20240814-0123456789ab. Build metadata such as +dirty is
+// kept after the shortened form.
 func short(v string) string {
 	if v == "" {
 		return "-"
 	}
-	if semver.IsPseudo(v) && len(v) > 27 {
+	core, build, _ := strings.Cut(v, "+")
+	if semver.IsPseudo(v) && len(core) > 27 {
 		// keep date, drop time-of-day
-		i := len(v) - 13 - 14 // start of timestamp
+		i := len(core) - 13 - 14 // start of timestamp
 		if i > 0 {
-			return v[:i+8] + v[i+14:]
+			core = core[:i+8] + core[i+14:]
+			if build != "" {
+				return core + "+" + build
+			}
+			return core
 		}
 	}
 	return v
