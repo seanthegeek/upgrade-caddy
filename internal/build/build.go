@@ -221,8 +221,9 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		} else {
 			pl.Note = "already at latest"
 		}
-		if path, minfo, ok, err := proxy.NewerMajor(ctx, pl.Package); err == nil && ok {
-			pl.Note = join(pl.Note, fmt.Sprintf("newer major %s at %s; use --with %s@%s --allow-major to move to it", minfo.Version, path, path, minfo.Version))
+		if majors, err := proxy.NewerMajors(ctx, pl.Package); err == nil && len(majors) > 0 {
+			m := majors[len(majors)-1]
+			pl.Note = join(pl.Note, fmt.Sprintf("newer major %s at %s; use --with %s@%s --allow-major to move to it", m.Version, m.Path, m.Path, m.Version))
 		}
 	}
 
@@ -501,7 +502,7 @@ func writeLockfile(path string, p *Plan, built *caddybin.Info) error {
 		Schema:    1,
 		BuiltAt:   time.Now().UTC().Truncate(time.Second),
 		GoVersion: built.GoVersion,
-		Caddy:     LockModule{Package: caddybin.CaddyModulePath, Version: built.MainVersion, Sum: built.MainSum},
+		Caddy:     LockModule{Package: built.MainPath, Version: built.MainVersion, Sum: built.MainSum},
 		Plugins:   []LockModule{},
 	}
 	source := map[string]Source{}

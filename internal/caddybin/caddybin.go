@@ -14,11 +14,24 @@ import (
 	"runtime/debug"
 	"strings"
 
+	"github.com/seanthegeek/upgrade-caddy/internal/goproxy"
 	"github.com/seanthegeek/upgrade-caddy/internal/pkgmgr"
 )
 
-// CaddyModulePath is the Go module path of Caddy v2.
-const CaddyModulePath = "github.com/caddyserver/caddy/v2"
+// CaddyModuleBase is Caddy's module path without a major-version suffix.
+// Caddy v2 lives at CaddyModulePath; a future v3 would be CaddyModuleBase
+// + "/v3". Caddy v1 lived on the bare path and is not supported.
+const (
+	CaddyModuleBase = "github.com/caddyserver/caddy"
+	CaddyModulePath = CaddyModuleBase + "/v2"
+)
+
+// IsCaddyModule reports whether path is Caddy itself at any supported
+// major version (v2 or later).
+func IsCaddyModule(path string) bool {
+	base, major := goproxy.SplitMajor(path)
+	return base == CaddyModuleBase && major >= 2
+}
 
 // Plugin is a non-standard Caddy module compiled into the binary.
 type Plugin struct {
@@ -36,7 +49,8 @@ type Info struct {
 	ResolvedPath  string            `json:"resolved_path"`
 	Version       string            `json:"version"` // output of `caddy version`, first field
 	GoVersion     string            `json:"go_version"`
-	MainVersion   string            `json:"main_version"` // from build info; "" when absent
+	MainPath      string            `json:"main_path,omitempty"` // Caddy's module path, e.g. .../caddy/v2; "" when absent
+	MainVersion   string            `json:"main_version"`        // from build info; "" when absent
 	MainSum       string            `json:"main_sum,omitempty"`
 	HasModuleInfo bool              `json:"has_module_info"` // false for distro-style builds
 	Plugins       []Plugin          `json:"plugins"`         // non-standard modules
@@ -81,18 +95,22 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 	for _, s := range bi.Settings {
 		info.Settings[s.Key] = s.Value
 	}
-	if bi.Main.Path != "" && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+	// Upstream release builds have Caddy as the main module. xcaddy builds
+	// have a synthetic main package named "caddy" with Caddy itself as a
+	// dependency, so the real path and version live in Deps. Either way,
+	// any major from v2 up is recognised.
+	if IsCaddyModule(bi.Main.Path) && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
 		info.HasModuleInfo = true
+		info.MainPath = bi.Main.Path
 		info.MainVersion = bi.Main.Version
 		info.MainSum = bi.Main.Sum
 	}
-	// xcaddy builds have a synthetic main package named "caddy" with Caddy
-	// itself as a dependency; the real version lives in Deps.
 	deps := map[string]*debug.Module{}
 	for _, d := range bi.Deps {
 		deps[d.Path] = d
-		if d.Path == CaddyModulePath {
+		if IsCaddyModule(d.Path) {
 			info.HasModuleInfo = true
+			info.MainPath = d.Path
 			info.MainVersion = d.Version
 			info.MainSum = d.Sum
 		}

@@ -85,3 +85,19 @@ func TestInspectHostCaddy(t *testing.T) {
 		t.Errorf("no module info but plugins listed: %+v", info.Plugins)
 	}
 }
+
+func TestIsCaddyModule(t *testing.T) {
+	cases := map[string]bool{
+		"github.com/caddyserver/caddy/v2":   true,
+		"github.com/caddyserver/caddy/v3":   true,
+		"github.com/caddyserver/caddy":      false, // v1, unsupported
+		"github.com/caddyserver/xcaddy":     false,
+		"github.com/caddy-dns/cloudflare":   false,
+		"github.com/caddyserver/caddy/v2/x": false,
+	}
+	for in, want := range cases {
+		if got := IsCaddyModule(in); got != want {
+			t.Errorf("IsCaddyModule(%q)=%v want %v", in, got, want)
+		}
+	}
+}

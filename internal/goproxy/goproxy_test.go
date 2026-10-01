@@ -63,33 +63,45 @@ func TestLatestAndNotFound(t *testing.T) {
 	}
 }
 
-func TestNewerMajor(t *testing.T) {
+func TestNewerMajors(t *testing.T) {
 	c := newServer(t, map[string]string{
-		"/example.com/m/@latest":    "v1.9.0",
-		"/example.com/m/v2/@latest": "v2.1.0",
-		"/example.com/m/v3/@latest": "v3.0.1",
-		"/example.com/n/v2/@latest": "v2.0.0",
+		"/example.com/m/@latest":       "v1.9.0",
+		"/example.com/m/v2/@latest":    "v2.1.0",
+		"/example.com/m/v3/@latest":    "v3.0.1",
+		"/example.com/n/v2/@latest":    "v2.0.0",
+		"/example.com/skip/@latest":    "v1.0.0",
+		"/example.com/skip/v4/@latest": "v4.2.0", // v2 and v3 were never published
 	})
 	ctx := context.Background()
 
-	path, info, ok, err := c.NewerMajor(ctx, "example.com/m")
-	if err != nil || !ok || path != "example.com/m/v3" || info.Version != "v3.0.1" {
-		t.Errorf("from v1: ok=%v path=%q ver=%q err=%v", ok, path, info.Version, err)
+	got, err := c.NewerMajors(ctx, "example.com/m")
+	if err != nil || len(got) != 2 || got[0].Path != "example.com/m/v2" || got[1].Version != "v3.0.1" || got[1].Major != 3 {
+		t.Errorf("from v1: %+v err=%v", got, err)
 	}
-	path, info, ok, err = c.NewerMajor(ctx, "example.com/m/v2")
-	if err != nil || !ok || path != "example.com/m/v3" || info.Version != "v3.0.1" {
-		t.Errorf("from v2: ok=%v path=%q ver=%q err=%v", ok, path, info.Version, err)
+	got, err = c.NewerMajors(ctx, "example.com/m/v2")
+	if err != nil || len(got) != 1 || got[0].Path != "example.com/m/v3" {
+		t.Errorf("from v2: %+v err=%v", got, err)
 	}
-	_, _, ok, err = c.NewerMajor(ctx, "example.com/m/v3")
-	if err != nil || ok {
-		t.Errorf("from v3: expected none, ok=%v err=%v", ok, err)
+	if got, err = c.NewerMajors(ctx, "example.com/m/v3"); err != nil || len(got) != 0 {
+		t.Errorf("from v3: expected none, got %+v err=%v", got, err)
 	}
-	_, _, ok, err = c.NewerMajor(ctx, "example.com/n/v2")
-	if err != nil || ok {
-		t.Errorf("n/v2: expected none, ok=%v err=%v", ok, err)
+	if got, err = c.NewerMajors(ctx, "example.com/n/v2"); err != nil || len(got) != 0 {
+		t.Errorf("n/v2: expected none, got %+v err=%v", got, err)
 	}
-	_, _, ok, err = c.NewerMajor(ctx, "gopkg.in/yaml.v2")
-	if err != nil || ok {
-		t.Errorf("gopkg.in: expected skip, ok=%v err=%v", ok, err)
+	if got, err = c.NewerMajors(ctx, "gopkg.in/yaml.v2"); err != nil || len(got) != 0 {
+		t.Errorf("gopkg.in: expected skip, got %+v err=%v", got, err)
+	}
+	// One skipped major number is tolerated; two consecutive misses end the walk.
+	got, err = c.NewerMajors(ctx, "example.com/skip")
+	if err != nil || len(got) != 0 {
+		t.Errorf("skip: v2 and v3 both missing should end the walk before v4, got %+v err=%v", got, err)
+	}
+	c2 := newServer(t, map[string]string{
+		"/example.com/skip/@latest":    "v1.0.0",
+		"/example.com/skip/v3/@latest": "v3.1.0", // only v2 skipped
+	})
+	got, err = c2.NewerMajors(ctx, "example.com/skip")
+	if err != nil || len(got) != 1 || got[0].Version != "v3.1.0" {
+		t.Errorf("one skipped major should be found, got %+v err=%v", got, err)
 	}
 }

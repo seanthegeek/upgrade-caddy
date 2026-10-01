@@ -22,10 +22,12 @@ type Options struct {
 	Proxy  *goproxy.Client
 }
 
-// Major describes a newer major version living at a different module path.
+// Major describes the newest major version living at a different module
+// path, and how many majors lie between it and the installed one.
 type Major struct {
 	Package string `json:"package"`
 	Version string `json:"version"`
+	Behind  int    `json:"behind"` // number of newer majors, including this one
 }
 
 // Status of one versioned component.
@@ -110,7 +112,11 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	if installed == "" {
 		installed = semver.Canonical(bin.Version)
 	}
-	r.Caddy = Status{Name: "caddy", Package: caddybin.CaddyModulePath, Installed: installed, Pseudo: semver.IsPseudo(installed)}
+	caddyPath := bin.MainPath
+	if caddyPath == "" {
+		caddyPath = caddybin.CaddyModulePath
+	}
+	r.Caddy = Status{Name: "caddy", Package: caddyPath, Installed: installed, Pseudo: semver.IsPseudo(installed)}
 
 	// Latest lookups in parallel: Caddy plus every plugin with a known package.
 	r.Plugins = make([]Status, len(bin.Plugins))
@@ -127,13 +133,14 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		if s.Outdated && s.Pseudo && semver.IsPseudo(s.Latest) {
 			s.Note = "untagged module: newer commit on default branch"
 		}
-		path, minfo, ok, err := proxy.NewerMajor(ctx, s.Package)
+		majors, err := proxy.NewerMajors(ctx, s.Package)
 		if err != nil {
 			r.warn(fmt.Sprintf("%s: could not probe for newer major versions: %v", s.Name, err))
 			return
 		}
-		if ok {
-			s.Major = &Major{Package: path, Version: minfo.Version}
+		if len(majors) > 0 {
+			newest := majors[len(majors)-1]
+			s.Major = &Major{Package: newest.Path, Version: newest.Version, Behind: len(majors)}
 		}
 	}
 	wg.Add(1)
@@ -155,11 +162,15 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	}
 	wg.Wait()
 
-	if r.Caddy.Major != nil {
+	if m := r.Caddy.Major; m != nil {
+		behind := "a newer major version"
+		if m.Behind > 1 {
+			behind = fmt.Sprintf("%d major versions", m.Behind)
+		}
 		r.Warnings = append(r.Warnings, fmt.Sprintf(
-			"Caddy %s exists at %s; Caddy has not historically backported security fixes to a previous major version. "+
+			"the installed Caddy is %s behind: %s is at %s. Caddy has not historically backported security fixes to a previous major version. "+
 				"Plugins built for the current major will not compile against it, so 'build' will not cross majors without an explicit flag",
-			r.Caddy.Major.Version, r.Caddy.Major.Package))
+			behind, m.Version, m.Package))
 	}
 	return r, nil
 }
@@ -233,7 +244,11 @@ func writeRow(w io.Writer, s Status) {
 		status += " (" + s.Note + ")"
 	}
 	if s.Major != nil {
-		status += " (major " + s.Major.Version + " at " + s.Major.Package + ")"
+		if s.Major.Behind > 1 {
+			status += fmt.Sprintf(" (%d majors behind: %s at %s)", s.Major.Behind, s.Major.Version, s.Major.Package)
+		} else {
+			status += " (major " + s.Major.Version + " at " + s.Major.Package + ")"
+		}
 	}
 	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Package, short(s.Installed), short(s.Latest), status)
 }

@@ -93,32 +93,49 @@ func EscapePath(p string) string {
 	return b.String()
 }
 
-// maxMajorProbe bounds how many successive major paths NewerMajor will try.
-const maxMajorProbe = 10
+// maxMajorProbe bounds how many major paths above the current one
+// NewerMajors will try, and missTolerance is how many consecutive missing
+// majors it accepts before concluding there are no more. Go allows a
+// project to skip a major number, so a single miss is not proof.
+const (
+	maxMajorProbe = 10
+	missTolerance = 2
+)
 
-// NewerMajor looks for a newer major version of modPath. Go puts the major
-// version in the module path (".../v3"), so a plain @latest query never sees
-// one. This probes the next major path and keeps going until the proxy says
-// a path does not exist, returning the highest major found. ok is false when
-// there is none. Modules that cannot use the /vN scheme, such as gopkg.in
-// paths, are never probed.
-func (c *Client) NewerMajor(ctx context.Context, modPath string) (path string, info Info, ok bool, err error) {
+// MajorVersion is a newer major of a module, living at its own path.
+type MajorVersion struct {
+	Major   int    `json:"major"`
+	Path    string `json:"path"`
+	Version string `json:"version"` // latest within that major
+}
+
+// NewerMajors lists every newer major version of modPath, lowest first.
+// Go puts the major version in the module path (".../v3"), so a plain
+// @latest query never sees one. This probes successive major paths above
+// the module's own, stopping after missTolerance consecutive paths the
+// proxy does not have. Modules that cannot use the /vN scheme, such as
+// gopkg.in paths, are never probed.
+func (c *Client) NewerMajors(ctx context.Context, modPath string) ([]MajorVersion, error) {
 	if strings.HasPrefix(modPath, "gopkg.in/") {
-		return "", Info{}, false, nil
+		return nil, nil
 	}
 	base, cur := SplitMajor(modPath)
-	for m := cur + 1; m <= cur+maxMajorProbe; m++ {
+	var found []MajorVersion
+	misses := 0
+	for m := cur + 1; m <= cur+maxMajorProbe && misses < missTolerance; m++ {
 		p := MajorPath(base, m)
-		i, err := c.Latest(ctx, p)
+		info, err := c.Latest(ctx, p)
 		if errors.Is(err, ErrNotFound) {
-			break
+			misses++
+			continue
 		}
 		if err != nil {
-			return "", Info{}, false, err
+			return nil, err
 		}
-		path, info, ok = p, i, true
+		misses = 0
+		found = append(found, MajorVersion{Major: m, Path: p, Version: info.Version})
 	}
-	return path, info, ok, nil
+	return found, nil
 }
 
 // SplitMajor separates a module path from its major-version suffix.
