@@ -53,7 +53,8 @@ only state that matters, and the tool is built around that.
 - `internal/goproxy` `@latest` lookups and newer-major probing against a Go
   module proxy.
 - `internal/semver` version comparison, including Go pseudo-versions.
-- `internal/pkgmgr` asks dpkg, rpm, pacman or apk which package owns a file.
+- `internal/pkgmgr` asks dpkg, rpm, pacman, apk, Homebrew or FreeBSD `pkg`
+  which package owns a file, failing closed when none can say.
 - `internal/systemd` finds service units whose `ExecStart` runs a binary,
   parses their config flags, and drives systemctl through a `Controller`
   interface so install's restart sequence can be tested with a fake.
@@ -191,8 +192,12 @@ These are implemented in `internal/install`; keep them true.
   install failure that rolls the binary back.
 - Package ownership must be known before the target is touched.
   `pkgmgr.Find` fails closed: a package manager that cannot answer either
-  way is an error, and `install` refuses on it rather than assuming "not
-  owned".
+  way is an error, and so is finding no package manager at all on macOS or
+  FreeBSD (Homebrew and `pkg` are probed there); `install` refuses on it
+  rather than assuming "not owned". On Linux, none of the known managers
+  being present means not owned.
+- Error messages never contain proxy credentials: our own errors run
+  GOPROXY URLs through `url.Redacted`, and net/http redacts its own.
 - Rollback restores the previous binary before trying to keep the failed
   one as `.failed`, returns the restore outcome separately from the
   diagnostic-copy outcome, and its restarts are verified the same way as

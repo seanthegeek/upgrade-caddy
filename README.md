@@ -19,8 +19,9 @@ Plugin versions are never bumped unless you ask.
 - `version` prints the tool's version, commit and Go toolchain.
 
 `build` refuses binaries that carry no Go module information (distribution
-packages), because the plugin set cannot be reproduced from them, unless
-`--fresh` is given. `install` never writes over a system package at all,
+packages), or that list modules without package information, because the
+plugin set cannot be reproduced from them, unless `--fresh` is given.
+`install` never writes over a system package at all,
 whether detected by package ownership or by missing module information. See
 "Coming from a distribution package" below. `check` works on everything and
 says what it found.
@@ -129,8 +130,10 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    distinct set of `--config`, `--adapter` and `--envfile` flags across
    those units, read from the command that runs the target via D-Bus so an
    argument containing a space survives, or the `--config` flag).
-2. Refuses if the target belongs to a system package, or if the package
-   manager cannot say either way, and checks up front
+2. Refuses if the target belongs to a system package (dpkg, rpm, pacman,
+   apk, Homebrew, or FreeBSD `pkg`), or if ownership cannot be established,
+   which on macOS and FreeBSD includes finding no package manager at all,
+   and checks up front
    whether root is needed (to write the directory, restart the unit, or
    re-apply file capabilities) so a long build never ends in "permission
    denied".
