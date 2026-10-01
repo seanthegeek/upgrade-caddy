@@ -3,15 +3,20 @@
 package goproxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/mod/module"
@@ -62,10 +67,60 @@ type Client struct {
 	HTTP    *http.Client
 }
 
-// New builds a client from GOPROXY, GONOPROXY and GOPRIVATE in the
-// environment, with the go command's defaults when they are unset.
+// New builds a client from the effective Go environment: GOPROXY,
+// GONOPROXY and GOPRIVATE from the process environment, else from the file
+// `go env -w` writes to (GOENV, or <user config dir>/go/env), as the go
+// command resolves them. GOENV=off disables the file.
 func New() *Client {
-	return FromEnv(os.Getenv("GOPROXY"), os.Getenv("GONOPROXY"), os.Getenv("GOPRIVATE"))
+	return FromEnv(GoEnv("GOPROXY"), GoEnv("GONOPROXY"), GoEnv("GOPRIVATE"))
+}
+
+var (
+	envFileOnce sync.Once
+	envFile     map[string]string
+)
+
+// GoEnv returns the effective value of a Go environment variable: the
+// process environment wins, then the GOENV file, then "".
+func GoEnv(key string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	envFileOnce.Do(func() { envFile = readGoEnvFile() })
+	return envFile[key]
+}
+
+// readGoEnvFile parses the file `go env -w` maintains, KEY=VALUE per line,
+// following the go command's location rules.
+func readGoEnvFile() map[string]string {
+	file := os.Getenv("GOENV")
+	switch file {
+	case "off":
+		return nil
+	case "":
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return nil
+		}
+		file = filepath.Join(dir, "go", "env")
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	vals := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			vals[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return vals
 }
 
 // FromEnv builds a client from explicit GOPROXY, GONOPROXY and GOPRIVATE
@@ -84,7 +139,9 @@ func FromEnv(goproxy, gonoproxy, goprivate string) *Client {
 
 // ParseGOPROXY splits a GOPROXY value into sources, keeping track of
 // whether each is followed by "," or "|". An empty value means the go
-// command's default, "https://proxy.golang.org,direct".
+// command's default, "https://proxy.golang.org,direct". As the go command
+// does, an entry that looks like a host rather than a keyword or a URL
+// ("proxy.example.com") gets "https://" prepended.
 func ParseGOPROXY(s string) []Source {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -99,6 +156,12 @@ func ParseGOPROXY(s string) []Source {
 		}
 		if entry = strings.TrimSpace(entry); entry != "" {
 			if entry != "off" && entry != "direct" {
+				// Mirrors cmd/go/internal/modfetch/proxy.go: single words are
+				// keywords, anything with ":/" or an absolute path is a
+				// complete URL, everything else is a host.
+				if strings.ContainsAny(entry, ".:/") && !strings.Contains(entry, ":/") && !filepath.IsAbs(entry) && !path.IsAbs(entry) {
+					entry = "https://" + entry
+				}
 				entry = strings.TrimRight(entry, "/")
 			}
 			sources = append(sources, Source{URL: entry, FallbackOnAnyError: sep == "|"})
@@ -152,8 +215,10 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			return Info{}, fmt.Errorf("%s: %w", modPath, ErrDirect)
 		}
 		var info Info
-		if strings.HasPrefix(s.URL, "file://") {
-			info, err = c.fetchFile(strings.TrimPrefix(s.URL, "file://")+"/"+escaped+"/@latest", modPath)
+		if dir, isFile, perr := fileProxyDir(s.URL); perr != nil {
+			err = perr
+		} else if isFile {
+			info, err = c.fetchFile(dir+"/"+escaped+"/@latest", modPath)
 		} else {
 			info, err = c.fetch(ctx, s.URL+"/"+escaped+"/@latest", modPath)
 		}
@@ -203,6 +268,23 @@ func (c *Client) fetch(ctx context.Context, url, modPath string) (Info, error) {
 		return Info{}, fmt.Errorf("%s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return decodeInfo(body, url)
+}
+
+// fileProxyDir parses a proxy entry and, for a file:// URL, returns its
+// decoded directory. As the go command requires, a file URL may carry
+// nothing but a path: a host, query or fragment is an error.
+func fileProxyDir(entry string) (dir string, isFile bool, err error) {
+	u, err := url.Parse(entry)
+	if err != nil {
+		return "", false, fmt.Errorf("GOPROXY entry %q: %w", entry, err)
+	}
+	if u.Scheme != "file" {
+		return "", false, nil
+	}
+	if *u != (url.URL{Scheme: u.Scheme, Path: u.Path, RawPath: u.RawPath}) {
+		return "", false, fmt.Errorf("GOPROXY entry %q: a file URL may contain only a path", entry)
+	}
+	return strings.TrimSuffix(filepath.FromSlash(u.Path), string(filepath.Separator)), true, nil
 }
 
 // fetchFile serves a file:// proxy, a directory laid out like a proxy. A

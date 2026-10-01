@@ -141,8 +141,8 @@ func TestSwapAndRollback(t *testing.T) {
 		t.Error("staged file should be gone after rename")
 	}
 
-	if err := rollback(target, previous); err != nil {
-		t.Fatal(err)
+	if restoreErr, keepErr := rollback(target, previous); restoreErr != nil || keepErr != nil {
+		t.Fatal(restoreErr, keepErr)
 	}
 	if got, _ := os.ReadFile(target); string(got) != "old" {
 		t.Errorf("after rollback target content: %q", got)
@@ -165,12 +165,19 @@ func TestRollbackRestoresEvenWhenFailedCopyCannotBeKept(t *testing.T) {
 	os.WriteFile(target+".previous", []byte("good"), 0o755)
 	// A non-empty directory at the .failed path makes the link fail.
 	os.MkdirAll(filepath.Join(target+".failed", "x"), 0o755)
-	err := rollback(target, target+".previous")
+	restoreErr, keepErr := rollback(target, target+".previous")
 	if got, _ := os.ReadFile(target); string(got) != "good" {
 		t.Fatalf("target must be restored first, got %q", got)
 	}
-	if err == nil || !strings.Contains(err.Error(), "could not keep the failed binary") {
-		t.Errorf("the diagnostic failure must still be reported: %v", err)
+	if restoreErr != nil {
+		t.Errorf("the restore succeeded and must not be reported as failed: %v", restoreErr)
+	}
+	if keepErr == nil || !strings.Contains(keepErr.Error(), "could not keep the failed binary") {
+		t.Errorf("the diagnostic failure must still be reported: %v", keepErr)
+	}
+	// And the operator-facing summary says the rollback succeeded.
+	if msg := rolledBack(restoreErr); !strings.Contains(msg, "rolled back to the previous binary") {
+		t.Errorf("summary for a successful restore with a failed diagnostic copy: %q", msg)
 	}
 }
 
@@ -225,7 +232,8 @@ func TestRestartUnitsRollsBackUnderCancelledContext(t *testing.T) {
 	// still run under their own deadline.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	ctl := &fakeCtl{active: []bool{false}}
+	// The forward restart never becomes active; the rollback restarts do.
+	ctl := &fakeCtl{active: []bool{false}, defaultActive: true}
 	var log strings.Builder
 	restarted, err := restartUnits(ctx, ctl, []string{"a.service", "b.service"}, target, target+".previous", time.Second, &log)
 	if err == nil || len(restarted) != 0 {
@@ -240,8 +248,30 @@ func TestRestartUnitsRollsBackUnderCancelledContext(t *testing.T) {
 	if len(ctl.restarts) != 3 { // the failed one, then both again for the rollback
 		t.Errorf("rollback restarts must run despite the cancelled context: %v", ctl.restarts)
 	}
-	if !strings.Contains(err.Error(), "rolled back to the previous binary") {
-		t.Errorf("a successful rollback should be reported as such: %v", err)
+	if !strings.Contains(err.Error(), "rolled back to the previous binary") || strings.Contains(err.Error(), "did not come back up") {
+		t.Errorf("a successful, verified rollback should be reported as such: %v", err)
+	}
+}
+
+func TestRestartUnitsReportsServiceDownAfterRollback(t *testing.T) {
+	settleDelay = 10 * time.Millisecond
+	t.Cleanup(func() { settleDelay = time.Second })
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("new"), 0o755)
+	os.WriteFile(target+".previous", []byte("old"), 0o755)
+	// Nothing ever becomes active, not even on the restored binary.
+	ctl := &fakeCtl{}
+	var log strings.Builder
+	_, err := restartUnits(context.Background(), ctl, []string{"a.service"}, target, target+".previous", 50*time.Millisecond, &log)
+	if err == nil || !strings.Contains(err.Error(), "did not come back up") || !strings.Contains(err.Error(), "after rollback") {
+		t.Errorf("a rollback whose restart fails must say so: %v", err)
+	}
+	if len(ctl.restarts) != 2 {
+		t.Errorf("forward restart plus one verified rollback restart expected: %v", ctl.restarts)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old" {
+		t.Errorf("binary should still be rolled back on disk: %q", got)
 	}
 }
 
@@ -281,18 +311,20 @@ func TestSwapFirstInstall(t *testing.T) {
 	if err != nil || previous != "" {
 		t.Fatalf("first install: previous=%q err=%v", previous, err)
 	}
-	if err := rollback(target, previous); err == nil {
+	if restoreErr, _ := rollback(target, previous); restoreErr == nil {
 		t.Error("rollback with no previous must fail")
 	}
 }
 
 // fakeCtl records calls and answers IsActive from a script.
 type fakeCtl struct {
-	restarts   []string
-	active     []bool
-	pid        int
-	restartErr error
-	activeErr  error
+	restarts      []string
+	active        []bool // scripted answers; once exhausted, defaultActive
+	defaultActive bool
+	pid           int
+	restartErr    error
+	activeErr     error
+	pidErr        error
 }
 
 func (f *fakeCtl) Restart(_ context.Context, unit string) error {
@@ -305,14 +337,14 @@ func (f *fakeCtl) IsActive(_ context.Context, _ string) (bool, error) {
 		return false, f.activeErr
 	}
 	if len(f.active) == 0 {
-		return false, nil
+		return f.defaultActive, nil
 	}
 	a := f.active[0]
 	f.active = f.active[1:]
 	return a, nil
 }
 
-func (f *fakeCtl) MainPID(_ context.Context, _ string) (int, error) { return f.pid, nil }
+func (f *fakeCtl) MainPID(_ context.Context, _ string) (int, error) { return f.pid, f.pidErr }
 
 func TestRestartAndVerify(t *testing.T) {
 	settleDelay = 10 * time.Millisecond
@@ -454,6 +486,15 @@ func TestRestartAndVerifyErrors(t *testing.T) {
 	// A PID whose /proc entry cannot be read: being active is enough.
 	if err := restartAndVerify(ctx, &fakeCtl{active: []bool{true, true}, pid: 2147483000}, "x.service", "/x", time.Second); err != nil {
 		t.Errorf("unreadable /proc entry should not fail: %v", err)
+	}
+	// A failure to query MainPID is not "no main process": verification
+	// could not be done, so the restart check fails.
+	if err := restartAndVerify(ctx, &fakeCtl{active: []bool{true, true}, pidErr: boom}, "x.service", "/x", time.Second); !errors.Is(err, boom) {
+		t.Errorf("MainPID error must fail verification: %v", err)
+	}
+	// PID 0 is a definite "no main process" and falls back to active state.
+	if err := restartAndVerify(ctx, &fakeCtl{active: []bool{true, true}, pid: 0}, "x.service", "/x", time.Second); err != nil {
+		t.Errorf("pid 0 should fall back to active: %v", err)
 	}
 }
 

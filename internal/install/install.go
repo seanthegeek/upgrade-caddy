@@ -214,18 +214,27 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 			return restarted, fmt.Errorf("%s did not come up with the new binary: %w; the new binary and lockfile were removed from %s again (there was nothing installed before)", u, rerr, target)
 		}
 		fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
-		rbErr := errors.Join(rollback(target, previous), rollbackLockfile(target))
-		rbCtx, cancel := context.WithTimeout(context.Background(), wait+15*time.Second)
-		defer cancel()
-		var restartErrs []error
+		restoreErr, keepErr := rollback(target, previous)
+		restoreErr = errors.Join(restoreErr, rollbackLockfile(target))
+		// The restored binary is restarted and verified the same way the
+		// new one was, under a fresh deadline per unit: a restart that is
+		// accepted and then fails is exactly the case being recovered from.
+		var recoveryErrs []error
 		for _, again := range units {
-			if e := ctl.Restart(rbCtx, again); e != nil {
-				restartErrs = append(restartErrs, e)
+			rbCtx, cancel := context.WithTimeout(context.Background(), wait+settleDelay+15*time.Second)
+			if e := restartAndVerify(rbCtx, ctl, again, target, wait); e != nil {
+				recoveryErrs = append(recoveryErrs, fmt.Errorf("after rollback, %w", e))
 			}
+			cancel()
+		}
+		recovery := errors.Join(recoveryErrs...)
+		summary := rolledBack(restoreErr)
+		if restoreErr == nil && recovery != nil {
+			summary += ", but the service did not come back up on it"
 		}
 		return restarted, errors.Join(
-			fmt.Errorf("%s did not come up with the new binary: %w; %s", u, rerr, rolledBack(rbErr)),
-			rbErr, errors.Join(restartErrs...))
+			fmt.Errorf("%s did not come up with the new binary: %w; %s", u, rerr, summary),
+			restoreErr, keepErr, recovery)
 	}
 	return restarted, nil
 }
@@ -430,8 +439,8 @@ func commitLockfile(target, newLock, previous string) error {
 		}
 		return fmt.Errorf("installing the lockfile: %w; the new binary was removed from %s again", err, target)
 	}
-	rbErr := rollback(target, previous)
-	return errors.Join(fmt.Errorf("installing the lockfile: %w; %s", err, rolledBack(rbErr)), rbErr)
+	restoreErr, keepErr := rollback(target, previous)
+	return errors.Join(fmt.Errorf("installing the lockfile: %w; %s", err, rolledBack(restoreErr)), restoreErr, keepErr)
 }
 
 // validationsFromUnits collects every distinct config the units run the
@@ -720,8 +729,8 @@ func swap(target, newPath string, caps []byte) (previous string, err error) {
 	}
 	if caps != nil {
 		if err := writeCaps(target, caps); err != nil {
-			rbErr := rollback(target, previous)
-			return "", errors.Join(fmt.Errorf("re-applying file capabilities: %w; %s", err, rolledBack(rbErr)), rbErr)
+			restoreErr, keepErr := rollback(target, previous)
+			return "", errors.Join(fmt.Errorf("re-applying file capabilities: %w; %s", err, rolledBack(restoreErr)), restoreErr, keepErr)
 		}
 	}
 	return previous, nil
@@ -729,22 +738,23 @@ func swap(target, newPath string, caps []byte) (previous string, err error) {
 
 // rollback puts the previous binary back. The failed one is kept as
 // <target>.failed for inspection when that is possible, but restoring the
-// target never waits on it: a problem with the diagnostic copy is reported
-// alongside the restore result, not instead of the restore.
-func rollback(target, previous string) error {
+// target never waits on it. The two outcomes are returned separately:
+// restoreErr says whether the target holds the previous binary again,
+// which is what an operator needs to know; keepErr only says the
+// diagnostic copy could not be made.
+func rollback(target, previous string) (restoreErr, keepErr error) {
 	if previous == "" {
-		return errors.New("no previous binary to roll back to")
+		return errors.New("no previous binary to roll back to"), nil
 	}
 	failed := target + ".failed"
 	os.Remove(failed)
-	var keepErr error
 	if err := os.Link(target, failed); err != nil {
-		keepErr = fmt.Errorf("rollback: could not keep the failed binary as %s: %w", failed, err)
+		keepErr = fmt.Errorf("could not keep the failed binary as %s: %w", failed, err)
 	}
 	if err := os.Rename(previous, target); err != nil {
-		return errors.Join(fmt.Errorf("rollback: restoring %s: %w", target, err), keepErr)
+		return fmt.Errorf("rollback: restoring %s: %w", target, err), keepErr
 	}
-	return keepErr
+	return nil, keepErr
 }
 
 // settleDelay is how long a unit must stay active before it counts as up.
@@ -787,8 +797,11 @@ func restartAndVerify(ctx context.Context, ctl systemd.Controller, unit, target 
 		return fmt.Errorf("%s became active but did not stay active for %s", unit, settleDelay)
 	}
 	pid, err := ctl.MainPID(ctx, unit)
-	if err != nil || pid == 0 {
-		return nil // active is the best we can confirm
+	if err != nil {
+		return fmt.Errorf("%s is active but its main process could not be determined: %w", unit, err)
+	}
+	if pid == 0 {
+		return nil // no main process to inspect; active is the best we can confirm
 	}
 	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if err != nil {

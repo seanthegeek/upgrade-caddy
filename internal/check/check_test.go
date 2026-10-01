@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/seanthegeek/upgrade-caddy/internal/goproxy"
@@ -124,5 +125,37 @@ func TestAnyErrors(t *testing.T) {
 	}
 	if (&Report{Caddy: Status{Name: "caddy", Note: "GOPROXY=off"}}).anyErrors() {
 		t.Error("a not-checked note is not an error")
+	}
+}
+
+func TestLookupAllOncePerPackage(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		if r.URL.Path == "/example.com/m/@latest" {
+			w.Write([]byte(`{"Version":"v1.2.0","Time":"2026-01-01T00:00:00Z"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	proxy := &goproxy.Client{Sources: goproxy.ParseGOPROXY(srv.URL), HTTP: srv.Client()}
+	// Three Caddy modules registered by one Go module, as caddy-l4 does.
+	rows := []*Status{
+		{Name: "layer4", Package: "example.com/m", Installed: "v1.0.0"},
+		{Name: "layer4.handlers.proxy", Package: "example.com/m", Installed: "v1.0.0"},
+		{Name: "layer4.matchers.tls", Package: "example.com/m", Installed: "v1.0.0"},
+	}
+	lookupAll(context.Background(), proxy, rows)
+	if hits["/example.com/m/@latest"] != 1 {
+		t.Errorf("want one @latest request for one package, got %d", hits["/example.com/m/@latest"])
+	}
+	for _, s := range rows {
+		if s.Latest != "v1.2.0" || !s.Outdated {
+			t.Errorf("every row should carry the shared result: %+v", s)
+		}
 	}
 }

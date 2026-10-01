@@ -132,7 +132,11 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    and `direct` meaning "cannot look up" (reported as not checked, never
    silently redirected to the public proxy), and private patterns never sent
    to a proxy. A 404 from a proxy is final; `direct` is not consulted.
-   `file://` proxies are read from disk. Lookups use the proxy's optional
+   `file://` proxies are parsed as URLs and read from disk; a bare host
+   gets `https://`; the variables are read from the process environment
+   and then the `GOENV` file, as `go env` resolves them. One lookup is
+   made per Go module, however many Caddy modules it registers. Lookups
+   use the proxy's optional
    `@latest` endpoint and do not apply retractions, and the newer-major
    probe gives up after two consecutive missing major numbers; these are
    documented limitations, not bugs to fix quietly. A hard lookup failure
@@ -189,11 +193,18 @@ These are implemented in `internal/install`; keep them true.
   way is an error, and `install` refuses on it rather than assuming "not
   owned".
 - Rollback restores the previous binary before trying to keep the failed
-  one as `.failed`, and its restarts run under a fresh deadline because the
-  caller's context is often already cancelled. Error messages say "rolled
-  back" only when the restore succeeded. On a first install the state to
-  restore is "nothing there": a failed restart removes the new binary and
-  lockfile again.
+  one as `.failed`, returns the restore outcome separately from the
+  diagnostic-copy outcome, and its restarts are verified the same way as
+  the forward ones under a fresh deadline per unit, because the caller's
+  context is often already cancelled. Error messages say "rolled back" only
+  when the restore succeeded, and add "did not come back up" when the
+  verified restart on the restored binary failed. On a first install the
+  state to restore is "nothing there": a failed restart removes the new
+  binary and lockfile again. A `MainPID` query failure fails verification;
+  only a PID of 0 falls back to the active state.
+- `main` cancels the context on SIGINT and SIGTERM, so a service manager,
+  CI cancellation or `timeout(1)` lets install roll back instead of dying
+  mid-swap.
 
 ## Conventions
 

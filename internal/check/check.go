@@ -83,6 +83,37 @@ func (r *Report) anyErrors() bool {
 	return false
 }
 
+// lookupAll resolves every row concurrently, but once per Go module: a
+// plugin that registers several Caddy modules yields several rows with the
+// same package and installed version, and they share one lookup rather
+// than issuing identical requests.
+func lookupAll(ctx context.Context, proxy *goproxy.Client, rows []*Status) {
+	groups := map[string][]*Status{}
+	var order []string
+	for _, s := range rows {
+		key := s.Package + "@" + s.Installed
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], s)
+	}
+	var wg sync.WaitGroup
+	for _, key := range order {
+		group := groups[key]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			first := group[0]
+			resolveStatus(ctx, proxy, first)
+			for _, other := range group[1:] {
+				other.Latest, other.NewerInMajor, other.Outdated = first.Latest, first.NewerInMajor, first.Outdated
+				other.MajorAvailable, other.Note, other.Error = first.MajorAvailable, first.Note, first.Error
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // resolveStatus fills in Latest, NewerInMajor, MajorAvailable and Outdated
 // for one component. A lookup that cannot happen (GOPROXY=off, a private
 // module) is a note; a lookup that fails, including the newer-major probe,
@@ -179,18 +210,11 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	}
 	r.Caddy = Status{Name: "caddy", Package: caddyPath, Installed: installed, PseudoVersion: semver.IsPseudo(installed)}
 
-	// Latest lookups in parallel: Caddy plus every plugin with a known package.
+	// Latest lookups: Caddy plus every plugin with a known package.
 	r.Plugins = make([]Status, len(bin.Plugins))
-	var wg sync.WaitGroup
-	lookup := func(s *Status) {
-		defer wg.Done()
-		resolveStatus(ctx, proxy, s)
-	}
-	wg.Add(1)
-	go lookup(&r.Caddy)
+	rows := []*Status{&r.Caddy}
 	for i, p := range bin.Plugins {
-		s := Status{Name: p.ModuleID, Package: p.Package, Installed: p.Version, PseudoVersion: semver.IsPseudo(p.Version)}
-		r.Plugins[i] = s
+		r.Plugins[i] = Status{Name: p.ModuleID, Package: p.Package, Installed: p.Version, PseudoVersion: semver.IsPseudo(p.Version)}
 		switch {
 		case p.Error != "":
 			r.Plugins[i].Error = p.Error
@@ -199,11 +223,10 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		case p.Package == "" || p.Version == "":
 			r.Plugins[i].Note = "no module info; not checked"
 		default:
-			wg.Add(1)
-			go lookup(&r.Plugins[i])
+			rows = append(rows, &r.Plugins[i])
 		}
 	}
-	wg.Wait()
+	lookupAll(ctx, proxy, rows)
 	r.UpdatesAvailable = r.anyOutdated()
 	r.HasErrors = r.anyErrors()
 

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -55,6 +56,12 @@ func TestParseGOPROXY(t *testing.T) {
 		"off":                       {{URL: "off"}},
 		"direct":                    {{URL: "direct"}},
 		" https://a.example , off ": {{URL: "https://a.example"}, {URL: "off"}},
+		// A host without a scheme gets https://, as the go command does;
+		// absolute paths and full URLs are left alone.
+		"proxy.example.com,direct": {{URL: "https://proxy.example.com"}, {URL: "direct"}},
+		"localhost:3000":           {{URL: "https://localhost:3000"}},
+		"file:///srv/proxy/":       {{URL: "file:///srv/proxy"}},
+		"/srv/proxy":               {{URL: "/srv/proxy"}},
 	}
 	for in, want := range cases {
 		if got := ParseGOPROXY(in); !reflect.DeepEqual(got, want) {
@@ -194,6 +201,62 @@ func TestLatestBadResponses(t *testing.T) {
 	}
 	if info, err := c.Latest(ctx, "good.example/incompatible"); err != nil || info.Version != "v2.0.0+incompatible" {
 		t.Errorf("+incompatible on a bare path is valid: %v %+v", err, info)
+	}
+}
+
+func TestFileProxyURLParsing(t *testing.T) {
+	// Percent-escapes in the path are decoded, as url.Parse does.
+	dir := filepath.Join(t.TempDir(), "proxy cache")
+	mod := filepath.Join(dir, "example.com", "m")
+	os.MkdirAll(mod, 0o755)
+	os.WriteFile(filepath.Join(mod, "@latest"), []byte(`{"Version":"v1.0.0"}`), 0o644)
+	entry := "file://" + strings.ReplaceAll(dir, " ", "%20")
+	if info, err := client(entry, "").Latest(context.Background(), "example.com/m"); err != nil || info.Version != "v1.0.0" {
+		t.Errorf("escaped file URL: %v %+v", err, info)
+	}
+	for _, bad := range []string{"file://host/srv/proxy", "file:///srv/proxy?x=1", "file:///srv/proxy#f"} {
+		if _, _, err := fileProxyDir(bad); err == nil {
+			t.Errorf("%q: a file URL with more than a path must be rejected", bad)
+		}
+	}
+	if _, isFile, err := fileProxyDir("https://proxy.golang.org"); err != nil || isFile {
+		t.Errorf("https entry: isFile=%v err=%v", isFile, err)
+	}
+}
+
+func TestGoEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	envfile := filepath.Join(dir, "env")
+	os.WriteFile(envfile, []byte("# written by go env -w\nGOPRIVATE=corp.example/*\nGOPROXY=https://proxy.corp.example\n"), 0o644)
+	reset := func() { envFileOnce = sync.Once{}; envFile = nil }
+	t.Cleanup(reset)
+
+	// Values persisted with `go env -w` are seen when the process env is unset.
+	t.Setenv("GOENV", envfile)
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GOPROXY", "")
+	os.Unsetenv("GOPRIVATE")
+	os.Unsetenv("GOPROXY")
+	reset()
+	if got := GoEnv("GOPRIVATE"); got != "corp.example/*" {
+		t.Errorf("GOPRIVATE from GOENV file: %q", got)
+	}
+	c := New()
+	if c.NoProxy != "corp.example/*" || c.Sources[0].URL != "https://proxy.corp.example" {
+		t.Errorf("New should use the GOENV file: %+v", c)
+	}
+	// The process environment wins.
+	t.Setenv("GOPRIVATE", "other.example/*")
+	reset()
+	if got := GoEnv("GOPRIVATE"); got != "other.example/*" {
+		t.Errorf("process env should win: %q", got)
+	}
+	// GOENV=off disables the file.
+	os.Unsetenv("GOPRIVATE")
+	t.Setenv("GOENV", "off")
+	reset()
+	if got := GoEnv("GOPRIVATE"); got != "" {
+		t.Errorf("GOENV=off should ignore the file: %q", got)
 	}
 }
 

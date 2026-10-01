@@ -53,9 +53,13 @@ major do not compile against the next, so a major upgrade is a deliberate
 step with explicit flags.
 
 Latest versions come from the Go module proxy, following the same
-`GOPROXY` rules as the `go` command: proxies (http, https or `file://`)
-are tried in order, a comma falls through to the next source after a 404
-or 410, a pipe after any error. `GOPROXY=off` and `GOPROXY=direct` mean
+`GOPROXY` rules as the `go` command: proxies (http, https, a bare host
+which gets `https://`, or `file://`) are tried in order, a comma falls
+through to the next source after a 404 or 410, a pipe after any error.
+`GOPROXY`, `GONOPROXY` and `GOPRIVATE` are read from the process
+environment first and then from the file `go env -w` writes (`GOENV`, or
+the user config directory's `go/env`; `GOENV=off` disables it), so values
+persisted that way are honoured. `GOPROXY=off` and `GOPROXY=direct` mean
 nothing can be looked up and
 the component is reported as "not checked", as is any module matching
 `GONOPROXY` or `GOPRIVATE`, which is never sent to a proxy. A module a proxy
@@ -154,9 +158,11 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    become active and one more second to be sure it stays up, and where
    `/proc/<pid>/exe` is readable (root, or the same user) confirms the main
    process executes the new binary. If that fails, the previous binary and
-   lockfile are restored, the units are restarted again, the failed binary
-   is kept as `<target>.failed`, and `install` exits 1 with a message that
-   says whether the rollback itself succeeded.
+   lockfile are restored, the units are restarted and verified again on
+   the restored binary, the failed binary is kept as `<target>.failed`, and
+   `install` exits 1 with a message that says whether the rollback itself
+   succeeded and whether the service came back up on it. SIGTERM, like
+   Ctrl-C, cancels the run and lets this rollback happen.
 
 `--no-restart` stops after step 5. `--dry-run` prints the plan after step 2.
 

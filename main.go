@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/seanthegeek/upgrade-caddy/internal/build"
@@ -47,7 +48,10 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(exitError)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM is what service managers, CI cancellation and timeout(1)
+	// send; it must cancel the context like Ctrl-C so install can roll back
+	// instead of dying mid-swap.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var code int
