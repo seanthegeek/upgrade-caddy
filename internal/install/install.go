@@ -27,8 +27,7 @@ import (
 
 // Options controls an install.
 type Options struct {
-	Binary    string // installed binary to reproduce and replace ("" searches PATH)
-	Target    string // where to install; defaults to Binary
+	Target    string // binary to reproduce and replace; "" means the first caddy on PATH
 	From      string // install this binary, produced by build, instead of building
 	Fresh     bool   // nothing is installed yet; build from --with only (requires Target)
 	Config    string // config to validate against; defaults to the service's --config
@@ -36,7 +35,11 @@ type Options struct {
 	DryRun    bool
 	Verbose   bool
 
-	Build build.Options // version and plugin selection, timeouts, proxy
+	// Build carries the version and plugin selection (CaddyVersion, Upgrade,
+	// UpgradeAll, With, Replace, AllowMajor), Proxy and TimeoutBuild. Its
+	// Binary, Fresh, Output, DryRun, Verbose, Log and OnPlan fields are
+	// overwritten from the fields above and from the target.
+	Build build.Options
 
 	Log         io.Writer          // progress; nil discards
 	Control     systemd.Controller // nil means the real systemctl
@@ -48,34 +51,34 @@ type Options struct {
 type Plan struct {
 	Target       string         `json:"target"`
 	TargetExists bool           `json:"target_exists"`
-	Installed    *caddybin.Info `json:"installed,omitempty"`
+	Installed    *caddybin.Info `json:"installed,omitempty"` // what is at Target now
 	Units        []systemd.Unit `json:"units"`
+	NoSystemd    bool           `json:"no_systemd"` // systemctl is not on PATH, so no unit can be found or restarted
 	From         string         `json:"from,omitempty"`
 	FromInfo     *caddybin.Info `json:"from_info,omitempty"`
-	Build        *build.Plan    `json:"build,omitempty"`
+	BuildPlan    *build.Plan    `json:"build,omitempty"`
 
 	Config     string   `json:"config,omitempty"`
 	Adapter    string   `json:"adapter,omitempty"`
-	EnvFiles   []string `json:"envfiles,omitempty"`
-	WorkDir    string   `json:"workdir,omitempty"`
+	EnvFiles   []string `json:"env_files,omitempty"`
+	WorkDir    string   `json:"work_dir,omitempty"`
 	ConfigFrom string   `json:"config_from,omitempty"` // "--config" or the unit name
 
-	Caps        string   `json:"file_capabilities,omitempty"` // getcap output to re-apply
-	NeedsRoot   bool     `json:"needs_root"`
-	RootReasons []string `json:"root_reasons,omitempty"`
+	FileCapabilities string   `json:"file_capabilities,omitempty"` // getcap output to re-apply
+	NeedsRoot        bool     `json:"needs_root"`
+	RootReasons      []string `json:"root_reasons,omitempty"`
 
 	buildOpts build.Options
 }
 
 // Result is what Run did.
 type Result struct {
-	Target     string
-	Previous   string // rollback copy, "" when there was nothing installed
-	Lockfile   string
-	Installed  *caddybin.Info
-	Validated  bool
-	Restarted  []string
-	RolledBack bool
+	Target    string
+	Previous  string // rollback copy, "" when there was nothing installed
+	Lockfile  string
+	Built     *caddybin.Info // the binary now at Target
+	Validated string         // config the new binary was validated against, "" if none
+	Restarted []string
 }
 
 // Run resolves, prints, checks privileges, obtains the new binary,
@@ -109,7 +112,7 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 			return plan, nil, err
 		}
 	} else {
-		res, err := plan.Build.Build(ctx, plan.buildOpts)
+		res, err := plan.BuildPlan.Build(ctx, plan.buildOpts)
 		if err != nil {
 			return plan, nil, err
 		}
@@ -124,7 +127,7 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		cleanup()
 		return plan, nil, fmt.Errorf("inspecting the new binary: %w", err)
 	}
-	result := &Result{Target: plan.Target, Installed: newInfo}
+	result := &Result{Target: plan.Target, Built: newInfo}
 
 	// 2. Validate with the new binary against the real config.
 	if plan.Config != "" {
@@ -133,14 +136,14 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 			cleanup()
 			return plan, nil, err
 		}
-		result.Validated = true
+		result.Validated = plan.Config
 	} else {
 		fmt.Fprintln(logw, "==> no config found to validate against (no service runs this binary and --config was not given); skipping validation")
 	}
 
 	// 3. Swap.
 	fmt.Fprintf(logw, "==> installing %s\n", plan.Target)
-	previous, err := swap(plan.Target, newPath, plan.Caps)
+	previous, err := swap(plan.Target, newPath, plan.FileCapabilities)
 	if err != nil {
 		cleanup()
 		return plan, nil, err
@@ -176,7 +179,6 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 			}
 			fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
 			rbErr := rollback(plan.Target, previous)
-			result.RolledBack = true
 			var restartErrs []error
 			for _, again := range plan.Units {
 				if rerr := ctl.Restart(ctx, again.Name); rerr != nil {
@@ -200,6 +202,11 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	if opts.From != "" && opts.Fresh {
 		return nil, errors.New("--from and --fresh cannot be combined")
 	}
+	if opts.From != "" {
+		if sel := buildSelectionFlags(opts.Build); sel != "" {
+			return nil, fmt.Errorf("--from installs an existing build, so %s cannot be combined with it; pass those to 'build' instead", sel)
+		}
+	}
 	p := &Plan{}
 
 	// Target.
@@ -213,7 +220,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	case opts.Fresh:
 		return nil, errors.New("--fresh needs --target: there is no installed binary to take the path from")
 	default:
-		path, err := caddybin.Find(opts.Binary)
+		path, err := caddybin.Find("")
 		if err != nil {
 			return nil, fmt.Errorf("%w (or --fresh --target PATH for a first install)", err)
 		}
@@ -250,6 +257,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	}
 
 	// Service and config.
+	p.NoSystemd = !systemd.Available()
 	units, err := systemd.UnitsUsing(ctx, p.Target)
 	if err != nil {
 		return nil, fmt.Errorf("querying systemd: %w", err)
@@ -272,15 +280,15 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 
 	// File capabilities to carry over.
 	if p.TargetExists {
-		p.Caps = fileCaps(ctx, p.Target)
+		p.FileCapabilities = fileCaps(ctx, p.Target)
 	}
 
 	// Privileges.
-	restart := len(units)
+	restartCount := len(units)
 	if opts.NoRestart {
-		restart = 0
+		restartCount = 0
 	}
-	p.NeedsRoot, p.RootReasons = needsRoot(os.Geteuid(), dirWritable(filepath.Dir(p.Target)), filepath.Dir(p.Target), restart, unitNames(units), p.Caps != "")
+	p.NeedsRoot, p.RootReasons = needsRoot(os.Geteuid(), dirWritable(filepath.Dir(p.Target)), filepath.Dir(p.Target), restartCount, unitNames(units), p.FileCapabilities != "")
 
 	// Source of the new binary.
 	if opts.From != "" {
@@ -316,8 +324,33 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		return nil, err
 	}
 	bopts.DryRun = false
-	p.Build, p.buildOpts = bplan, bopts
+	p.BuildPlan, p.buildOpts = bplan, bopts
 	return p, nil
+}
+
+// buildSelectionFlags names the build-selection options that are set, for
+// the error that rejects them alongside --from.
+func buildSelectionFlags(b build.Options) string {
+	var set []string
+	if b.CaddyVersion != "" {
+		set = append(set, "--caddy-version")
+	}
+	if len(b.Upgrade) > 0 {
+		set = append(set, "--upgrade")
+	}
+	if b.UpgradeAll {
+		set = append(set, "--upgrade-all")
+	}
+	if len(b.With) > 0 {
+		set = append(set, "--with")
+	}
+	if len(b.Replace) > 0 {
+		set = append(set, "--replace")
+	}
+	if b.AllowMajor {
+		set = append(set, "--allow-major")
+	}
+	return strings.Join(set, ", ")
 }
 
 // refuseSystemPackage explains why install will not touch a system
@@ -355,13 +388,15 @@ func removeCommand(o *pkgmgr.Owner) string {
 }
 
 // needsRoot decides whether the install must run as root, and why.
-func needsRoot(euid int, dirWritable bool, dir string, restartUnits int, units string, hasCaps bool) (bool, []string) {
+// restartCount is how many units will be restarted and unitNames their
+// comma-joined names for the message.
+func needsRoot(euid int, canWriteDir bool, dir string, restartCount int, unitNames string, hasCaps bool) (bool, []string) {
 	var reasons []string
-	if !dirWritable {
+	if !canWriteDir {
 		reasons = append(reasons, "write to "+dir)
 	}
-	if restartUnits > 0 {
-		reasons = append(reasons, "restart "+units)
+	if restartCount > 0 {
+		reasons = append(reasons, "restart "+unitNames)
 	}
 	if hasCaps {
 		reasons = append(reasons, "re-apply file capabilities")
@@ -596,7 +631,10 @@ func (p *Plan) WriteText(w io.Writer) {
 		fmt.Fprint(w, " (nothing installed yet)")
 	}
 	fmt.Fprintln(w)
-	if len(p.Units) == 0 {
+	switch {
+	case p.NoSystemd:
+		fmt.Fprintln(w, "Service:  systemctl not found; no service can be found or restarted")
+	case len(p.Units) == 0:
 		fmt.Fprintln(w, "Service:  none runs this binary; nothing will be restarted")
 	}
 	for _, u := range p.Units {
@@ -607,8 +645,8 @@ func (p *Plan) WriteText(w io.Writer) {
 	} else {
 		fmt.Fprintln(w, "Validate: skipped, no config known; pass --config to validate")
 	}
-	if p.Caps != "" {
-		fmt.Fprintf(w, "Caps:     %s (will be re-applied)\n", p.Caps)
+	if p.FileCapabilities != "" {
+		fmt.Fprintf(w, "Caps:     %s (will be re-applied)\n", p.FileCapabilities)
 	}
 	if p.NeedsRoot {
 		fmt.Fprintf(w, "Root:     required to %s\n", strings.Join(p.RootReasons, " and "))
@@ -618,7 +656,7 @@ func (p *Plan) WriteText(w io.Writer) {
 		return
 	}
 	fmt.Fprintln(w, "Build:")
-	p.Build.WriteText(indent{w})
+	p.BuildPlan.WriteText(indent{w})
 }
 
 type indent struct{ w io.Writer }

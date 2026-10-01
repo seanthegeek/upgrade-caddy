@@ -97,13 +97,14 @@ resolved version and checksum of Caddy and every plugin.
 ## install
 
 ```text
-upgrade-caddy install [--binary PATH] [--target PATH] [--config PATH] [--no-restart]
-                      [--from PATH | build flags...] [--fresh] [--dry-run] [--verbose]
+upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
+                      [--from PATH | build flags...] [--fresh]
+                      [--restart-wait 15s] [--timeout 20m] [--dry-run] [--verbose]
 ```
 
 `install` does, in order:
 
-1. Resolves the target (the installed binary by default), the systemd units
+1. Resolves the target (the first `caddy` on `PATH` by default), the systemd units
    whose `ExecStart` runs it, and the config to validate against (the
    unit's `--config`, `--adapter` and `--envfile` flags, or `--config`).
 2. Refuses if the target belongs to a system package, and checks up front

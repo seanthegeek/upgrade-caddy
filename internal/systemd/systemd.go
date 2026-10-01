@@ -55,10 +55,16 @@ func (u Unit) ConfigArgs() (config, adapter string, envfiles []string) {
 
 const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p MainPID"
 
+// Available reports whether systemctl is on PATH.
+func Available() bool {
+	_, err := exec.LookPath("systemctl")
+	return err == nil
+}
+
 // UnitsUsing lists loaded service units whose ExecStart executable resolves
 // to binary. It returns nil, nil when systemctl is not available.
 func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
-	if _, err := exec.LookPath("systemctl"); err != nil {
+	if !Available() {
 		return nil, nil
 	}
 	want, err := filepath.EvalSymlinks(binary)

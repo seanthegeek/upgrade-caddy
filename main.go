@@ -25,9 +25,9 @@ var version = "0.1.0"
 
 // Exit codes.
 const (
-	ExitOK      = 0
-	ExitError   = 1
-	ExitUpdates = 2 // check: at least one component is outdated
+	exitOK      = 0
+	exitError   = 1
+	exitUpdates = 2 // check: at least one component is outdated
 )
 
 const usage = `usage: upgrade-caddy <command> [flags]
@@ -44,7 +44,7 @@ Run "upgrade-caddy <command> -h" for flags.
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(ExitError)
+		os.Exit(exitError)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -63,7 +63,7 @@ func main() {
 		fmt.Print(usage)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", os.Args[1], usage)
-		code = ExitError
+		code = exitError
 	}
 	os.Exit(code)
 }
@@ -87,20 +87,20 @@ func runCheck(ctx context.Context, args []string) int {
 	report, err := check.Run(ctx, check.Options{Binary: *binary})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade-caddy check:", err)
-		return ExitError
+		return exitError
 	}
 	if *asJSON {
 		if err := report.WriteJSON(os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "upgrade-caddy check:", err)
-			return ExitError
+			return exitError
 		}
 	} else {
 		report.WriteText(os.Stdout)
 	}
-	if report.UpdatesAvailable() {
-		return ExitUpdates
+	if report.UpdatesAvailable {
+		return exitUpdates
 	}
-	return ExitOK
+	return exitOK
 }
 
 // multiFlag collects a repeatable string flag.
@@ -147,28 +147,27 @@ func runBuild(ctx context.Context, args []string) int {
 	_, res, err := build.Run(ctx, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade-caddy build:", err)
-		return ExitError
+		return exitError
 	}
 	if opts.DryRun {
 		fmt.Fprintln(os.Stdout, "Dry run: nothing built.")
-		return ExitOK
+		return exitOK
 	}
 	fmt.Fprintf(os.Stdout, "Built %s (%s, %d plugins)\nLockfile %s\n", res.Output, res.Built.MainVersion, len(res.Built.Plugins), res.Lockfile)
-	return ExitOK
+	return exitOK
 }
 
 func runInstall(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	var opts install.Options
 	var upgrade, with, replace multiFlag
-	fs.StringVar(&opts.Binary, "binary", "", "installed caddy binary to reproduce and replace (default: first caddy on PATH)")
-	fs.StringVar(&opts.Target, "target", "", "where to install (default: the installed binary's path)")
+	fs.StringVar(&opts.Target, "target", "", "binary to reproduce and replace (default: first caddy on PATH)")
 	fs.StringVar(&opts.From, "from", "", "install this binary, produced by 'upgrade-caddy build', instead of building")
 	fs.BoolVar(&opts.Fresh, "fresh", false, "nothing is installed yet; build from --with only (requires --target)")
 	fs.StringVar(&opts.Config, "config", "", "config to validate against (default: the service's --config)")
 	fs.BoolVar(&opts.NoRestart, "no-restart", false, "swap the binary but do not restart the service")
 	fs.StringVar(&opts.Build.CaddyVersion, "caddy-version", "", "Caddy version to build (default: latest within the installed major)")
-	fs.Var(&upgrade, "upgrade", "plugin to bump to its latest version within its major (repeatable)")
+	fs.Var(&upgrade, "upgrade", "plugin to bump to its latest version within its major, by Go module path or Caddy module ID (repeatable)")
 	fs.BoolVar(&opts.Build.UpgradeAll, "upgrade-all", false, "bump every plugin to its latest version within its major")
 	fs.Var(&with, "with", "module[@version] to add, or whose version to override (repeatable)")
 	fs.Var(&replace, "replace", "old=new module replacement passed to xcaddy (repeatable)")
@@ -199,13 +198,16 @@ func runInstall(ctx context.Context, args []string) int {
 	_, res, err := install.Run(ctx, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade-caddy install:", err)
-		return ExitError
+		return exitError
 	}
 	if opts.DryRun {
 		fmt.Fprintln(os.Stdout, "Dry run: nothing changed.")
-		return ExitOK
+		return exitOK
 	}
-	fmt.Fprintf(os.Stdout, "Installed %s (%s, %d plugins)\n", res.Target, res.Installed.MainVersion, len(res.Installed.Plugins))
+	fmt.Fprintf(os.Stdout, "Installed %s (%s, %d plugins)\n", res.Target, res.Built.MainVersion, len(res.Built.Plugins))
+	if res.Validated != "" {
+		fmt.Fprintf(os.Stdout, "Validated %s\n", res.Validated)
+	}
 	if res.Previous != "" {
 		fmt.Fprintf(os.Stdout, "Previous  %s\n", res.Previous)
 	}
@@ -215,7 +217,7 @@ func runInstall(ctx context.Context, args []string) int {
 	if len(res.Restarted) > 0 {
 		fmt.Fprintf(os.Stdout, "Restarted %s\n", strings.Join(res.Restarted, ", "))
 	}
-	return ExitOK
+	return exitOK
 }
 
 // versionString is "upgrade-caddy 0.1.0 (go1.22.2 linux/amd64)", with the

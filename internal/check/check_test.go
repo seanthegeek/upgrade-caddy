@@ -17,18 +17,18 @@ func TestShort(t *testing.T) {
 	}
 }
 
-func TestUpdatesAvailable(t *testing.T) {
+func TestAnyOutdated(t *testing.T) {
 	current := Status{Name: "caddy", Installed: "v2.11.6", Latest: "v2.11.6"}
-	behind := Status{Name: "p", Installed: "v1.0.0", Latest: "v1.1.0", Outdated: true}
-	major := Status{Name: "caddy", Installed: "v2.11.6", Latest: "v2.11.6", Major: &Major{Package: "x/v3", Version: "v3.0.0"}}
+	behind := Status{Name: "p", Installed: "v1.0.0", Latest: "v1.1.0", NewerInMajor: true, Outdated: true}
+	major := Status{Name: "caddy", Installed: "v2.11.6", Latest: "v2.11.6", Outdated: true, MajorAvailable: &Major{Package: "x/v3", Version: "v3.0.0"}}
 
-	if (&Report{Caddy: current}).UpdatesAvailable() {
+	if (&Report{Caddy: current}).anyOutdated() {
 		t.Error("all current should be false")
 	}
-	if !(&Report{Caddy: current, Plugins: []Status{behind}}).UpdatesAvailable() {
+	if !(&Report{Caddy: current, Plugins: []Status{behind}}).anyOutdated() {
 		t.Error("outdated plugin should be true")
 	}
-	if !(&Report{Caddy: major}).UpdatesAvailable() {
+	if !(&Report{Caddy: major}).anyOutdated() {
 		t.Error("newer major should always count as an available update")
 	}
 }

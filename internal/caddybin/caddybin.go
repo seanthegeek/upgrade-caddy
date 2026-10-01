@@ -41,24 +41,24 @@ type Plugin struct {
 	Replace        string `json:"replace,omitempty"`         // replacement path if a replace directive was used
 	ReplaceVersion string `json:"replace_version,omitempty"` // version of the replacement, if it is a module
 	Sum            string `json:"sum,omitempty"`             // h1: checksum from build info, of the replacement when replaced
-	Err            string `json:"error,omitempty"`           // error Caddy reported for this module
+	Error          string `json:"error,omitempty"`           // error Caddy reported for this module
 }
 
 // Info is everything the tool can learn about a Caddy binary.
 type Info struct {
-	Path          string            `json:"path"`
-	ResolvedPath  string            `json:"resolved_path"`
-	Version       string            `json:"version"` // output of `caddy version`, first field
-	GoVersion     string            `json:"go_version"`
-	MainPath      string            `json:"main_path,omitempty"` // Caddy's module path, e.g. .../caddy/v2; "" when absent
-	MainVersion   string            `json:"main_version"`        // from build info; "" when absent
-	MainSum       string            `json:"main_sum,omitempty"`
-	HasModuleInfo bool              `json:"has_module_info"` // false for distro-style builds
-	Plugins       []Plugin          `json:"plugins"`         // non-standard modules
-	Unknown       []Plugin          `json:"unknown_modules,omitempty"`
-	StandardCount int               `json:"standard_count"`
-	Package       *pkgmgr.Owner     `json:"package,omitempty"`
-	Settings      map[string]string `json:"build_settings,omitempty"`
+	Path           string            `json:"path"`
+	ResolvedPath   string            `json:"resolved_path"`
+	Version        string            `json:"version"` // output of `caddy version`, first field
+	GoVersion      string            `json:"go_version"`
+	MainPath       string            `json:"main_path,omitempty"` // Caddy's module path, e.g. .../caddy/v2; "" when absent
+	MainVersion    string            `json:"main_version"`        // from build info; "" when absent
+	MainSum        string            `json:"main_sum,omitempty"`
+	HasModuleInfo  bool              `json:"has_module_info"` // false for distro-style builds
+	Plugins        []Plugin          `json:"plugins"`         // non-standard modules
+	UnknownModules []Plugin          `json:"unknown_modules,omitempty"`
+	StandardCount  int               `json:"standard_count"`
+	Owner          *pkgmgr.Owner     `json:"owner,omitempty"` // OS package that installed the file
+	BuildSettings  map[string]string `json:"build_settings,omitempty"`
 }
 
 // IsDistroBuild reports whether the binary lacks the Go module metadata that
@@ -92,9 +92,9 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 		return nil, fmt.Errorf("reading Go build info from %s: %w", path, err)
 	}
 	info.GoVersion = bi.GoVersion
-	info.Settings = map[string]string{}
+	info.BuildSettings = map[string]string{}
 	for _, s := range bi.Settings {
-		info.Settings[s.Key] = s.Value
+		info.BuildSettings[s.Key] = s.Value
 	}
 	// Upstream release builds have Caddy as the main module. xcaddy builds
 	// have a synthetic main package named "caddy" with Caddy itself as a
@@ -153,8 +153,8 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 		}
 	}
 	info.Plugins = nonstd
-	info.Unknown = unknown
-	info.Package = pkgmgr.Find(ctx, info.ResolvedPath)
+	info.UnknownModules = unknown
+	info.Owner = pkgmgr.Find(ctx, info.ResolvedPath)
 	return info, nil
 }
 
@@ -208,7 +208,7 @@ func parseModuleLine(line string) Plugin {
 	var p Plugin
 	line = strings.TrimSpace(line)
 	if i := strings.Index(line, " ["); i >= 0 {
-		p.Err = strings.TrimSuffix(strings.TrimSpace(line[i+2:]), "]")
+		p.Error = strings.TrimSuffix(strings.TrimSpace(line[i+2:]), "]")
 		line = line[:i]
 	}
 	f := strings.Fields(line)

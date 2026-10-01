@@ -129,7 +129,7 @@ fi
 sudo apt-get install -y -qq caddy >/dev/null
 PKG_INODE=$(stat -c %i /usr/bin/caddy)
 set +e
-OUT=$("${SUDO[@]}" "$TOOL" install --binary /usr/bin/caddy 2>&1)
+OUT=$("${SUDO[@]}" "$TOOL" install --target /usr/bin/caddy 2>&1)
 RC=$?
 set -e
 echo "$OUT"

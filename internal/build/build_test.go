@@ -84,9 +84,6 @@ func TestResolveDefaultsPinPluginsAndUpgradesCaddy(t *testing.T) {
 			t.Errorf("plugin should be pinned: %+v", pl)
 		}
 	}
-	if !p.Changes() {
-		t.Error("a Caddy bump is a change")
-	}
 }
 
 func TestResolveUpgradeByModuleIDAndPath(t *testing.T) {
@@ -125,8 +122,16 @@ func TestResolveWith(t *testing.T) {
 	if o := plugin(p, "github.com/example/other"); o == nil || o.Version != "v0.5.0" || o.Source != Added {
 		t.Errorf("added plugin: %+v", o)
 	}
-	if cf := plugin(p, "github.com/caddy-dns/cloudflare"); cf.Version != "v0.2.3" || cf.Source != Replaced {
+	if cf := plugin(p, "github.com/caddy-dns/cloudflare"); cf.Version != "v0.2.3" || cf.Source != Overridden {
 		t.Errorf("version override: %+v", cf)
+	}
+	// --with at the installed version changes nothing and stays pinned.
+	same, err := resolve(t, installed(), Options{With: []string{"github.com/caddy-dns/cloudflare@v0.2.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cf := plugin(same, "github.com/caddy-dns/cloudflare"); cf.Source != Pinned || cf.Version != "v0.2.1" {
+		t.Errorf("--with at the installed version: %+v", cf)
 	}
 	if len(p.Plugins) != 3 {
 		t.Errorf("want 3 plugins, got %d", len(p.Plugins))
@@ -148,7 +153,7 @@ func TestResolveWithNewMajorNeedsAllowMajor(t *testing.T) {
 	if plugin(p, "github.com/example/plugin") != nil {
 		t.Error("old major should be replaced, not kept alongside (duplicate module registration)")
 	}
-	if np := plugin(p, "github.com/example/plugin/v2"); np == nil || np.Version != "v2.0.1" || np.Source != Replaced || !strings.Contains(np.Note, "major version change") {
+	if np := plugin(p, "github.com/example/plugin/v2"); np == nil || np.Version != "v2.0.1" || np.Source != Overridden || !strings.Contains(np.Note, "major version change") {
 		t.Errorf("new major: %+v", np)
 	}
 	if len(p.Plugins) != 3 {

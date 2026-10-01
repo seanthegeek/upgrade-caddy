@@ -46,10 +46,9 @@ type Options struct {
 	DryRun       bool     // resolve and print the plan, do not build
 	Verbose      bool     // stream all build output instead of just step names
 	Proxy        *goproxy.Client
-	Log          io.Writer   // progress output; nil discards
-	OnPlan       func(*Plan) // called with the resolved plan before building, if set
-	TimeoutGet   time.Duration
-	TimeoutBuild time.Duration
+	Log          io.Writer     // progress output; nil discards
+	OnPlan       func(*Plan)   // called with the resolved plan before building, if set
+	TimeoutBuild time.Duration // xcaddy's timeout for the compile step; the overall limit is the context's
 }
 
 // Source says how a plugin ended up in the plan.
@@ -57,10 +56,10 @@ type Source string
 
 // Plugin sources.
 const (
-	Pinned   Source = "pinned"   // same version as the installed binary
-	Upgraded Source = "upgraded" // bumped to latest within its major by --upgrade or --upgrade-all
-	Added    Source = "added"    // new via --with
-	Replaced Source = "replaced" // an installed plugin whose version or major was overridden by --with
+	Pinned     Source = "pinned"     // same version as the installed binary
+	Upgraded   Source = "upgraded"   // bumped to latest within its major by --upgrade or --upgrade-all
+	Added      Source = "added"      // new via --with
+	Overridden Source = "overridden" // an installed plugin whose version or major was changed by --with
 )
 
 // Plugin is one module the new binary will carry.
@@ -83,7 +82,7 @@ type Plan struct {
 	Plugins        []Plugin         `json:"plugins"`
 	Replacements   []xcaddy.Replace `json:"replacements,omitempty"`
 	Output         string           `json:"output"`
-	GoVersion      string           `json:"go_version,omitempty"`
+	HostGoVersion  string           `json:"host_go_version,omitempty"` // the go on PATH; the build may auto-fetch a newer one
 }
 
 // Result is what Build produced.
@@ -94,8 +93,8 @@ type Result struct {
 }
 
 // Run inspects the installed binary (unless Fresh), resolves a plan, and
-// builds it unless DryRun is set. The plan is returned in every case so the
-// caller can print it.
+// builds it unless DryRun is set. Once resolved, the plan is returned even
+// when a later step fails, so the caller can print it.
 func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	if _, err := exec.LookPath("go"); err != nil {
 		return nil, nil, errors.New("the Go toolchain is required to build Caddy and no 'go' was found on PATH; see https://go.dev/dl/")
@@ -116,7 +115,7 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		return nil, nil, err
 	}
 	if out, err := exec.CommandContext(ctx, "go", "version").Output(); err == nil {
-		plan.GoVersion = strings.TrimPrefix(strings.TrimSpace(string(out)), "go version ")
+		plan.HostGoVersion = strings.TrimPrefix(strings.TrimSpace(string(out)), "go version ")
 	}
 	// build never replaces a binary a service is running; that is install's job
 	if units, err := systemd.UnitsUsing(ctx, plan.Output); err == nil && len(units) > 0 {
@@ -174,8 +173,8 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 	index := map[string]int{} // package path -> position in p.Plugins
 	if src != nil {
 		for _, ip := range src.Plugins {
-			if ip.Err != "" {
-				return nil, fmt.Errorf("plugin %s in %s reported an error: %s", ip.ModuleID, src.Path, ip.Err)
+			if ip.Error != "" {
+				return nil, fmt.Errorf("plugin %s in %s reported an error: %s", ip.ModuleID, src.Path, ip.Error)
 			}
 			if ip.Package == "" || ip.Version == "" {
 				return nil, fmt.Errorf("plugin %s in %s has no module path or version in build info; cannot pin it", ip.ModuleID, src.Path)
@@ -243,7 +242,10 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		}
 		if i, ok := index[path]; ok {
 			pl := &p.Plugins[i]
-			pl.Version, pl.Source = version, Replaced
+			pl.Version = version
+			if version != pl.Installed {
+				pl.Source = Overridden
+			}
 			continue
 		}
 		base, major := goproxy.SplitMajor(path)
@@ -254,7 +256,7 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 			}
 			delete(index, pl.Package)
 			pl.Note = join(pl.Note, "major version change from "+pl.Package+"@"+pl.Installed)
-			pl.Package, pl.Version, pl.Source = path, version, Replaced
+			pl.Package, pl.Version, pl.Source = path, version, Overridden
 			index[path] = i
 			continue
 		}
@@ -328,19 +330,6 @@ func join(a, b string) string {
 	return a + "; " + b
 }
 
-// Changes reports whether the plan differs from the source binary at all.
-func (p *Plan) Changes() bool {
-	if p.CaddyVersion != p.CaddyInstalled {
-		return true
-	}
-	for _, pl := range p.Plugins {
-		if pl.Source != Pinned {
-			return true
-		}
-	}
-	return false
-}
-
 // WriteText prints the plan for a human.
 func (p *Plan) WriteText(w io.Writer) {
 	if p.SourcePath != "" {
@@ -353,8 +342,8 @@ func (p *Plan) WriteText(w io.Writer) {
 	} else {
 		fmt.Fprintf(w, "Caddy:    %s\n", p.CaddyVersion)
 	}
-	if p.GoVersion != "" {
-		fmt.Fprintf(w, "Host Go:  %s (a newer toolchain is fetched automatically if Caddy requires it)\n", p.GoVersion)
+	if p.HostGoVersion != "" {
+		fmt.Fprintf(w, "Host Go:  %s (a newer toolchain is fetched automatically if Caddy requires it)\n", p.HostGoVersion)
 	}
 	fmt.Fprintf(w, "Output:   %s\n", p.Output)
 	if len(p.Plugins) == 0 {
@@ -406,7 +395,6 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 		CaddyVersion: p.CaddyVersion,
 		Plugins:      deps,
 		Replacements: p.Replacements,
-		TimeoutGet:   opts.TimeoutGet,
 		TimeoutBuild: opts.TimeoutBuild,
 		OnStep:       steps.onStep,
 	}
@@ -470,16 +458,16 @@ func (p *Plan) verify(built *caddybin.Info) error {
 	return nil
 }
 
-// Lockfile records exactly what went into a build, with checksums, so the
-// next run can show what changed and an installed binary can be traced to
-// its inputs.
+// Lockfile records exactly what went into a build, with checksums, so an
+// installed binary can be traced to its inputs. Nothing reads it back yet;
+// install only requires that one exists beside a --from binary.
 type Lockfile struct {
-	Schema    int          `json:"schema"`
-	BuiltAt   time.Time    `json:"built_at"`
-	GoVersion string       `json:"go_version"`
-	Caddy     LockModule   `json:"caddy"`
-	Plugins   []LockModule `json:"plugins"`
-	Source    *LockSource  `json:"source_binary,omitempty"`
+	Schema       int          `json:"schema"`
+	BuiltAt      time.Time    `json:"built_at"`
+	GoVersion    string       `json:"go_version"` // the toolchain that compiled the binary
+	Caddy        LockModule   `json:"caddy"`
+	Plugins      []LockModule `json:"plugins"`
+	SourceBinary *LockSource  `json:"source_binary,omitempty"`
 }
 
 // LockModule is one module in a Lockfile.
@@ -521,7 +509,7 @@ func writeLockfile(path string, p *Plan, built *caddybin.Info) error {
 		lf.Plugins = append(lf.Plugins, lm)
 	}
 	if p.SourcePath != "" {
-		lf.Source = &LockSource{Path: p.SourcePath, Version: p.CaddyInstalled}
+		lf.SourceBinary = &LockSource{Path: p.SourcePath, Version: p.CaddyInstalled}
 	}
 	data, err := json.MarshalIndent(lf, "", "  ")
 	if err != nil {

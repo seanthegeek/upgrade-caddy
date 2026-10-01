@@ -37,7 +37,7 @@ func TestParseListModules(t *testing.T) {
 	if nonstd[1].Replace != "../replace-response" {
 		t.Errorf("replace not parsed: %+v", nonstd[1])
 	}
-	if nonstd[2].Err != "some error text" || nonstd[2].Version != "v1.2.3" {
+	if nonstd[2].Error != "some error text" || nonstd[2].Version != "v1.2.3" {
 		t.Errorf("error line not parsed: %+v", nonstd[2])
 	}
 	if len(unknown) != 1 || unknown[0].ModuleID != "mystery.module" {

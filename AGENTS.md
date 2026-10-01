@@ -278,7 +278,7 @@ unprivileged, and should be after any change to `internal/install`:
 
 ```bash
 # in a scratch directory holding a binary that build produced
-./upgrade-caddy install --dry-run                                   # refusal with uninstall instructions
+./upgrade-caddy install --target /usr/bin/caddy --dry-run           # refusal with uninstall instructions
 ./upgrade-caddy install --binary scratch/caddy-x --config scratch/Caddyfile   # build, validate, swap, .previous
 ./upgrade-caddy install --from scratch/caddy-x --target scratch/new/caddy     # stage without building
 ./upgrade-caddy install --from scratch/caddy-x --target scratch/new/caddy --config scratch/bad.Caddyfile  # must change nothing

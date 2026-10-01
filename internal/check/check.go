@@ -33,36 +33,39 @@ type Major struct {
 
 // Status of one versioned component.
 type Status struct {
-	Name      string `json:"name"`
-	Package   string `json:"package,omitempty"`
-	Installed string `json:"installed"`
-	Latest    string `json:"latest,omitempty"`
-	Outdated  bool   `json:"outdated"`
-	Pseudo    bool   `json:"pseudo_version"` // installed is pinned to an untagged commit
-	Major     *Major `json:"major_available,omitempty"`
-	Note      string `json:"note,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Name           string `json:"name"`
+	Package        string `json:"package,omitempty"` // Go module path
+	Installed      string `json:"installed"`
+	Latest         string `json:"latest,omitempty"` // latest within the installed major
+	Outdated       bool   `json:"outdated"`         // a newer version exists, within the major or beyond it
+	NewerInMajor   bool   `json:"newer_in_major"`   // Latest is ahead of Installed
+	PseudoVersion  bool   `json:"pseudo_version"`   // installed is pinned to an untagged commit
+	MajorAvailable *Major `json:"major_available,omitempty"`
+	Note           string `json:"note,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
-// Report is the result of a check.
+// Report is the result of a check. UpdatesAvailable mirrors the exit
+// status so JSON consumers do not have to re-derive it.
 type Report struct {
-	Binary   *caddybin.Info `json:"binary"`
-	Caddy    Status         `json:"caddy"`
-	Plugins  []Status       `json:"plugins"`
-	Services []systemd.Unit `json:"services"`
-	Warnings []string       `json:"warnings"`
+	Binary           *caddybin.Info `json:"binary"`
+	Caddy            Status         `json:"caddy"`
+	Plugins          []Status       `json:"plugins"`
+	Units            []systemd.Unit `json:"units"`
+	Warnings         []string       `json:"warnings"`
+	UpdatesAvailable bool           `json:"updates_available"`
 
 	mu sync.Mutex // guards Warnings during concurrent lookups
 }
 
-// UpdatesAvailable reports whether Caddy or any plugin is behind. A newer
-// major version always counts: Caddy has never backported security fixes
-// to a previous major, so staying on one is a risk even though build will
-// not cross it without being told to.
-func (r *Report) UpdatesAvailable() bool {
+// anyOutdated reports whether Caddy or any plugin is behind. A newer major
+// version always counts: Caddy has never backported security fixes to a
+// previous major, so staying on one is a risk even though build will not
+// cross it without being told to.
+func (r *Report) anyOutdated() bool {
 	all := append([]Status{r.Caddy}, r.Plugins...)
 	for _, s := range all {
-		if s.Outdated || s.Major != nil {
+		if s.Outdated {
 			return true
 		}
 	}
@@ -94,7 +97,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	if units, err := systemd.UnitsUsing(ctx, bin.ResolvedPath); err != nil {
 		r.Warnings = append(r.Warnings, "could not query systemd: "+err.Error())
 	} else {
-		r.Services = units
+		r.Units = units
 	}
 
 	if bin.IsDistroBuild() {
@@ -102,10 +105,10 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 			"this binary carries no Go module information, which is typical of distribution packages; "+
 				"its plugin set and pinned versions cannot be reproduced, so 'build' and 'install' will refuse to operate on it")
 	}
-	if bin.Package != nil {
+	if bin.Owner != nil {
 		r.Warnings = append(r.Warnings, fmt.Sprintf(
 			"this binary is owned by the %s package %q; a custom build written over it would be undone by the next package upgrade",
-			bin.Package.Manager, bin.Package.Package))
+			bin.Owner.Manager, bin.Owner.Package))
 	}
 
 	// Caddy itself.
@@ -117,7 +120,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	if caddyPath == "" {
 		caddyPath = caddybin.CaddyModulePath
 	}
-	r.Caddy = Status{Name: "caddy", Package: caddyPath, Installed: installed, Pseudo: semver.IsPseudo(installed)}
+	r.Caddy = Status{Name: "caddy", Package: caddyPath, Installed: installed, PseudoVersion: semver.IsPseudo(installed)}
 
 	// Latest lookups in parallel: Caddy plus every plugin with a known package.
 	r.Plugins = make([]Status, len(bin.Plugins))
@@ -134,8 +137,8 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 			return
 		}
 		s.Latest = info.Version
-		s.Outdated = semver.Compare(s.Installed, s.Latest) < 0
-		if s.Outdated && s.Pseudo && semver.IsPseudo(s.Latest) {
+		s.NewerInMajor = semver.Compare(s.Installed, s.Latest) < 0
+		if s.NewerInMajor && s.PseudoVersion && semver.IsPseudo(s.Latest) {
 			s.Note = "untagged module: newer commit on default branch"
 		}
 		majors, err := proxy.NewerMajors(ctx, s.Package)
@@ -145,17 +148,18 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		}
 		if len(majors) > 0 {
 			newest := majors[len(majors)-1]
-			s.Major = &Major{Package: newest.Path, Version: newest.Version, Behind: len(majors)}
+			s.MajorAvailable = &Major{Package: newest.Path, Version: newest.Version, Behind: len(majors)}
 		}
+		s.Outdated = s.NewerInMajor || s.MajorAvailable != nil
 	}
 	wg.Add(1)
 	go lookup(&r.Caddy)
 	for i, p := range bin.Plugins {
-		s := Status{Name: p.ModuleID, Package: p.Package, Installed: p.Version, Pseudo: semver.IsPseudo(p.Version)}
+		s := Status{Name: p.ModuleID, Package: p.Package, Installed: p.Version, PseudoVersion: semver.IsPseudo(p.Version)}
 		r.Plugins[i] = s
 		switch {
-		case p.Err != "":
-			r.Plugins[i].Error = p.Err
+		case p.Error != "":
+			r.Plugins[i].Error = p.Error
 		case p.Replace != "":
 			r.Plugins[i].Note = "replaced by " + p.Replace + "; not checked"
 		case p.Package == "" || p.Version == "":
@@ -166,8 +170,9 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		}
 	}
 	wg.Wait()
+	r.UpdatesAvailable = r.anyOutdated()
 
-	if m := r.Caddy.Major; m != nil {
+	if m := r.Caddy.MajorAvailable; m != nil {
 		behind := "a newer major version"
 		if m.Behind > 1 {
 			behind = fmt.Sprintf("%d major versions", m.Behind)
@@ -196,15 +201,15 @@ func (r *Report) WriteText(w io.Writer) {
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "Version:  %s (%s)\n", b.Version, b.GoVersion)
-	if b.Package != nil {
-		fmt.Fprintf(w, "Package:  %s %s (%s)\n", b.Package.Package, b.Package.Version, b.Package.Manager)
+	if b.Owner != nil {
+		fmt.Fprintf(w, "Package:  %s %s (%s)\n", b.Owner.Package, b.Owner.Version, b.Owner.Manager)
 	}
 	if b.IsDistroBuild() {
 		fmt.Fprintln(w, "Build:    no Go module information (distribution-style build)")
 	} else {
 		fmt.Fprintf(w, "Build:    Go module info present, %d standard modules, %d plugins\n", b.StandardCount, len(b.Plugins))
 	}
-	for _, u := range r.Services {
+	for _, u := range r.Units {
 		fmt.Fprintf(w, "Service:  %s (%s/%s)\n", u.Name, u.ActiveState, u.SubState)
 	}
 	fmt.Fprintln(w)
@@ -216,14 +221,14 @@ func (r *Report) WriteText(w io.Writer) {
 		writeRow(tw, p)
 	}
 	tw.Flush()
-	if len(r.Plugins) == 0 && len(b.Unknown) == 0 {
+	if len(r.Plugins) == 0 && len(b.UnknownModules) == 0 {
 		if b.IsDistroBuild() {
 			fmt.Fprintln(w, "\nPlugins:  unknown (no module information in this binary)")
 		} else {
 			fmt.Fprintln(w, "\nPlugins:  none")
 		}
 	}
-	for _, u := range b.Unknown {
+	for _, u := range b.UnknownModules {
 		fmt.Fprintf(w, "Unknown module: %s (no package information)\n", u.ModuleID)
 	}
 
@@ -242,17 +247,17 @@ func writeRow(w io.Writer, s Status) {
 		status = "error: " + s.Error
 	case s.Latest == "":
 		status = "not checked"
-	case s.Outdated || s.Major != nil:
+	case s.Outdated:
 		status = "OUTDATED"
 	}
 	if s.Note != "" {
 		status += " (" + s.Note + ")"
 	}
-	if s.Major != nil {
-		if s.Major.Behind > 1 {
-			status += fmt.Sprintf(" (%d majors behind: %s at %s)", s.Major.Behind, s.Major.Version, s.Major.Package)
+	if m := s.MajorAvailable; m != nil {
+		if m.Behind > 1 {
+			status += fmt.Sprintf(" (%d majors behind: %s at %s)", m.Behind, m.Version, m.Package)
 		} else {
-			status += " (major " + s.Major.Version + " at " + s.Major.Package + ")"
+			status += " (major " + m.Version + " at " + m.Package + ")"
 		}
 	}
 	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Package, short(s.Installed), short(s.Latest), status)

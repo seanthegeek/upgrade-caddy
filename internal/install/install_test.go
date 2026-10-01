@@ -3,6 +3,8 @@ package install
 import (
 	"context"
 	"errors"
+
+	"github.com/seanthegeek/upgrade-caddy/internal/build"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,6 +227,24 @@ func TestStageAndCopy(t *testing.T) {
 	os.Remove(from + ".lock.json")
 	if _, _, err := stage(from, filepath.Join(dst, "caddy2")); err == nil {
 		t.Error("missing lockfile should fail staging")
+	}
+}
+
+func TestFromRejectsBuildSelection(t *testing.T) {
+	cases := map[string]Options{
+		"upgrade-all":   {From: "/x/caddy", Build: build.Options{UpgradeAll: true}},
+		"with":          {From: "/x/caddy", Build: build.Options{With: []string{"example.com/p"}}},
+		"caddy-version": {From: "/x/caddy", Build: build.Options{CaddyVersion: "v2.11.0"}},
+		"allow-major":   {From: "/x/caddy", Build: build.Options{AllowMajor: true}},
+	}
+	for name, opts := range cases {
+		_, err := Resolve(context.Background(), opts)
+		if err == nil || !strings.Contains(err.Error(), "--from installs an existing build") {
+			t.Errorf("%s: want the --from rejection, got %v", name, err)
+		}
+	}
+	if got := buildSelectionFlags(build.Options{Upgrade: []string{"x"}, Replace: []string{"a=b"}}); got != "--upgrade, --replace" {
+		t.Errorf("buildSelectionFlags: %q", got)
 	}
 }
 
