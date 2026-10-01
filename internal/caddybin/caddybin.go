@@ -1,0 +1,200 @@
+// Package caddybin inspects an installed Caddy binary: its version, the Go
+// module information embedded at build time, the non-standard plugins it
+// carries, and whether a package manager owns it.
+package caddybin
+
+import (
+	"context"
+	"debug/buildinfo"
+	"errors"
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime/debug"
+	"strings"
+
+	"github.com/seanthegeek/upgrade-caddy/internal/pkgmgr"
+)
+
+// CaddyModulePath is the Go module path of Caddy v2.
+const CaddyModulePath = "github.com/caddyserver/caddy/v2"
+
+// Plugin is a non-standard Caddy module compiled into the binary.
+type Plugin struct {
+	ModuleID string `json:"module_id"`         // e.g. dns.providers.cloudflare
+	Package  string `json:"package,omitempty"` // Go module path
+	Version  string `json:"version,omitempty"` // Go module version as built
+	Replace  string `json:"replace,omitempty"` // replacement path if a replace directive was used
+	Sum      string `json:"sum,omitempty"`     // h1: checksum from build info
+	Err      string `json:"error,omitempty"`   // error Caddy reported for this module
+}
+
+// Info is everything the tool can learn about a Caddy binary.
+type Info struct {
+	Path          string            `json:"path"`
+	ResolvedPath  string            `json:"resolved_path"`
+	Version       string            `json:"version"` // output of `caddy version`, first field
+	GoVersion     string            `json:"go_version"`
+	MainVersion   string            `json:"main_version"` // from build info; "" when absent
+	MainSum       string            `json:"main_sum,omitempty"`
+	HasModuleInfo bool              `json:"has_module_info"` // false for distro-style builds
+	Plugins       []Plugin          `json:"plugins"`         // non-standard modules
+	Unknown       []Plugin          `json:"unknown_modules,omitempty"`
+	StandardCount int               `json:"standard_count"`
+	Package       *pkgmgr.Owner     `json:"package,omitempty"`
+	Settings      map[string]string `json:"build_settings,omitempty"`
+}
+
+// IsDistroBuild reports whether the binary lacks the Go module metadata that
+// upstream and xcaddy builds always carry. Without it the plugin set and
+// pinned versions cannot be reproduced.
+func (i *Info) IsDistroBuild() bool { return !i.HasModuleInfo }
+
+// Find returns the binary to inspect: explicit if non-empty, else the first
+// "caddy" on $PATH.
+func Find(explicit string) (string, error) {
+	if explicit != "" {
+		return filepath.Abs(explicit)
+	}
+	p, err := exec.LookPath("caddy")
+	if err != nil {
+		return "", errors.New("no caddy binary found on PATH; pass --binary")
+	}
+	return filepath.Abs(p)
+}
+
+// Inspect reads build info from the file and runs the binary to list its
+// modules.
+func Inspect(ctx context.Context, path string) (*Info, error) {
+	info := &Info{Path: path, ResolvedPath: path}
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		info.ResolvedPath = r
+	}
+
+	bi, err := buildinfo.ReadFile(info.ResolvedPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading Go build info from %s: %w", path, err)
+	}
+	info.GoVersion = bi.GoVersion
+	info.Settings = map[string]string{}
+	for _, s := range bi.Settings {
+		info.Settings[s.Key] = s.Value
+	}
+	if bi.Main.Path != "" && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		info.HasModuleInfo = true
+		info.MainVersion = bi.Main.Version
+		info.MainSum = bi.Main.Sum
+	}
+	// xcaddy builds have a synthetic main package named "caddy" with Caddy
+	// itself as a dependency; the real version lives in Deps.
+	deps := map[string]*debug.Module{}
+	for _, d := range bi.Deps {
+		deps[d.Path] = d
+		if d.Path == CaddyModulePath {
+			info.HasModuleInfo = true
+			info.MainVersion = d.Version
+			info.MainSum = d.Sum
+		}
+	}
+
+	out, err := exec.CommandContext(ctx, info.ResolvedPath, "version").Output()
+	if err != nil {
+		return nil, fmt.Errorf("running %s version: %w", path, err)
+	}
+	if f := strings.Fields(string(out)); len(f) > 0 {
+		info.Version = f[0]
+	}
+
+	listOut, err := listModules(ctx, info.ResolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	std, nonstd, unknown := ParseListModules(listOut)
+	info.StandardCount = std
+	for i := range nonstd {
+		if d, ok := deps[nonstd[i].Package]; ok {
+			nonstd[i].Sum = d.Sum
+			if nonstd[i].Version == "" {
+				nonstd[i].Version = d.Version
+			}
+		}
+	}
+	info.Plugins = nonstd
+	info.Unknown = unknown
+	info.Package = pkgmgr.Find(ctx, info.ResolvedPath)
+	return info, nil
+}
+
+func listModules(ctx context.Context, bin string) (string, error) {
+	out, err := exec.CommandContext(ctx, bin, "list-modules", "--packages", "--versions").Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return "", fmt.Errorf("running %s list-modules: %w: %s", bin, err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", fmt.Errorf("running %s list-modules: %w", bin, err)
+	}
+	return string(out), nil
+}
+
+var sectionRe = regexp.MustCompile(`^\s*(Standard|Non-standard|Unknown) modules: (\d+)\s*$`)
+
+// ParseListModules parses the text output of `caddy list-modules --packages
+// --versions`. Lines are "id [version] [package [=> replace]] [[error]]",
+// and each group is terminated by a "<Kind> modules: N" summary line.
+func ParseListModules(out string) (standard int, nonstandard, unknown []Plugin) {
+	var pending []Plugin
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if m := sectionRe.FindStringSubmatch(line); m != nil {
+			switch m[1] {
+			case "Standard":
+				standard = len(pending)
+				fmt.Sscan(m[2], &standard)
+			case "Non-standard":
+				nonstandard = pending
+			case "Unknown":
+				unknown = pending
+			}
+			pending = nil
+			continue
+		}
+		pending = append(pending, parseModuleLine(line))
+	}
+	// Old Caddy versions that cannot resolve module info print bare IDs with
+	// no summary lines at all; treat those as unknown.
+	if len(pending) > 0 && nonstandard == nil && unknown == nil {
+		unknown = pending
+	}
+	return standard, nonstandard, unknown
+}
+
+func parseModuleLine(line string) Plugin {
+	var p Plugin
+	line = strings.TrimSpace(line)
+	if i := strings.Index(line, " ["); i >= 0 {
+		p.Err = strings.TrimSuffix(strings.TrimSpace(line[i+2:]), "]")
+		line = line[:i]
+	}
+	f := strings.Fields(line)
+	if len(f) == 0 {
+		return p
+	}
+	p.ModuleID = f[0]
+	rest := f[1:]
+	if len(rest) > 0 && strings.HasPrefix(rest[0], "v") && !strings.Contains(rest[0], "/") {
+		p.Version = rest[0]
+		rest = rest[1:]
+	}
+	if len(rest) > 0 {
+		p.Package = rest[0]
+		rest = rest[1:]
+	}
+	if len(rest) >= 2 && rest[0] == "=>" {
+		p.Replace = rest[1]
+	}
+	return p
+}
