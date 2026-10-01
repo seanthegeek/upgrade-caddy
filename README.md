@@ -31,11 +31,16 @@ says what it found.
 upgrade-caddy check [--binary PATH] [--json] [--timeout 60s]
 ```
 
-Exit status: `0` everything is current, `2` updates are available, `1` error.
+Exit status: `0` everything is current, `2` updates are available, `1` error,
+including when some component could not be checked because the proxy
+failed (the JSON report then has `has_errors: true`). A component that
+cannot be looked up at all (`GOPROXY=off`, a private module) is "not
+checked" and does not affect the status.
 
 Go keeps the major version in the module path (`.../caddy/v2`), so a plain
 latest-version query never sees a new major. `check` also probes the next
-major path for Caddy and every plugin and reports any it finds. A newer major
+major path for Caddy and every plugin and reports any it finds, giving up
+after two consecutive major numbers that do not exist. A newer major
 counts as an available update, because Caddy has never backported security
 fixes to a previous major: staying on the old one means going unpatched.
 `build` will still not cross a major on its own, since plugins built for one
@@ -43,9 +48,10 @@ major do not compile against the next, so a major upgrade is a deliberate
 step with explicit flags.
 
 Latest versions come from the Go module proxy, following the same
-`GOPROXY` rules as the `go` command: proxies are tried in order, a comma
-falls through to the next source after a 404 or 410, a pipe after any
-error. `GOPROXY=off` and `GOPROXY=direct` mean nothing can be looked up and
+`GOPROXY` rules as the `go` command: proxies (http, https or `file://`)
+are tried in order, a comma falls through to the next source after a 404
+or 410, a pipe after any error. `GOPROXY=off` and `GOPROXY=direct` mean
+nothing can be looked up and
 the component is reported as "not checked", as is any module matching
 `GONOPROXY` or `GOPRIVATE`, which is never sent to a proxy. A module a proxy
 answers 404 for is reported as not found even when `direct` follows, since
@@ -105,9 +111,11 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
 `install` does, in order:
 
 1. Resolves the target (the first `caddy` on `PATH` by default), the systemd units
-   whose `ExecStart` runs it, and the config to validate against (the
-   unit's `--config`, `--adapter` and `--envfile` flags, or `--config`).
-2. Refuses if the target belongs to a system package, and checks up front
+   whose `ExecStart` runs it, and the configs to validate against (every
+   distinct set of `--config`, `--adapter` and `--envfile` flags across
+   those units, or the `--config` flag).
+2. Refuses if the target belongs to a system package, or if the package
+   manager cannot say either way, and checks up front
    whether root is needed (to write the directory, restart the unit, or
    re-apply file capabilities) so a long build never ends in "permission
    denied".
@@ -121,18 +129,20 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    sudo upgrade-caddy install --from /tmp/caddy
    ```
 
-4. Runs `validate` with the new binary against the real config. A rejected
+4. Runs `validate` with the new binary against each real config. A rejected
    config stops everything before anything changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the
    path. Mode and file capabilities (`getcap`) are carried over; owner is
-   too when running as root.
+   too when running as root. The lockfile is installed the same way, with
+   the old one kept as `<target>.lock.json.previous`.
 6. Restarts each unit, waits up to `--restart-wait` (default 15s) for it to
    become active and one more second to be sure it stays up, and where
    `/proc/<pid>/exe` is readable (root, or the same user) confirms the main
-   process executes the new binary. If that fails, the previous binary is
-   restored, the unit is restarted again, the failed binary is kept as
-   `<target>.failed`, and `install` exits 1.
+   process executes the new binary. If that fails, the previous binary and
+   lockfile are restored, the units are restarted again, the failed binary
+   is kept as `<target>.failed`, and `install` exits 1 with a message that
+   says whether the rollback itself succeeded.
 
 `--no-restart` stops after step 5. `--dry-run` prints the plan after step 2.
 

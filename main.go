@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -69,7 +70,7 @@ func main() {
 }
 
 func runCheck(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("check", flag.ExitOnError)
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	binary := fs.String("binary", "", "path to the caddy binary (default: first caddy on PATH)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	timeout := fs.Duration("timeout", 60*time.Second, "overall timeout for version lookups")
@@ -79,7 +80,9 @@ func runCheck(ctx context.Context, args []string) int {
 		fmt.Fprintln(fs.Output(), "A newer major version counts as an available update: Caddy does not backport fixes to older majors.")
 		fs.PrintDefaults()
 	}
-	fs.Parse(args)
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
@@ -97,10 +100,29 @@ func runCheck(ctx context.Context, args []string) int {
 	} else {
 		report.WriteText(os.Stdout)
 	}
+	if report.HasErrors {
+		fmt.Fprintln(os.Stderr, "upgrade-caddy check: some components could not be checked; see the STATUS column")
+		return exitError
+	}
 	if report.UpdatesAvailable {
 		return exitUpdates
 	}
 	return exitOK
+}
+
+// parseFlags parses args and maps the outcome to an exit code: ok is false
+// when the command should stop, with code 0 after -h and 1 after a usage
+// error. flag.ExitOnError would exit 2, which check uses to mean "updates
+// available".
+func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
+	switch err := fs.Parse(args); {
+	case err == nil:
+		return exitOK, true
+	case errors.Is(err, flag.ErrHelp):
+		return exitOK, false
+	default:
+		return exitError, false
+	}
 }
 
 // multiFlag collects a repeatable string flag.
@@ -110,7 +132,7 @@ func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
 func runBuild(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("build", flag.ExitOnError)
+	fs := flag.NewFlagSet("build", flag.ContinueOnError)
 	var opts build.Options
 	var upgrade, with, replace multiFlag
 	fs.StringVar(&opts.Binary, "binary", "", "installed caddy binary to reproduce (default: first caddy on PATH)")
@@ -132,7 +154,9 @@ func runBuild(ctx context.Context, args []string) int {
 		fmt.Fprintln(fs.Output(), "Writes <output>.lock.json recording the version and checksum of Caddy and every plugin.")
 		fs.PrintDefaults()
 	}
-	fs.Parse(args)
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
 	opts.Upgrade, opts.With, opts.Replace = upgrade, with, replace
 	opts.Log = os.Stderr
 	opts.TimeoutBuild = *timeout
@@ -158,7 +182,7 @@ func runBuild(ctx context.Context, args []string) int {
 }
 
 func runInstall(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	var opts install.Options
 	var upgrade, with, replace multiFlag
 	fs.StringVar(&opts.Target, "target", "", "binary to reproduce and replace (default: first caddy on PATH)")
@@ -183,7 +207,9 @@ func runInstall(ctx context.Context, args []string) int {
 		fmt.Fprintln(fs.Output(), "back if the unit does not come up. Never installs over a system package.")
 		fs.PrintDefaults()
 	}
-	fs.Parse(args)
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
 	opts.Build.Upgrade, opts.Build.With, opts.Build.Replace = upgrade, with, replace
 	opts.Build.TimeoutBuild = *timeout
 	opts.Log = os.Stderr
@@ -205,8 +231,8 @@ func runInstall(ctx context.Context, args []string) int {
 		return exitOK
 	}
 	fmt.Fprintf(os.Stdout, "Installed %s (%s, %d plugins)\n", res.Target, res.Built.MainVersion, len(res.Built.Plugins))
-	if res.Validated != "" {
-		fmt.Fprintf(os.Stdout, "Validated %s\n", res.Validated)
+	if len(res.Validated) > 0 {
+		fmt.Fprintf(os.Stdout, "Validated %s\n", strings.Join(res.Validated, ", "))
 	}
 	if res.Previous != "" {
 		fmt.Fprintf(os.Stdout, "Previous  %s\n", res.Previous)

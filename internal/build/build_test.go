@@ -174,6 +174,34 @@ func TestResolveUpgradeNotesNewerMajor(t *testing.T) {
 	}
 }
 
+func TestResolveBarePathMajorChange(t *testing.T) {
+	// v0 and v1 share a bare module path. "Latest" being v1 while v0 is
+	// installed is a major change and needs --allow-major.
+	src := installed()
+	src.Plugins = []caddybin.Plugin{{ModuleID: "x", Package: "github.com/example/plugin", Version: "v0.9.0"}}
+	p, err := resolve(t, src, Options{Upgrade: []string{"x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl := plugin(p, "github.com/example/plugin")
+	if pl.Version != "v0.9.0" || pl.Source != Pinned || !strings.Contains(pl.Note, "new major on the same path") {
+		t.Errorf("--upgrade must not cross v0 -> v1 silently: %+v", pl)
+	}
+	p, err = resolve(t, src, Options{Upgrade: []string{"x"}, AllowMajor: true})
+	if err != nil || plugin(p, "github.com/example/plugin").Version != "v1.3.0" {
+		t.Errorf("--upgrade with --allow-major should take v1: %v %+v", err, p.Plugins)
+	}
+	if _, err := resolve(t, src, Options{With: []string{"github.com/example/plugin"}}); err == nil || !strings.Contains(err.Error(), "--allow-major") {
+		t.Errorf("--with resolving to a new major on the same path must need --allow-major: %v", err)
+	}
+	if _, err := resolve(t, src, Options{With: []string{"github.com/example/plugin@v1.0.0"}}); err == nil || !strings.Contains(err.Error(), "from v0 to v1") {
+		t.Errorf("explicit --with across v0 -> v1 must need --allow-major: %v", err)
+	}
+	if p, err := resolve(t, src, Options{With: []string{"github.com/example/plugin@v1.0.0"}, AllowMajor: true}); err != nil || plugin(p, "github.com/example/plugin").Version != "v1.0.0" {
+		t.Errorf("explicit --with with --allow-major: %v", err)
+	}
+}
+
 func TestResolveCaddyMajor(t *testing.T) {
 	if _, err := resolve(t, installed(), Options{CaddyVersion: "v3.0.0"}); err == nil || !strings.Contains(err.Error(), "--allow-major") {
 		t.Errorf("caddy major change without --allow-major should fail, got %v", err)

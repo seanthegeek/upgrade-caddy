@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -168,6 +170,26 @@ func TestLatestBadResponses(t *testing.T) {
 		if _, err := c.Latest(ctx, m); err == nil || errors.Is(err, ErrNotFound) {
 			t.Errorf("%s: want a hard error, got %v", m, err)
 		}
+	}
+}
+
+func TestFileProxy(t *testing.T) {
+	dir := t.TempDir()
+	mod := filepath.Join(dir, "example.com", "!upper")
+	os.MkdirAll(mod, 0o755)
+	os.WriteFile(filepath.Join(mod, "@latest"), []byte(`{"Version":"v1.5.0","Time":"2026-01-01T00:00:00Z"}`), 0o644)
+	ctx := context.Background()
+	c := client("file://"+dir+",direct", "")
+	info, err := c.Latest(ctx, "example.com/Upper")
+	if err != nil || info.Version != "v1.5.0" {
+		t.Errorf("file proxy: %v %+v", err, info)
+	}
+	if _, err := c.Latest(ctx, "example.com/missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing file should be not found: %v", err)
+	}
+	os.WriteFile(filepath.Join(mod, "@latest"), []byte("junk"), 0o644)
+	if _, err := c.Latest(ctx, "example.com/Upper"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("bad JSON in a file proxy is a hard error: %v", err)
 	}
 }
 

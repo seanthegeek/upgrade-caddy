@@ -1,6 +1,13 @@
 package check
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/seanthegeek/upgrade-caddy/internal/goproxy"
+)
 
 func TestShort(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -30,5 +37,67 @@ func TestAnyOutdated(t *testing.T) {
 	}
 	if !(&Report{Caddy: major}).anyOutdated() {
 		t.Error("newer major should always count as an available update")
+	}
+}
+
+func fakeProxy(t *testing.T, versions map[string]string, broken ...string) *goproxy.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, b := range broken {
+			if r.URL.Path == b {
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+		}
+		if v, ok := versions[r.URL.Path]; ok {
+			w.Write([]byte(`{"Version":"` + v + `","Time":"2026-01-01T00:00:00Z"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return &goproxy.Client{Sources: goproxy.ParseGOPROXY(srv.URL), HTTP: srv.Client()}
+}
+
+func TestResolveStatus(t *testing.T) {
+	ctx := context.Background()
+	var warnings []string
+	warn := func(m string) { warnings = append(warnings, m) }
+
+	// Newer within the major, but the major probe fails: still outdated.
+	p := fakeProxy(t, map[string]string{"/example.com/m/@latest": "v1.2.0"}, "/example.com/m/v2/@latest")
+	s := Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}
+	resolveStatus(ctx, p, &s, warn)
+	if !s.NewerInMajor || !s.Outdated || s.Error != "" || len(warnings) != 1 {
+		t.Errorf("failed major probe must not hide a within-major update: %+v warnings=%v", s, warnings)
+	}
+	// A hard failure on the lookup itself is an error, not "current".
+	s = Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}
+	resolveStatus(ctx, fakeProxy(t, nil, "/example.com/m/@latest"), &s, warn)
+	if s.Error == "" || s.Outdated {
+		t.Errorf("hard lookup failure: %+v", s)
+	}
+	// Cannot look up: a note, not an error.
+	s = Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}
+	resolveStatus(ctx, &goproxy.Client{Sources: goproxy.ParseGOPROXY("off")}, &s, warn)
+	if s.Error != "" || s.Note == "" || s.Outdated {
+		t.Errorf("GOPROXY=off: %+v", s)
+	}
+	// Current within the major, newer major available: outdated.
+	p = fakeProxy(t, map[string]string{"/example.com/m/@latest": "v1.0.0", "/example.com/m/v2/@latest": "v2.0.0"})
+	s = Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}
+	resolveStatus(ctx, p, &s, warn)
+	if s.NewerInMajor || !s.Outdated || s.MajorAvailable == nil || s.MajorAvailable.Behind != 1 {
+		t.Errorf("newer major: %+v", s)
+	}
+}
+
+func TestAnyErrors(t *testing.T) {
+	r := &Report{Caddy: Status{Name: "caddy"}, Plugins: []Status{{Name: "p", Error: "boom"}}}
+	if !r.anyErrors() {
+		t.Error("a component error must be reported")
+	}
+	if (&Report{Caddy: Status{Name: "caddy", Note: "GOPROXY=off"}}).anyErrors() {
+		t.Error("a not-checked note is not an error")
 	}
 }

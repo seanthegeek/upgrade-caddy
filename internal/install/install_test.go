@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/seanthegeek/upgrade-caddy/internal/build"
+	"github.com/seanthegeek/upgrade-caddy/internal/systemd"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,120 @@ func TestSwapAndRollback(t *testing.T) {
 	}
 }
 
+func TestRollbackRestoresEvenWhenFailedCopyCannotBeKept(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("bad"), 0o755)
+	os.WriteFile(target+".previous", []byte("good"), 0o755)
+	// A non-empty directory at the .failed path makes the link fail.
+	os.MkdirAll(filepath.Join(target+".failed", "x"), 0o755)
+	err := rollback(target, target+".previous")
+	if got, _ := os.ReadFile(target); string(got) != "good" {
+		t.Fatalf("target must be restored first, got %q", got)
+	}
+	if err == nil || !strings.Contains(err.Error(), "could not keep the failed binary") {
+		t.Errorf("the diagnostic failure must still be reported: %v", err)
+	}
+}
+
+func TestLockfileSwapAndRollback(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	lock := target + ".lock.json"
+	os.WriteFile(lock, []byte("old"), 0o644)
+	staged := filepath.Join(dir, "staged.lock.json")
+	os.WriteFile(staged, []byte("new"), 0o644)
+	if err := swapLockfile(target, staged); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(lock); string(got) != "new" {
+		t.Errorf("lockfile after swap: %q", got)
+	}
+	if got, _ := os.ReadFile(lock + ".previous"); string(got) != "old" {
+		t.Errorf("previous lockfile should be kept: %q", got)
+	}
+	if err := rollbackLockfile(target); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(lock); string(got) != "old" {
+		t.Errorf("lockfile after rollback: %q", got)
+	}
+	// First install: no previous lockfile, rollback removes the new one.
+	os.Remove(lock)
+	os.WriteFile(staged, []byte("new"), 0o644)
+	if err := swapLockfile(target, staged); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollbackLockfile(target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(lock); !errors.Is(err, os.ErrNotExist) {
+		t.Error("rollback with no previous lockfile should remove the new one")
+	}
+}
+
+func TestRestartUnitsRollsBackUnderCancelledContext(t *testing.T) {
+	settleDelay = 10 * time.Millisecond
+	t.Cleanup(func() { settleDelay = time.Second })
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("new"), 0o755)
+	os.WriteFile(target+".previous", []byte("old"), 0o755)
+	os.WriteFile(target+".lock.json", []byte("newlock"), 0o644)
+	os.WriteFile(target+".lock.json.previous", []byte("oldlock"), 0o644)
+
+	// The caller's context is already cancelled, as after Ctrl-C or the
+	// overall deadline: the restart fails, but the rollback restarts must
+	// still run under their own deadline.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctl := &fakeCtl{active: []bool{false}}
+	var log strings.Builder
+	restarted, err := restartUnits(ctx, ctl, []string{"a.service", "b.service"}, target, target+".previous", time.Second, &log)
+	if err == nil || len(restarted) != 0 {
+		t.Fatalf("expected failure, got restarted=%v err=%v", restarted, err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old" {
+		t.Errorf("binary should be rolled back, got %q", got)
+	}
+	if got, _ := os.ReadFile(target + ".lock.json"); string(got) != "oldlock" {
+		t.Errorf("lockfile should be rolled back, got %q", got)
+	}
+	if len(ctl.restarts) != 3 { // the failed one, then both again for the rollback
+		t.Errorf("rollback restarts must run despite the cancelled context: %v", ctl.restarts)
+	}
+	if !strings.Contains(err.Error(), "rolled back to the previous binary") {
+		t.Errorf("a successful rollback should be reported as such: %v", err)
+	}
+}
+
+func TestRestartUnitsReportsFailedRollbackHonestly(t *testing.T) {
+	settleDelay = 10 * time.Millisecond
+	t.Cleanup(func() { settleDelay = time.Second })
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("new"), 0o755)
+	// previous points at a file that does not exist, so the restore fails.
+	var log strings.Builder
+	_, err := restartUnits(context.Background(), &fakeCtl{}, []string{"a.service"}, target, filepath.Join(dir, "gone"), 50*time.Millisecond, &log)
+	if err == nil || !strings.Contains(err.Error(), "ROLLBACK FAILED") || strings.Contains(err.Error(), "rolled back to") {
+		t.Errorf("a failed restore must not be reported as rolled back: %v", err)
+	}
+}
+
+func TestValidationsFromUnits(t *testing.T) {
+	units := []systemd.Unit{
+		{Name: "a.service", Args: []string{"caddy", "run", "--config", "/etc/a/Caddyfile"}, WorkingDirectory: "/srv/a"},
+		{Name: "b.service", Args: []string{"caddy", "run", "--config", "/etc/b.json", "--adapter", "json"}},
+		{Name: "c.service", Args: []string{"caddy", "run", "--config", "/etc/a/Caddyfile"}, WorkingDirectory: "/srv/a"}, // same as a
+		{Name: "d.service", Args: []string{"caddy", "run"}},                                                             // no --config
+	}
+	got := validationsFromUnits(units)
+	if len(got) != 2 || got[0].From != "a.service" || got[1].Config != "/etc/b.json" || got[1].Adapter != "json" {
+		t.Errorf("want two distinct validations, got %+v", got)
+	}
+}
+
 func TestSwapFirstInstall(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "caddy")
@@ -191,7 +306,7 @@ func TestValidateArgs(t *testing.T) {
 	script := filepath.Join(dir, "caddy")
 	argsFile := filepath.Join(dir, "args")
 	os.WriteFile(script, []byte("#!/bin/sh\necho \"$@\" > "+argsFile+"\npwd >> "+argsFile+"\nexit ${FAKE_EXIT:-0}\n"), 0o755)
-	p := &Plan{Config: "/etc/caddy/Caddyfile", Adapter: "caddyfile", EnvFiles: []string{"/a.env", "/b.env"}, WorkDir: dir}
+	p := Validation{Config: "/etc/caddy/Caddyfile", Adapter: "caddyfile", EnvFiles: []string{"/a.env", "/b.env"}, WorkDir: dir}
 	var log strings.Builder
 	if err := validate(context.Background(), script, p, &log, false); err != nil {
 		t.Fatal(err)

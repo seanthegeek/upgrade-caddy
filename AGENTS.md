@@ -129,8 +129,11 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    and `direct` meaning "cannot look up" (reported as not checked, never
    silently redirected to the public proxy), and private patterns never sent
    to a proxy. A 404 from a proxy is final; `direct` is not consulted.
-   Lookups use the proxy's optional `@latest` endpoint and do not apply
-   retractions; both are documented limitations, not bugs to fix quietly.
+   `file://` proxies are read from disk. Lookups use the proxy's optional
+   `@latest` endpoint and do not apply retractions, and the newer-major
+   probe gives up after two consecutive missing major numbers; these are
+   documented limitations, not bugs to fix quietly. A hard lookup failure
+   (timeout, 5xx, bad response) makes `check` exit 1, never 0.
 10. **Exit codes are a contract.** `0` current, `1` error, `2` updates
     available. Scripts and cron jobs rely on them. Report output goes to
     stdout and errors to stderr, and `--json` output must stay parseable.
@@ -139,9 +142,9 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
 
 These are implemented in `internal/install`; keep them true.
 
-- `validate` runs with the *new* binary against the live config (taken
-  from the unit's `--config`, `--adapter` and `--envfile` flags, in its
-  `WorkingDirectory`) before anything changes. No config known means a
+- `validate` runs with the *new* binary against every distinct live config
+  (taken from each unit's `--config`, `--adapter` and `--envfile` flags, in
+  its `WorkingDirectory`) before anything changes. No config known means a
   warning and no validation, not a failure.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is
@@ -158,7 +161,18 @@ These are implemented in `internal/install`; keep them true.
 - Root is required only for what actually needs it (unwritable directory,
   unit restart, `setcap`), and that is checked before the build starts.
   `--from` exists so the build can run as a normal user.
-- The lockfile from the build is moved to `<target>.lock.json`.
+- The lockfile from the build is moved to `<target>.lock.json`, the old one
+  is kept as `<target>.lock.json.previous`, and a rollback restores both
+  the binary and the lockfile. Failing to install the lockfile is an
+  install failure that rolls the binary back.
+- Package ownership must be known before the target is touched.
+  `pkgmgr.Find` fails closed: a package manager that cannot answer either
+  way is an error, and `install` refuses on it rather than assuming "not
+  owned".
+- Rollback restores the previous binary before trying to keep the failed
+  one as `.failed`, and its restarts run under a fresh deadline because the
+  caller's context is often already cancelled. Error messages say "rolled
+  back" only when the restore succeeded.
 
 ## Conventions
 
@@ -287,7 +301,7 @@ unprivileged, and should be after any change to `internal/install`:
 ```bash
 # in a scratch directory holding a binary that build produced
 ./upgrade-caddy install --target /usr/bin/caddy --dry-run           # refusal with uninstall instructions
-./upgrade-caddy install --binary scratch/caddy-x --config scratch/Caddyfile   # build, validate, swap, .previous
+./upgrade-caddy install --target scratch/caddy-x --config scratch/Caddyfile   # build, validate, swap, .previous
 ./upgrade-caddy install --from scratch/caddy-x --target scratch/new/caddy     # stage without building
 ./upgrade-caddy install --from scratch/caddy-x --target scratch/new/caddy --config scratch/bad.Caddyfile  # must change nothing
 ```

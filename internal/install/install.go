@@ -58,11 +58,7 @@ type Plan struct {
 	FromInfo     *caddybin.Info `json:"from_info,omitempty"`
 	BuildPlan    *build.Plan    `json:"build,omitempty"`
 
-	Config     string   `json:"config,omitempty"`
-	Adapter    string   `json:"adapter,omitempty"`
-	EnvFiles   []string `json:"env_files,omitempty"`
-	WorkDir    string   `json:"work_dir,omitempty"`
-	ConfigFrom string   `json:"config_from,omitempty"` // "--config" or the unit name
+	Validations []Validation `json:"validations,omitempty"` // every distinct config the new binary is checked against
 
 	FileCapabilities string   `json:"file_capabilities,omitempty"` // getcap output to re-apply
 	NeedsRoot        bool     `json:"needs_root"`
@@ -71,13 +67,24 @@ type Plan struct {
 	buildOpts build.Options
 }
 
+// Validation is one config the new binary must accept before the swap:
+// the unit's --config, --adapter and --envfile flags run in its working
+// directory, or the --config flag of install itself.
+type Validation struct {
+	Config   string   `json:"config"`
+	Adapter  string   `json:"adapter,omitempty"`
+	EnvFiles []string `json:"env_files,omitempty"`
+	WorkDir  string   `json:"work_dir,omitempty"`
+	From     string   `json:"from"` // "--config" or the unit name
+}
+
 // Result is what Run did.
 type Result struct {
 	Target    string
 	Previous  string // rollback copy, "" when there was nothing installed
 	Lockfile  string
 	Built     *caddybin.Info // the binary now at Target
-	Validated string         // config the new binary was validated against, "" if none
+	Validated []string       // configs the new binary was validated against
 	Restarted []string
 }
 
@@ -132,19 +139,20 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	}
 	result := &Result{Target: plan.Target, Built: newInfo}
 
-	// 2. Validate with the new binary against the real config.
-	if plan.Config != "" {
-		fmt.Fprintf(logw, "==> validating %s with the new binary\n", plan.Config)
-		if err := validate(ctx, newPath, plan, logw, opts.Verbose); err != nil {
+	// 2. Validate with the new binary against every config in use.
+	if len(plan.Validations) == 0 {
+		fmt.Fprintln(logw, "==> no config known to validate against (no unit passes --config to this binary and --config was not given); skipping validation")
+	}
+	for _, v := range plan.Validations {
+		fmt.Fprintf(logw, "==> validating %s with the new binary\n", v.Config)
+		if err := validate(ctx, newPath, v, logw, opts.Verbose); err != nil {
 			cleanup()
 			return plan, nil, err
 		}
-		result.Validated = plan.Config
-	} else {
-		fmt.Fprintln(logw, "==> no config known to validate against (no unit passes --config to this binary and --config was not given); skipping validation")
+		result.Validated = append(result.Validated, v.Config)
 	}
 
-	// 3. Swap.
+	// 3. Swap the binary, then the lockfile, keeping both previous copies.
 	fmt.Fprintf(logw, "==> installing %s\n", plan.Target)
 	previous, err := swap(plan.Target, newPath, plan.FileCapabilities)
 	if err != nil {
@@ -153,9 +161,13 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	}
 	result.Previous = previous
 	result.Lockfile = plan.Target + ".lock.json"
-	if err := os.Rename(newLock, result.Lockfile); err != nil {
-		fmt.Fprintf(logw, "    warning: could not move lockfile into place: %v\n", err)
-		result.Lockfile = ""
+	if err := swapLockfile(plan.Target, newLock); err != nil {
+		os.Remove(newLock)
+		if previous == "" {
+			return plan, nil, fmt.Errorf("installing the lockfile: %w (the new binary is at %s)", err, plan.Target)
+		}
+		rbErr := rollback(plan.Target, previous)
+		return plan, nil, errors.Join(fmt.Errorf("installing the lockfile: %w; %s", err, rolledBack(rbErr)), rbErr)
 	}
 
 	// 4. Restart and verify, rolling back on failure.
@@ -173,28 +185,55 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	if wait == 0 {
 		wait = 15 * time.Second
 	}
-	for _, u := range plan.Units {
-		fmt.Fprintf(logw, "==> restarting %s\n", u.Name)
-		if err := restartAndVerify(ctx, ctl, u.Name, plan.Target, wait); err != nil {
-			fmt.Fprintf(logw, "    %v\n", err)
-			if previous == "" {
-				return plan, result, fmt.Errorf("%s did not come up with the new binary and there is no previous binary to roll back to", u.Name)
-			}
-			fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
-			rbErr := rollback(plan.Target, previous)
-			var restartErrs []error
-			for _, again := range plan.Units {
-				if rerr := ctl.Restart(ctx, again.Name); rerr != nil {
-					restartErrs = append(restartErrs, rerr)
-				}
-			}
-			return plan, result, errors.Join(
-				fmt.Errorf("%s did not come up with the new binary: %w; rolled back (the failed binary is kept at %s.failed)", u.Name, err, plan.Target),
-				rbErr, errors.Join(restartErrs...))
-		}
-		result.Restarted = append(result.Restarted, u.Name)
+	names := make([]string, len(plan.Units))
+	for i, u := range plan.Units {
+		names[i] = u.Name
 	}
-	return plan, result, nil
+	result.Restarted, err = restartUnits(ctx, ctl, names, plan.Target, previous, wait, logw)
+	return plan, result, err
+}
+
+// restartUnits restarts every unit and verifies each comes up. On the first
+// failure it restores the previous binary and lockfile, restarts all units
+// again under a fresh deadline (the caller's context may already be
+// cancelled, which is often why the restart failed), and returns an error
+// that says whether the rollback actually succeeded.
+func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, target, previous string, wait time.Duration, logw io.Writer) (restarted []string, err error) {
+	for _, u := range units {
+		fmt.Fprintf(logw, "==> restarting %s\n", u)
+		rerr := restartAndVerify(ctx, ctl, u, target, wait)
+		if rerr == nil {
+			restarted = append(restarted, u)
+			continue
+		}
+		fmt.Fprintf(logw, "    %v\n", rerr)
+		if previous == "" {
+			return restarted, fmt.Errorf("%s did not come up with the new binary and there is no previous binary to roll back to", u)
+		}
+		fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
+		rbErr := errors.Join(rollback(target, previous), rollbackLockfile(target))
+		rbCtx, cancel := context.WithTimeout(context.Background(), wait+15*time.Second)
+		defer cancel()
+		var restartErrs []error
+		for _, again := range units {
+			if e := ctl.Restart(rbCtx, again); e != nil {
+				restartErrs = append(restartErrs, e)
+			}
+		}
+		return restarted, errors.Join(
+			fmt.Errorf("%s did not come up with the new binary: %w; %s", u, rerr, rolledBack(rbErr)),
+			rbErr, errors.Join(restartErrs...))
+	}
+	return restarted, nil
+}
+
+// rolledBack words the outcome of a rollback for an error message, so a
+// failed restore is never reported as a success.
+func rolledBack(rbErr error) string {
+	if rbErr == nil {
+		return "rolled back to the previous binary (the failed one is kept as <target>.failed)"
+	}
+	return "ROLLBACK FAILED, the target may still hold the failed binary"
 }
 
 // Resolve decides what install would do. It inspects the target, refuses
@@ -245,7 +284,11 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		if r, err := filepath.EvalSymlinks(p.Target); err == nil {
 			resolved = r
 		}
-		if owner := pkgmgr.Find(ctx, resolved); owner != nil {
+		owner, err := pkgmgr.Find(ctx, resolved)
+		if err != nil {
+			return nil, fmt.Errorf("refusing to continue: %w; install must know whether %s belongs to a system package before replacing it", err, p.Target)
+		}
+		if owner != nil {
 			return nil, refuseSystemPackage(p.Target, owner)
 		}
 		info, err := caddybin.Inspect(ctx, p.Target)
@@ -272,14 +315,9 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.Config, p.ConfigFrom = abs, "--config"
+		p.Validations = []Validation{{Config: abs, From: "--config"}}
 	} else {
-		for _, u := range units {
-			if cfg, adapter, env := u.ConfigArgs(); cfg != "" {
-				p.Config, p.Adapter, p.EnvFiles, p.WorkDir, p.ConfigFrom = cfg, adapter, env, u.WorkingDirectory, u.Name
-				break
-			}
-		}
+		p.Validations = validationsFromUnits(units)
 	}
 
 	// File capabilities to carry over.
@@ -330,6 +368,27 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	bopts.DryRun = false
 	p.BuildPlan, p.buildOpts = bplan, bopts
 	return p, nil
+}
+
+// validationsFromUnits collects every distinct config the units run the
+// binary with, so a binary serving several services is checked against
+// all of them before any is restarted.
+func validationsFromUnits(units []systemd.Unit) []Validation {
+	var out []Validation
+	seen := map[string]bool{}
+	for _, u := range units {
+		cfg, adapter, env := u.ConfigArgs()
+		if cfg == "" {
+			continue
+		}
+		key := strings.Join(append([]string{cfg, adapter, u.WorkingDirectory}, env...), "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, Validation{Config: cfg, Adapter: adapter, EnvFiles: env, WorkDir: u.WorkingDirectory, From: u.Name})
+	}
+	return out
 }
 
 // buildSelectionFlags names the build-selection options that are set, for
@@ -501,17 +560,17 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	return nil
 }
 
-// validate runs `<new binary> validate` against the plan's config.
-func validate(ctx context.Context, bin string, p *Plan, logw io.Writer, verbose bool) error {
-	args := []string{"validate", "--config", p.Config}
-	if p.Adapter != "" {
-		args = append(args, "--adapter", p.Adapter)
+// validate runs `<new binary> validate` against one config.
+func validate(ctx context.Context, bin string, v Validation, logw io.Writer, verbose bool) error {
+	args := []string{"validate", "--config", v.Config}
+	if v.Adapter != "" {
+		args = append(args, "--adapter", v.Adapter)
 	}
-	for _, f := range p.EnvFiles {
+	for _, f := range v.EnvFiles {
 		args = append(args, "--envfile", f)
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Dir = p.WorkDir
+	cmd.Dir = v.WorkDir
 	out, err := cmd.CombinedOutput()
 	if verbose || err != nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -519,7 +578,39 @@ func validate(ctx context.Context, bin string, p *Plan, logw io.Writer, verbose 
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("the new binary rejected %s: %w; nothing was changed", p.Config, err)
+		return fmt.Errorf("the new binary rejected %s: %w; nothing was changed", v.Config, err)
+	}
+	return nil
+}
+
+// swapLockfile installs newLock as <target>.lock.json, keeping any existing
+// lockfile as <target>.lock.json.previous so a rollback can restore it.
+func swapLockfile(target, newLock string) error {
+	lock := target + ".lock.json"
+	prev := lock + ".previous"
+	os.Remove(prev)
+	if _, err := os.Stat(lock); err == nil {
+		if err := os.Rename(lock, prev); err != nil {
+			return fmt.Errorf("keeping previous lockfile: %w", err)
+		}
+	}
+	if err := os.Rename(newLock, lock); err != nil {
+		os.Rename(prev, lock) // best effort: put the old one back
+		return err
+	}
+	return nil
+}
+
+// rollbackLockfile undoes swapLockfile: the previous lockfile comes back
+// if there was one, otherwise the new one is removed.
+func rollbackLockfile(target string) error {
+	lock := target + ".lock.json"
+	prev := lock + ".previous"
+	if _, err := os.Stat(prev); err == nil {
+		return os.Rename(prev, lock)
+	}
+	if err := os.Remove(lock); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	return nil
 }
@@ -555,27 +646,30 @@ func swap(target, newPath, caps string) (previous string, err error) {
 	if caps != "" {
 		if out, err := exec.Command("setcap", caps, target).CombinedOutput(); err != nil {
 			rbErr := rollback(target, previous)
-			return "", errors.Join(fmt.Errorf("re-applying file capabilities %q: %w: %s; rolled back", caps, err, strings.TrimSpace(string(out))), rbErr)
+			return "", errors.Join(fmt.Errorf("re-applying file capabilities %q: %w: %s; %s", caps, err, strings.TrimSpace(string(out)), rolledBack(rbErr)), rbErr)
 		}
 	}
 	return previous, nil
 }
 
 // rollback puts the previous binary back. The failed one is kept as
-// <target>.failed for inspection.
+// <target>.failed for inspection when that is possible, but restoring the
+// target never waits on it: a problem with the diagnostic copy is reported
+// alongside the restore result, not instead of the restore.
 func rollback(target, previous string) error {
 	if previous == "" {
 		return errors.New("no previous binary to roll back to")
 	}
 	failed := target + ".failed"
 	os.Remove(failed)
+	var keepErr error
 	if err := os.Link(target, failed); err != nil {
-		return fmt.Errorf("rollback: keeping failed binary: %w", err)
+		keepErr = fmt.Errorf("rollback: could not keep the failed binary as %s: %w", failed, err)
 	}
 	if err := os.Rename(previous, target); err != nil {
-		return fmt.Errorf("rollback: restoring %s: %w", target, err)
+		return errors.Join(fmt.Errorf("rollback: restoring %s: %w", target, err), keepErr)
 	}
-	return nil
+	return keepErr
 }
 
 // settleDelay is how long a unit must stay active before it counts as up.
@@ -653,10 +747,11 @@ func (p *Plan) WriteText(w io.Writer) {
 	for _, u := range p.Units {
 		fmt.Fprintf(w, "Service:  %s (%s/%s)\n", u.Name, u.ActiveState, u.SubState)
 	}
-	if p.Config != "" {
-		fmt.Fprintf(w, "Validate: %s (from %s)\n", p.Config, p.ConfigFrom)
-	} else {
+	if len(p.Validations) == 0 {
 		fmt.Fprintln(w, "Validate: skipped, no config known; pass --config to validate")
+	}
+	for _, v := range p.Validations {
+		fmt.Fprintf(w, "Validate: %s (from %s)\n", v.Config, v.From)
 	}
 	if p.FileCapabilities != "" {
 		fmt.Fprintf(w, "Caps:     %s (will be re-applied)\n", p.FileCapabilities)

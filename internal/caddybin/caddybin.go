@@ -57,7 +57,8 @@ type Info struct {
 	Plugins        []Plugin          `json:"plugins"`         // non-standard modules
 	UnknownModules []Plugin          `json:"unknown_modules,omitempty"`
 	StandardCount  int               `json:"standard_count"`
-	Owner          *pkgmgr.Owner     `json:"owner,omitempty"` // OS package that installed the file
+	Owner          *pkgmgr.Owner     `json:"owner,omitempty"`         // OS package that installed the file
+	OwnerUnknown   string            `json:"owner_unknown,omitempty"` // why ownership could not be determined, if it could not
 	BuildSettings  map[string]string `json:"build_settings,omitempty"`
 }
 
@@ -156,7 +157,11 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 	}
 	info.Plugins = nonstd
 	info.UnknownModules = unknown
-	info.Owner = pkgmgr.Find(ctx, info.ResolvedPath)
+	owner, err := pkgmgr.Find(ctx, info.ResolvedPath)
+	if err != nil {
+		info.OwnerUnknown = err.Error()
+	}
+	info.Owner = owner
 	return info, nil
 }
 

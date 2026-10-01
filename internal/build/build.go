@@ -117,8 +117,13 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	if out, err := exec.CommandContext(ctx, "go", "version").Output(); err == nil {
 		plan.HostGoVersion = strings.TrimPrefix(strings.TrimSpace(string(out)), "go version ")
 	}
-	// build never replaces a binary a service is running; that is install's job
-	if units, err := systemd.UnitsUsing(ctx, plan.Output); err == nil && len(units) > 0 {
+	// build never replaces a binary a service is running; that is install's
+	// job. If systemd cannot be asked, the guarantee cannot be kept, so stop.
+	units, err := systemd.UnitsUsing(ctx, plan.Output)
+	if err != nil {
+		return plan, nil, fmt.Errorf("cannot confirm that no service runs %s: %w", plan.Output, err)
+	}
+	if len(units) > 0 {
 		return plan, nil, fmt.Errorf("%s is run by %s; 'build' never replaces a live binary, use 'install'", plan.Output, units[0].Name)
 	}
 	if opts.OnPlan != nil {
@@ -218,11 +223,16 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		if err != nil {
 			return nil, fmt.Errorf("--upgrade %s: %w", pl.Package, err)
 		}
-		if semver.Compare(info.Version, pl.Installed) > 0 {
+		switch {
+		case semver.Compare(info.Version, pl.Installed) <= 0:
+			pl.Note = "already at latest"
+		case crossesMajor(pl.Installed, info.Version) && !opts.AllowMajor:
+			// v0 and v1 share a bare module path, so "latest" can be a
+			// different major without the path changing.
+			pl.Note = fmt.Sprintf("latest %s is a new major on the same path; pass --allow-major to take it", info.Version)
+		default:
 			pl.Version = info.Version
 			pl.Source = Upgraded
-		} else {
-			pl.Note = "already at latest"
 		}
 		if majors, err := proxy.NewerMajors(ctx, pl.Package); err == nil && len(majors) > 0 {
 			m := majors[len(majors)-1]
@@ -246,6 +256,9 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		}
 		if i, ok := index[path]; ok {
 			pl := &p.Plugins[i]
+			if crossesMajor(pl.Installed, version) && !opts.AllowMajor {
+				return nil, fmt.Errorf("--with %s would move %s from v%d to v%d on the same path; pass --allow-major to do this deliberately", spec, pl.Package, semver.Major(pl.Installed), semver.Major(version))
+			}
 			pl.Version = version
 			if version != pl.Installed {
 				pl.Source = Overridden
@@ -300,6 +313,14 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		}
 	}
 	return p, nil
+}
+
+// crossesMajor reports whether two versions of a module on one path have
+// different semantic majors, which on a bare path happens between v0 and
+// v1. Versions that are not semantic (branches, hashes) never cross.
+func crossesMajor(installed, candidate string) bool {
+	a, b := semver.Major(installed), semver.Major(candidate)
+	return a >= 0 && b >= 0 && a != b
 }
 
 func find(plugins []Plugin, name string) (int, bool) {
@@ -423,14 +444,20 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return nil, err
 	}
+	// Write the lockfile beside the staged binary first, so a lockfile
+	// failure leaves the requested output untouched; then move both.
+	built.Path, built.ResolvedPath = p.Output, p.Output
+	tmpLock := tmpPath + ".lock.json"
+	if err := writeLockfile(tmpLock, p, built); err != nil {
+		return nil, err
+	}
 	if err := os.Rename(tmpPath, p.Output); err != nil {
+		os.Remove(tmpLock)
 		return nil, fmt.Errorf("moving the new binary into place: %w", err)
 	}
-	built.Path, built.ResolvedPath = p.Output, p.Output
-
 	lockPath := p.Output + ".lock.json"
-	if err := writeLockfile(lockPath, p, built); err != nil {
-		return nil, err
+	if err := os.Rename(tmpLock, lockPath); err != nil {
+		return nil, fmt.Errorf("the binary is at %s but its lockfile could not be moved into place: %w", p.Output, err)
 	}
 	return &Result{Output: p.Output, Lockfile: lockPath, Built: built}, nil
 }

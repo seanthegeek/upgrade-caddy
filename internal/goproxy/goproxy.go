@@ -90,21 +90,23 @@ func ParseGOPROXY(s string) []Source {
 		s = defaultGOPROXY
 	}
 	var sources []Source
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i < len(s) && s[i] != ',' && s[i] != '|' {
-			continue
+	rest := s
+	for {
+		entry, sep, remainder := rest, "", ""
+		if i := strings.IndexAny(rest, ",|"); i >= 0 {
+			entry, sep, remainder = rest[:i], rest[i:i+1], rest[i+1:]
 		}
-		entry := strings.TrimSpace(s[start:i])
-		if entry != "" {
+		if entry = strings.TrimSpace(entry); entry != "" {
 			if entry != "off" && entry != "direct" {
 				entry = strings.TrimRight(entry, "/")
 			}
-			sources = append(sources, Source{URL: entry, FallbackOnAnyError: i < len(s) && s[i] == '|'})
+			sources = append(sources, Source{URL: entry, FallbackOnAnyError: sep == "|"})
 		}
-		start = i + 1
+		if sep == "" {
+			return sources
+		}
+		rest = remainder
 	}
-	return sources
 }
 
 // Info is a proxy's answer for @latest.
@@ -116,7 +118,8 @@ type Info struct {
 // Latest returns the latest version of modPath, walking the GOPROXY list
 // the way the go command does: each proxy is asked in turn, a 404 or 410
 // moves on to the next source, and any other error moves on only when the
-// entry was followed by "|". Reaching "off" or "direct" ends the walk:
+// entry was followed by "|". Proxies may be http(s) URLs or file:// paths
+// laid out like a proxy. Reaching "off" or "direct" ends the walk:
 // "direct" after a proxy's 404 is reported as ErrNotFound, since this tool
 // does not consult version control; "direct" or "off" first is ErrDirect or
 // ErrOff. Modules matching GONOPROXY/GOPRIVATE are never sent to a proxy.
@@ -147,7 +150,12 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			}
 			return Info{}, fmt.Errorf("%s: %w", modPath, ErrDirect)
 		}
-		info, err := c.fetch(ctx, s.URL+"/"+escaped+"/@latest", modPath)
+		var info Info
+		if strings.HasPrefix(s.URL, "file://") {
+			info, err = c.fetchFile(strings.TrimPrefix(s.URL, "file://")+"/"+escaped+"/@latest", modPath)
+		} else {
+			info, err = c.fetch(ctx, s.URL+"/"+escaped+"/@latest", modPath)
+		}
 		if err == nil {
 			return info, nil
 		}
@@ -184,12 +192,29 @@ func (c *Client) fetch(ctx context.Context, url, modPath string) (Info, error) {
 	if resp.StatusCode != http.StatusOK {
 		return Info{}, fmt.Errorf("%s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	return decodeInfo(body, url)
+}
+
+// fetchFile serves a file:// proxy, a directory laid out like a proxy. A
+// missing file is the proxy protocol's 404.
+func (c *Client) fetchFile(path, modPath string) (Info, error) {
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Info{}, fmt.Errorf("%s: %w", modPath, ErrNotFound)
+	}
+	if err != nil {
+		return Info{}, err
+	}
+	return decodeInfo(body, path)
+}
+
+func decodeInfo(body []byte, where string) (Info, error) {
 	var info Info
 	if err := json.Unmarshal(body, &info); err != nil {
-		return Info{}, fmt.Errorf("%s: bad JSON: %w", url, err)
+		return Info{}, fmt.Errorf("%s: bad JSON: %w", where, err)
 	}
 	if info.Version == "" {
-		return Info{}, fmt.Errorf("%s: empty version in response", url)
+		return Info{}, fmt.Errorf("%s: empty version in response", where)
 	}
 	return info, nil
 }
@@ -225,7 +250,10 @@ type MajorVersion struct {
 // Go puts the major version in the module path (".../v3", or ".v3" for
 // gopkg.in), so a plain @latest query never sees one. This probes
 // successive major paths above the module's own, stopping after
-// missTolerance consecutive paths the proxy does not have.
+// missTolerance consecutive paths the proxy does not have. That is a
+// deliberate bound: a project that skips two consecutive major numbers
+// would go unseen, in exchange for not sending ten requests per module on
+// every check.
 func (c *Client) NewerMajors(ctx context.Context, modPath string) ([]MajorVersion, error) {
 	base, cur := SplitMajor(modPath)
 	var found []MajorVersion

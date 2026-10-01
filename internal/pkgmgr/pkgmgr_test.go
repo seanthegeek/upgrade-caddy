@@ -1,6 +1,11 @@
 package pkgmgr
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"os/exec"
+	"testing"
+)
 
 func TestParseDpkgSearch(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -71,4 +76,67 @@ func TestParseOwnerEdgeCases(t *testing.T) {
 	if o := parseApkOwner("/usr/bin/caddy is owned by caddy"); o == nil || o.Package != "caddy" || o.Version != "" {
 		t.Errorf("apk without version: %+v", o)
 	}
+}
+
+// Exit codes and messages captured from each manager when asked about a
+// file no package owns, and a few failure shapes.
+func TestClassifyFailsClosed(t *testing.T) {
+	// dpkg
+	if pkg, err := classifyDpkg(result{code: 1, stderr: "dpkg-query: no path found matching pattern /opt/caddy"}); err != nil || pkg != "" {
+		t.Errorf("dpkg not owned: %q %v", pkg, err)
+	}
+	if pkg, err := classifyDpkg(result{code: 0, stdout: "caddy: /usr/bin/caddy"}); err != nil || pkg != "caddy" {
+		t.Errorf("dpkg owned: %q %v", pkg, err)
+	}
+	if _, err := classifyDpkg(result{code: 0, stdout: "diversion by x from: /usr/bin/caddy"}); err == nil {
+		t.Error("dpkg exit 0 with no owner line is unknown, not 'not owned'")
+	}
+	if _, err := classifyDpkg(result{code: 2, stderr: "dpkg-query: error: database locked"}); err == nil {
+		t.Error("dpkg other failure must be an error")
+	}
+	if _, err := classifyDpkg(result{code: 1, stderr: "Kein Pfad gefunden"}); err == nil {
+		t.Error("dpkg exit 1 without the known message must be an error")
+	}
+	// rpm
+	if o, err := classifyRpm(result{code: 1, stdout: "file /opt/caddy is not owned by any package"}); err != nil || o != nil {
+		t.Errorf("rpm not owned: %+v %v", o, err)
+	}
+	if o, err := classifyRpm(result{code: 0, stdout: "caddy 2.8.4-1.fc40\n"}); err != nil || o == nil || o.Package != "caddy" {
+		t.Errorf("rpm owned: %+v %v", o, err)
+	}
+	if _, err := classifyRpm(result{code: 1, stderr: "error: rpmdb open failed"}); err == nil {
+		t.Error("rpm other failure must be an error")
+	}
+	// pacman
+	if o, err := classifyPacman(result{code: 1, stderr: "error: No package owns /opt/caddy"}); err != nil || o != nil {
+		t.Errorf("pacman not owned: %+v %v", o, err)
+	}
+	if _, err := classifyPacman(result{code: 1, stderr: "error: could not open file"}); err == nil {
+		t.Error("pacman other failure must be an error")
+	}
+	// apk
+	if o, err := classifyApk(result{code: 1, stderr: "ERROR: /opt/caddy: Could not find owner package"}); err != nil || o != nil {
+		t.Errorf("apk not owned: %+v %v", o, err)
+	}
+	if _, err := classifyApk(result{code: -1}); err == nil {
+		t.Error("apk command failure must be an error")
+	}
+}
+
+func TestFindCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Find(ctx, "/usr/bin/true")
+	if _, hasMgr := anyManager(); hasMgr && !errors.Is(err, ErrUnknown) {
+		t.Errorf("a cancelled context must not read as 'not owned': %v", err)
+	}
+}
+
+func anyManager() (string, bool) {
+	for _, b := range []string{"dpkg", "rpm", "pacman", "apk"} {
+		if _, err := exec.LookPath(b); err == nil {
+			return b, true
+		}
+	}
+	return "", false
 }

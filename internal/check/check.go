@@ -54,6 +54,7 @@ type Report struct {
 	Units            []systemd.Unit `json:"units"`
 	Warnings         []string       `json:"warnings"`
 	UpdatesAvailable bool           `json:"updates_available"`
+	HasErrors        bool           `json:"has_errors"` // some component could not be checked because of a hard failure
 
 	mu sync.Mutex // guards Warnings during concurrent lookups
 }
@@ -70,6 +71,49 @@ func (r *Report) anyOutdated() bool {
 		}
 	}
 	return false
+}
+
+func (r *Report) anyErrors() bool {
+	all := append([]Status{r.Caddy}, r.Plugins...)
+	for _, s := range all {
+		if s.Error != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveStatus fills in Latest, NewerInMajor, MajorAvailable and Outdated
+// for one component. A lookup that cannot happen (GOPROXY=off, a private
+// module) is a note; a lookup that fails is an error. The within-major
+// answer is recorded before the major probe, so a failed probe cannot hide
+// a newer version the proxy already reported.
+func resolveStatus(ctx context.Context, proxy *goproxy.Client, s *Status, warn func(string)) {
+	info, err := proxy.Latest(ctx, s.Package)
+	if err != nil {
+		if reason, ok := goproxy.NotChecked(err); ok {
+			s.Note = reason
+			return
+		}
+		s.Error = err.Error()
+		return
+	}
+	s.Latest = info.Version
+	s.NewerInMajor = semver.Compare(s.Installed, s.Latest) < 0
+	s.Outdated = s.NewerInMajor
+	if s.NewerInMajor && s.PseudoVersion && semver.IsPseudo(s.Latest) {
+		s.Note = "untagged module: newer commit on default branch"
+	}
+	majors, err := proxy.NewerMajors(ctx, s.Package)
+	if err != nil {
+		warn(fmt.Sprintf("%s: could not probe for newer major versions: %v", s.Name, err))
+		return
+	}
+	if len(majors) > 0 {
+		newest := majors[len(majors)-1]
+		s.MajorAvailable = &Major{Package: newest.Path, Version: newest.Version, Behind: len(majors)}
+		s.Outdated = true
+	}
 }
 
 func (r *Report) warn(msg string) {
@@ -127,30 +171,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	var wg sync.WaitGroup
 	lookup := func(s *Status) {
 		defer wg.Done()
-		info, err := proxy.Latest(ctx, s.Package)
-		if err != nil {
-			if reason, ok := goproxy.NotChecked(err); ok {
-				s.Note = reason
-				return
-			}
-			s.Error = err.Error()
-			return
-		}
-		s.Latest = info.Version
-		s.NewerInMajor = semver.Compare(s.Installed, s.Latest) < 0
-		if s.NewerInMajor && s.PseudoVersion && semver.IsPseudo(s.Latest) {
-			s.Note = "untagged module: newer commit on default branch"
-		}
-		majors, err := proxy.NewerMajors(ctx, s.Package)
-		if err != nil {
-			r.warn(fmt.Sprintf("%s: could not probe for newer major versions: %v", s.Name, err))
-			return
-		}
-		if len(majors) > 0 {
-			newest := majors[len(majors)-1]
-			s.MajorAvailable = &Major{Package: newest.Path, Version: newest.Version, Behind: len(majors)}
-		}
-		s.Outdated = s.NewerInMajor || s.MajorAvailable != nil
+		resolveStatus(ctx, proxy, s, r.warn)
 	}
 	wg.Add(1)
 	go lookup(&r.Caddy)
@@ -171,6 +192,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	}
 	wg.Wait()
 	r.UpdatesAvailable = r.anyOutdated()
+	r.HasErrors = r.anyErrors()
 
 	if m := r.Caddy.MajorAvailable; m != nil {
 		behind := "one major version"
