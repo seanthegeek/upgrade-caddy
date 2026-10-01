@@ -1,20 +1,59 @@
-// Package systemd discovers service units that execute a given binary.
+// Package systemd discovers service units that execute a given binary and
+// drives them through systemctl.
 package systemd
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 // Unit is a systemd service that runs the binary of interest.
 type Unit struct {
-	Name        string `json:"name"`
-	ExecStart   string `json:"exec_start"`
-	ActiveState string `json:"active_state"`
-	SubState    string `json:"sub_state"`
+	Name             string   `json:"name"`
+	ExecStart        string   `json:"exec_start"`
+	Args             []string `json:"args,omitempty"` // argv of the first ExecStart command
+	WorkingDirectory string   `json:"working_directory,omitempty"`
+	MainPID          int      `json:"main_pid,omitempty"`
+	ActiveState      string   `json:"active_state"`
+	SubState         string   `json:"sub_state"`
 }
+
+// ConfigArgs reads the Caddy config flags out of the unit's command line:
+// --config/-c, --adapter/-a and --envfile (repeatable, comma-separable),
+// each in either "--flag value" or "--flag=value" form.
+func (u Unit) ConfigArgs() (config, adapter string, envfiles []string) {
+	args := u.Args
+	for i := 0; i < len(args); i++ {
+		name, value, hasValue := strings.Cut(args[i], "=")
+		if !hasValue && i+1 < len(args) {
+			value = args[i+1]
+		}
+		switch name {
+		case "--config", "-c":
+			config = value
+		case "--adapter", "-a":
+			adapter = value
+		case "--envfile":
+			for _, f := range strings.Split(value, ",") {
+				if f = strings.TrimSpace(f); f != "" {
+					envfiles = append(envfiles, f)
+				}
+			}
+		default:
+			continue
+		}
+		if !hasValue {
+			i++
+		}
+	}
+	return config, adapter, envfiles
+}
+
+const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p MainPID"
 
 // UnitsUsing lists loaded service units whose ExecStart executable resolves
 // to binary. It returns nil, nil when systemctl is not available.
@@ -26,8 +65,8 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 	if err != nil {
 		want = binary
 	}
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "--no-pager",
-		"-p", "Id", "-p", "ExecStart", "-p", "ActiveState", "-p", "SubState", "*.service").Output()
+	args := append([]string{"show", "--no-pager"}, strings.Fields(showProps)...)
+	out, err := exec.CommandContext(ctx, "systemctl", append(args, "*.service")...).Output()
 	if err != nil {
 		return nil, err
 	}
@@ -63,10 +102,15 @@ func parseShow(out string) []Unit {
 				u.Name = v
 			case "ExecStart":
 				u.ExecStart = v
+				u.Args = execArgs(v)
 			case "ActiveState":
 				u.ActiveState = v
 			case "SubState":
 				u.SubState = v
+			case "WorkingDirectory":
+				u.WorkingDirectory = v
+			case "MainPID":
+				u.MainPID, _ = strconv.Atoi(v)
 			}
 		}
 		if u.Name != "" && u.ExecStart != "" {
@@ -93,4 +137,63 @@ func execPaths(execStart string) []string {
 		}
 		rest = remainder
 	}
+}
+
+// execArgs extracts the argv of the first ExecStart command. systemd joins
+// the arguments with single spaces, so an argument containing a space
+// cannot be told apart from two arguments; Caddy's flags never contain one.
+func execArgs(execStart string) []string {
+	_, after, ok := strings.Cut(execStart, "argv[]=")
+	if !ok {
+		return nil
+	}
+	argv, _, _ := strings.Cut(after, " ;")
+	return strings.Fields(argv)
+}
+
+// Controller is the part of systemctl install needs. It is an interface so
+// the restart-and-verify sequence can be tested without systemd.
+type Controller interface {
+	Restart(ctx context.Context, unit string) error
+	IsActive(ctx context.Context, unit string) (bool, error)
+	MainPID(ctx context.Context, unit string) (int, error)
+}
+
+// Systemctl drives the real systemctl.
+type Systemctl struct{}
+
+// Restart runs `systemctl restart`.
+func (Systemctl) Restart(ctx context.Context, unit string) error {
+	out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl restart %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// IsActive runs `systemctl is-active`, which exits non-zero for any state
+// other than active without that being an error for us. A unit that has
+// entered the failed state is reported as an error straight away, so a
+// caller waiting for it to come up does not wait out its deadline.
+func (Systemctl) IsActive(ctx context.Context, unit string) (bool, error) {
+	out, err := exec.CommandContext(ctx, "systemctl", "is-active", unit).Output()
+	state := strings.TrimSpace(string(out))
+	switch state {
+	case "active":
+		return true, nil
+	case "failed":
+		return false, fmt.Errorf("%s entered the failed state", unit)
+	case "":
+		return false, fmt.Errorf("systemctl is-active %s: %w", unit, err)
+	}
+	return false, nil
+}
+
+// MainPID returns the unit's main process ID, 0 if it has none.
+func (Systemctl) MainPID(ctx context.Context, unit string) (int, error) {
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "MainPID", "--value", unit).Output()
+	if err != nil {
+		return 0, fmt.Errorf("systemctl show %s: %w", unit, err)
+	}
+	return strconv.Atoi(strings.TrimSpace(string(out)))
 }

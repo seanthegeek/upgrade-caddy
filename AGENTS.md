@@ -12,8 +12,9 @@ plugins compiled into it. It has three commands:
   binary, is behind the latest version on the Go module proxy. Implemented.
 - `build` builds a new Caddy with the same plugins at the same pinned
   versions, using the xcaddy library, and writes a lockfile. Implemented.
-- `install` builds, validates against the live config, swaps the binary and
-  restarts the service. Not yet implemented.
+- `install` builds (or takes a prior build), validates against the live
+  config, swaps the binary with a rollback copy kept, restarts the service
+  and rolls back if it does not come up. Implemented.
 
 **Why this exists**: Caddy's own `caddy upgrade` and `caddy add-package`
 commands are marked experimental, depend on the project's build server
@@ -30,8 +31,17 @@ only state that matters, and the tool is built around that.
 ## Files
 
 - `main.go` parses flags, dispatches to a command and maps the result to an
-  exit code. No logic lives here.
+  exit code. It also holds the `version` variable. No other logic lives
+  here.
+- `CHANGELOG.md` follows Keep a Changelog. Every user-visible change gets a
+  line under `[Unreleased]` in the same commit that makes it.
 - `internal/check` the check command: gathers, compares, prints.
+- `internal/install` the install command, the only package that changes
+  system state. `Resolve` decides everything (target, units, config to
+  validate, root needed, build plan) with no side effects; `Run` validates,
+  swaps, restarts and rolls back in a fixed order. `swap`, `rollback`,
+  `restartAndVerify` and `validate` are small and tested on temp files and
+  a fake `systemd.Controller`.
 - `internal/build` the build command. `Resolve` turns the installed binary
   and flags into a `Plan` with every version decided and talks only to the
   module proxy, so it is tested with a fake one. `Plan.Build` runs xcaddy,
@@ -44,8 +54,21 @@ only state that matters, and the tool is built around that.
   module proxy.
 - `internal/semver` version comparison, including Go pseudo-versions.
 - `internal/pkgmgr` asks dpkg, rpm, pacman or apk which package owns a file.
-- `internal/systemd` finds service units whose `ExecStart` runs a binary.
+- `internal/systemd` finds service units whose `ExecStart` runs a binary,
+  parses their config flags, and drives systemctl through a `Controller`
+  interface so install's restart sequence can be tested with a fake.
 - `README.md` user-facing docs.
+- `.github/workflows/ci.yml` runs the hermetic checks on every push and
+  pull request, then `ci/integration.sh` on throwaway Ubuntu runners.
+- `.github/workflows/codeql.yml` runs CodeQL's security-and-quality
+  queries over the Go code and the workflow files on pushes, pull requests
+  and weekly. Findings land in the repository's Security tab and on pull
+  requests; treat them like failing tests.
+- `ci/integration.sh` the privileged integration test: first install,
+  in-place upgrade with a running unit and file capabilities, rollback,
+  a root build, and the refusal over Ubuntu's package. It writes a unit
+  file and runs the tool as root, so it refuses to run unless
+  `UPGRADE_CADDY_CI=1` is set. Never run it on a machine you care about.
 
 ## Non-negotiable design invariants
 
@@ -73,15 +96,18 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    removing.
 5. **Distribution builds are detected, reported, and refused for mutation.**
    A binary with no Go module information (Ubuntu's `caddy` package is one)
-   cannot have its plugin set reproduced, so `build` and `install` refuse it.
-   `check` still works and says why. `IsDistroBuild()` means exactly "no
-   module info", nothing else.
-6. **Package ownership is a separate flag from distro build.** The official
-   Caddy apt repository installs a dpkg-owned `/usr/bin/caddy` that *does*
-   carry module info. Overwriting any package-owned file is still wrong,
-   because the next package upgrade undoes it, so `install` refuses on
-   ownership independently. A `dpkg-divert` based `--divert` escape hatch is
-   the documented way to do it if it is ever added.
+   cannot have its plugin set reproduced, so `build` refuses it unless
+   `--fresh` says to ignore it, and `install` refuses it outright. `check`
+   still works and says why. `IsDistroBuild()` means exactly "no module
+   info", nothing else.
+6. **`install` never writes over a system package, and there is no bypass
+   flag.** Package ownership is checked separately from distro build: the
+   official Caddy apt repository installs a dpkg-owned `/usr/bin/caddy` that
+   *does* carry module info, and it is still refused, because the next
+   package upgrade would undo the install. The refusal message tells the
+   user to uninstall the package, recreate the unit and user per Caddy's
+   manual-install docs, and then run `install --fresh --target`. The author
+   chose this over a `dpkg-divert` escape hatch; do not add one.
 7. **`check` is strictly read-only.** It is the tool used to debug the other
    two commands, so it must never be the thing that changes state. The only
    subprocesses it may run are the Caddy binary itself with `version` and
@@ -97,21 +123,28 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
     available. Scripts and cron jobs rely on them. Report output goes to
     stdout and errors to stderr, and `--json` output must stay parseable.
 
-## Rules for `install` (when it is implemented)
+## Rules for `install`
 
-- Run `caddy validate` with the *new* binary against the live config before
-  touching anything.
-- Write to a temporary path in the same directory, then rename over the old
-  binary. Rename is atomic and the running process keeps its old inode.
-- Keep the previous binary as a rollback target.
-- Find the service by scanning unit `ExecStart` paths for the binary being
-  replaced. Do not assume it is called `caddy.service`.
-- Restart, don't reload. Reload re-reads config but keeps the old process
-  and therefore the old binary.
-- Require root only when the target directory or `systemctl` actually needs
-  it. Check, don't assume.
-- Write a lockfile of resolved module versions and checksums after each
-  build so the next run can diff against it.
+These are implemented in `internal/install`; keep them true.
+
+- `validate` runs with the *new* binary against the live config (taken
+  from the unit's `--config`, `--adapter` and `--envfile` flags, in its
+  `WorkingDirectory`) before anything changes. No config known means a
+  warning and no validation, not a failure.
+- The new binary is produced or staged in the target's own directory, the
+  current one is hard-linked to `<target>.previous`, then the new one is
+  renamed over the target. There is never an instant without a binary at
+  the path. Mode, owner and `getcap` file capabilities carry over.
+- The service is found by scanning unit `ExecStart` paths for the target.
+  It is never assumed to be `caddy.service`.
+- Restart, don't reload. Reload keeps the old process and so the old binary.
+- After restart, wait for active, and as root confirm `/proc/<MainPID>/exe`
+  is the target. On failure restore `.previous`, restart again, keep the
+  bad binary as `<target>.failed`, exit 1.
+- Root is required only for what actually needs it (unwritable directory,
+  unit restart, `setcap`), and that is checked before the build starts.
+  `--from` exists so the build can run as a normal user.
+- The lockfile from the build is moved to `<target>.lock.json`.
 
 ## Conventions
 
@@ -226,6 +259,24 @@ and an upstream release binary (download the tarball from GitHub releases
 and pass `--binary`) whenever `internal/caddybin` or `internal/check`
 changes, since the two take different paths through the code.
 
+`install` cannot be run for real on this host: `/usr/bin/caddy` is Ubuntu's
+package (refused by design) and sudo needs a password. What can be run
+unprivileged, and should be after any change to `internal/install`:
+
+```bash
+# in a scratch directory holding a binary that build produced
+./upgrade-caddy install --dry-run                                   # refusal with uninstall instructions
+./upgrade-caddy install --binary scratch/caddy-x --config scratch/Caddyfile   # build, validate, swap, .previous
+./upgrade-caddy install --from scratch/caddy-x --target scratch/new/caddy     # stage without building
+./upgrade-caddy install --from scratch/caddy-x --target scratch/new/caddy --config scratch/bad.Caddyfile  # must change nothing
+```
+
+The restart, verify and rollback sequence is covered by the fake
+`systemd.Controller` tests locally and for real by `ci/integration.sh` on
+GitHub Actions, where the runner is a throwaway VM with systemd and
+passwordless sudo. A change to `internal/install` or `internal/systemd` is
+not validated until that job is green.
+
 A real `build` (no `--dry-run`) downloads a Go toolchain and Caddy's
 dependencies and takes several minutes. Run one to a scratch path whenever
 `Plan.Build`, the step logger or the lockfile writer changes, then run
@@ -235,9 +286,20 @@ way to exercise check's plugin table against real data.
 ## GitHub releases
 
 - Releases are made by version tag, not branch. Tags are prefixed with `v`.
-  Release titles exclude the `v`.
-- Attach statically linked Linux binaries for amd64 and arm64, built with
-  `CGO_ENABLED=0 go build -trimpath`.
+  Release titles exclude the `v` (GoReleaser's `name_template` does this).
+- `.github/workflows/release.yml` runs on every `v*` tag: it checks the
+  tag matches `version` in `main.go`, extracts that version's section from
+  `CHANGELOG.md` as the release notes, and runs GoReleaser with
+  `.goreleaser.yaml`, which builds static (`CGO_ENABLED=0`, `-trimpath`)
+  archives for linux/amd64, linux/arm64, linux/armv7, darwin/amd64,
+  darwin/arm64 and freebsd/amd64 plus `checksums.txt`. Windows is not a
+  target: `install` uses Unix-only calls and there is no systemd.
+- To release: set `version` in `main.go`, turn the `[Unreleased]` section of
+  `CHANGELOG.md` into `[X.Y.Z] - YYYY-MM-DD`, commit, tag `vX.Y.Z`, push the
+  tag. The workflow refuses if the tag and `main.go` disagree or the
+  changelog has no section for the version.
+- Verify `.goreleaser.yaml` changes locally with
+  `goreleaser release --snapshot --clean` (output in `dist/`, ignored).
 - `go install github.com/seanthegeek/upgrade-caddy@<tag>` must keep working,
   which means the module path in `go.mod` must not change.
 
