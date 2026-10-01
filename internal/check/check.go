@@ -85,10 +85,11 @@ func (r *Report) anyErrors() bool {
 
 // resolveStatus fills in Latest, NewerInMajor, MajorAvailable and Outdated
 // for one component. A lookup that cannot happen (GOPROXY=off, a private
-// module) is a note; a lookup that fails is an error. The within-major
-// answer is recorded before the major probe, so a failed probe cannot hide
-// a newer version the proxy already reported.
-func resolveStatus(ctx context.Context, proxy *goproxy.Client, s *Status, warn func(string)) {
+// module) is a note; a lookup that fails, including the newer-major probe,
+// is an error that makes check exit 1. The within-major answer is recorded
+// before the major probe, so a failed probe cannot hide a newer version
+// the proxy already reported.
+func resolveStatus(ctx context.Context, proxy *goproxy.Client, s *Status) {
 	info, err := proxy.Latest(ctx, s.Package)
 	if err != nil {
 		if reason, ok := goproxy.NotChecked(err); ok {
@@ -106,7 +107,7 @@ func resolveStatus(ctx context.Context, proxy *goproxy.Client, s *Status, warn f
 	}
 	majors, err := proxy.NewerMajors(ctx, s.Package)
 	if err != nil {
-		warn(fmt.Sprintf("%s: could not probe for newer major versions: %v", s.Name, err))
+		s.Error = fmt.Sprintf("could not probe for newer major versions: %v", err)
 		return
 	}
 	if len(majors) > 0 {
@@ -171,7 +172,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	var wg sync.WaitGroup
 	lookup := func(s *Status) {
 		defer wg.Done()
-		resolveStatus(ctx, proxy, s, r.warn)
+		resolveStatus(ctx, proxy, s)
 	}
 	wg.Add(1)
 	go lookup(&r.Caddy)

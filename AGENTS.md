@@ -146,6 +146,10 @@ These are implemented in `internal/install`; keep them true.
   (taken from each unit's `--config`, `--adapter` and `--envfile` flags, in
   its `WorkingDirectory`) before anything changes. No config known means a
   warning and no validation, not a failure.
+- The target is resolved through symlinks first and the real file is what
+  is replaced; hard-linking and renaming a symlink would leave the referent
+  and every service executing it on the old binary. `swap` refuses a
+  symlink as a second line of defence.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is
   renamed over the target. There is never an instant without a binary at

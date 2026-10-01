@@ -427,3 +427,78 @@ func TestSwapErrors(t *testing.T) {
 		t.Error("target must be untouched after a failed swap")
 	}
 }
+
+func TestResolveTargetFollowsSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "caddy-2.11.6")
+	os.WriteFile(real, []byte("x"), 0o755)
+	link := filepath.Join(dir, "caddy")
+	os.Symlink(real, link)
+	got, exists, err := resolveTarget(link)
+	if err != nil || !exists || got != real {
+		t.Errorf("symlink should resolve to the real file: %q %v %v", got, exists, err)
+	}
+	// A first install through a symlinked directory lands in the real one.
+	realDir := filepath.Join(dir, "bin")
+	os.Mkdir(realDir, 0o755)
+	os.Symlink(realDir, filepath.Join(dir, "linkdir"))
+	got, exists, err = resolveTarget(filepath.Join(dir, "linkdir", "caddy"))
+	if err != nil || exists || got != filepath.Join(realDir, "caddy") {
+		t.Errorf("first install via symlinked dir: %q %v %v", got, exists, err)
+	}
+	if _, _, err := resolveTarget(dir); err == nil {
+		t.Error("a directory is not a valid target")
+	}
+	if _, _, err := resolveTarget(filepath.Join(dir, "no", "such", "caddy")); err == nil {
+		t.Error("a missing directory is an error, not a first install")
+	}
+}
+
+func TestSwapRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	os.WriteFile(real, []byte("old"), 0o755)
+	link := filepath.Join(dir, "caddy")
+	os.Symlink(real, link)
+	staged := filepath.Join(dir, "staged")
+	os.WriteFile(staged, []byte("new"), 0o755)
+	if _, err := swap(link, staged, ""); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("swap on a symlink must refuse: %v", err)
+	}
+	if got, _ := os.ReadFile(real); string(got) != "old" {
+		t.Error("referent must be untouched")
+	}
+	if fi, _ := os.Lstat(link); fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("the link must still be a link")
+	}
+}
+
+func TestCommitLockfileUndoesTheSwapOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	// First install: the lockfile cannot be installed (missing staged
+	// file), so the just-placed binary must be removed again.
+	os.WriteFile(target, []byte("new"), 0o755)
+	err := commitLockfile(target, filepath.Join(dir, "missing.lock.json"), "")
+	if err == nil || !strings.Contains(err.Error(), "removed from") {
+		t.Errorf("first install: %v", err)
+	}
+	if _, statErr := os.Stat(target); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("first install: the new binary must not be left behind")
+	}
+	// Upgrade: the previous binary is restored.
+	os.WriteFile(target, []byte("new"), 0o755)
+	os.WriteFile(target+".previous", []byte("old"), 0o755)
+	err = commitLockfile(target, filepath.Join(dir, "missing.lock.json"), target+".previous")
+	if err == nil || !strings.Contains(err.Error(), "rolled back to the previous binary") {
+		t.Errorf("upgrade: %v", err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old" {
+		t.Errorf("upgrade: target should be restored, got %q", got)
+	}
+	// Success leaves the lockfile in place.
+	os.WriteFile(filepath.Join(dir, "staged.lock.json"), []byte("{}"), 0o644)
+	if err := commitLockfile(target, filepath.Join(dir, "staged.lock.json"), ""); err != nil {
+		t.Errorf("success: %v", err)
+	}
+}

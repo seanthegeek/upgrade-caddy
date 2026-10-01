@@ -33,7 +33,8 @@ upgrade-caddy check [--binary PATH] [--json] [--timeout 60s]
 
 Exit status: `0` everything is current, `2` updates are available, `1` error,
 including when some component could not be checked because the proxy
-failed (the JSON report then has `has_errors: true`). A component that
+failed, for the latest-version lookup or the newer-major probe (the JSON
+report then has `has_errors: true`). A component that
 cannot be looked up at all (`GOPROXY=off`, a private module) is "not
 checked" and does not affect the status.
 
@@ -110,7 +111,8 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
 
 `install` does, in order:
 
-1. Resolves the target (the first `caddy` on `PATH` by default), the systemd units
+1. Resolves the target (the first `caddy` on `PATH` by default; a symlink
+   is followed and the file it points to is what gets replaced), the systemd units
    whose `ExecStart` runs it, and the configs to validate against (every
    distinct set of `--config`, `--adapter` and `--envfile` flags across
    those units, or the `--config` flag).
@@ -135,7 +137,8 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    new one over the target. There is never a moment with no binary at the
    path. Mode and file capabilities (`getcap`) are carried over; owner is
    too when running as root. The lockfile is installed the same way, with
-   the old one kept as `<target>.lock.json.previous`.
+   the old one kept as `<target>.lock.json.previous`; if it cannot be, the
+   binary swap is undone (a first install removes the new binary again).
 6. Restarts each unit, waits up to `--restart-wait` (default 15s) for it to
    become active and one more second to be sure it stays up, and where
    `/proc/<pid>/exe` is readable (root, or the same user) confirms the main

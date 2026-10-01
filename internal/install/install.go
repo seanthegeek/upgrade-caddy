@@ -49,7 +49,8 @@ type Options struct {
 
 // Plan is everything install has decided, before it changes anything.
 type Plan struct {
-	Target       string         `json:"target"`
+	Target       string         `json:"target"`                     // the real file that is replaced; symlinks are resolved
+	Requested    string         `json:"requested_target,omitempty"` // the path given, when it was a symlink to Target
 	TargetExists bool           `json:"target_exists"`
 	Installed    *caddybin.Info `json:"installed,omitempty"` // what is at Target now
 	Units        []systemd.Unit `json:"units"`
@@ -161,13 +162,8 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	}
 	result.Previous = previous
 	result.Lockfile = plan.Target + ".lock.json"
-	if err := swapLockfile(plan.Target, newLock); err != nil {
-		os.Remove(newLock)
-		if previous == "" {
-			return plan, nil, fmt.Errorf("installing the lockfile: %w (the new binary is at %s)", err, plan.Target)
-		}
-		rbErr := rollback(plan.Target, previous)
-		return plan, nil, errors.Join(fmt.Errorf("installing the lockfile: %w; %s", err, rolledBack(rbErr)), rbErr)
+	if err := commitLockfile(plan.Target, newLock, previous); err != nil {
+		return plan, nil, err
 	}
 
 	// 4. Restart and verify, rolling back on failure.
@@ -269,22 +265,22 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		}
 		p.Target = path
 	}
-	if fi, err := os.Stat(p.Target); err == nil {
-		if fi.IsDir() {
-			return nil, fmt.Errorf("%s is a directory", p.Target)
-		}
-		p.TargetExists = true
-	} else if !errors.Is(err, os.ErrNotExist) {
+	// A symlink (a common way to point /usr/local/bin/caddy at a versioned
+	// file) is resolved once, and the real file is what gets replaced;
+	// hard-linking and renaming the link itself would leave the referent,
+	// and every service executing it, on the old binary.
+	real, exists, err := resolveTarget(p.Target)
+	if err != nil {
 		return nil, err
 	}
+	if real != p.Target {
+		p.Requested, p.Target = p.Target, real
+	}
+	p.TargetExists = exists
 
 	// Never over a system package or a distribution build.
 	if p.TargetExists {
-		resolved := p.Target
-		if r, err := filepath.EvalSymlinks(p.Target); err == nil {
-			resolved = r
-		}
-		owner, err := pkgmgr.Find(ctx, resolved)
+		owner, err := pkgmgr.Find(ctx, p.Target)
 		if err != nil {
 			return nil, fmt.Errorf("refusing to continue: %w; install must know whether %s belongs to a system package before replacing it", err, p.Target)
 		}
@@ -368,6 +364,52 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	bopts.DryRun = false
 	p.BuildPlan, p.buildOpts = bplan, bopts
 	return p, nil
+}
+
+// resolveTarget follows symlinks from the requested path to the file that
+// will actually be replaced. A missing final path is a first install.
+func resolveTarget(path string) (real string, exists bool, err error) {
+	real, err = filepath.EvalSymlinks(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// Resolve the directory so a first install into a symlinked
+		// directory still lands in the real one.
+		dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return "", false, fmt.Errorf("%s: %w", filepath.Dir(path), err)
+		}
+		return filepath.Join(dir, filepath.Base(path)), false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	fi, err := os.Stat(real)
+	if err != nil {
+		return "", false, err
+	}
+	if fi.IsDir() {
+		return "", false, fmt.Errorf("%s is a directory", real)
+	}
+	return real, true, nil
+}
+
+// commitLockfile installs the new lockfile and undoes the binary swap when
+// that fails: the previous binary is restored, or on a first install the
+// just-placed binary is removed, so a failed install never leaves a
+// changed target.
+func commitLockfile(target, newLock, previous string) error {
+	err := swapLockfile(target, newLock)
+	if err == nil {
+		return nil
+	}
+	os.Remove(newLock)
+	if previous == "" {
+		if rmErr := os.Remove(target); rmErr != nil {
+			return errors.Join(fmt.Errorf("installing the lockfile: %w; and the new binary could not be removed from %s", err, target), rmErr)
+		}
+		return fmt.Errorf("installing the lockfile: %w; the new binary was removed from %s again", err, target)
+	}
+	rbErr := rollback(target, previous)
+	return errors.Join(fmt.Errorf("installing the lockfile: %w; %s", err, rolledBack(rbErr)), rbErr)
 }
 
 // validationsFromUnits collects every distinct config the units run the
@@ -622,6 +664,9 @@ func rollbackLockfile(target string) error {
 // (root); file capabilities are re-applied. It returns the rollback path,
 // or "" when there was no previous file.
 func swap(target, newPath, caps string) (previous string, err error) {
+	if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%s is a symlink; install replaces the file it points to, so the target must be resolved first", target)
+	}
 	if old, err := os.Stat(target); err == nil {
 		if err := os.Chmod(newPath, old.Mode().Perm()); err != nil {
 			return "", err
@@ -732,6 +777,9 @@ func restartAndVerify(ctx context.Context, ctl systemd.Controller, unit, target 
 // WriteText prints the plan for a human.
 func (p *Plan) WriteText(w io.Writer) {
 	fmt.Fprintf(w, "Target:   %s", p.Target)
+	if p.Requested != "" {
+		fmt.Fprintf(w, " (resolved from symlink %s)", p.Requested)
+	}
 	if p.Installed != nil {
 		fmt.Fprintf(w, " (%s, %d plugins)", p.Installed.MainVersion, len(p.Installed.Plugins))
 	} else if !p.TargetExists {
