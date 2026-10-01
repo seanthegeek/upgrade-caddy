@@ -159,7 +159,9 @@ Download the archive for your platform from the
 [releases page](https://github.com/seanthegeek/upgrade-caddy/releases),
 verify it against `checksums.txt`, and put `upgrade-caddy` on your `PATH`.
 Builds are provided for Linux (amd64, arm64, armv7), macOS (amd64, arm64)
-and FreeBSD (amd64). The Go toolchain must be installed separately for
+and FreeBSD (amd64).
+Or run `go install github.com/seanthegeek/upgrade-caddy@latest`
+The Go toolchain must be installed separately for
 `build` and `install`; `check` needs nothing else.
 
 ## Build
@@ -167,8 +169,6 @@ and FreeBSD (amd64). The Go toolchain must be installed separately for
 ```bash
 go build -o upgrade-caddy .
 go test ./...
-
-go install github.com/seanthegeek/upgrade-caddy@latest
 ```
 
 CI runs the same checks plus `ci/integration.sh`, which exercises the
