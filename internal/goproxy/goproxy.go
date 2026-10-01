@@ -233,7 +233,7 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			// real version and read as "current". It is an error like any
 			// other, so a "|" separator falls through to the next source.
 			if cerr := module.Check(modPath, info.Version); cerr != nil {
-				err = fmt.Errorf("%s: proxy %s returned an invalid version %q: %w", modPath, s.URL, info.Version, cerr)
+				err = fmt.Errorf("%s: proxy %s returned an invalid version %q: %w", modPath, redacted(s.URL), info.Version, cerr)
 			} else {
 				return info, nil
 			}
@@ -269,9 +269,21 @@ func (c *Client) fetch(ctx context.Context, url, modPath string) (Info, error) {
 		return Info{}, fmt.Errorf("%s: %w", modPath, ErrNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Info{}, fmt.Errorf("%s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+		return Info{}, fmt.Errorf("%s: HTTP %d: %s", redacted(url), resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return decodeInfo(body, url)
+}
+
+// redacted returns a URL with any password replaced by "xxxxx", for error
+// messages: a GOPROXY entry may carry credentials, and errors end up on
+// stderr and in JSON reports. (net/http already does this for its own
+// transport errors.)
+func redacted(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return u.Redacted()
 }
 
 // fileProxyDir parses a proxy entry and, for a file:// URL, returns its

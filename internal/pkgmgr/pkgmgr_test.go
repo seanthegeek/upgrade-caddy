@@ -140,3 +140,40 @@ func anyManager() (string, bool) {
 	}
 	return "", false
 }
+
+func TestBrewOwner(t *testing.T) {
+	cellar := "/opt/homebrew/Cellar"
+	if o := brewOwner(cellar, "/opt/homebrew/Cellar/caddy/2.8.4/bin/caddy"); o == nil || o.Package != "caddy" || o.Version != "2.8.4" || o.Manager != "brew" {
+		t.Errorf("cellar path: %+v", o)
+	}
+	if o := brewOwner(cellar+"/", "/opt/homebrew/Cellar/caddy/2.8.4/bin/caddy"); o == nil {
+		t.Error("trailing slash on the cellar should not matter")
+	}
+	if o := brewOwner(cellar, "/usr/local/bin/caddy"); o != nil {
+		t.Errorf("outside the cellar: %+v", o)
+	}
+	if o := brewOwner(cellar, "/opt/homebrew/Cellar/caddy"); o != nil {
+		t.Errorf("too shallow to be an installed file: %+v", o)
+	}
+}
+
+func TestClassifyPkgWhich(t *testing.T) {
+	o, err := classifyPkgWhich(result{code: 0, stdout: "/usr/local/bin/caddy was installed by package caddy-2.8.4\n"})
+	if err != nil || o == nil || o.Manager != "pkg" || o.Package != "caddy" || o.Version != "2.8.4" {
+		t.Errorf("owned: %+v %v", o, err)
+	}
+	// A package name containing a dash: the version is after the last one.
+	o, err = classifyPkgWhich(result{code: 0, stdout: "/usr/local/bin/x was installed by package caddy-custom-2.8.4_1"})
+	if err != nil || o == nil || o.Package != "caddy-custom" || o.Version != "2.8.4_1" {
+		t.Errorf("dashed name: %+v %v", o, err)
+	}
+	if o, err := classifyPkgWhich(result{code: 1}); err != nil || o != nil {
+		t.Errorf("not owned: %+v %v", o, err)
+	}
+	if _, err := classifyPkgWhich(result{code: 1, stderr: "pkg: database locked"}); err == nil {
+		t.Error("exit 1 with a complaint on stderr is unknown, not 'not owned'")
+	}
+	if _, err := classifyPkgWhich(result{code: 0, stdout: "something else"}); err == nil {
+		t.Error("exit 0 without the owner line is unknown")
+	}
+}

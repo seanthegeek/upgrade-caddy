@@ -289,6 +289,32 @@ func TestFileProxy(t *testing.T) {
 	}
 }
 
+func TestErrorsRedactProxyCredentials(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/example.com/bad/@latest" {
+			w.Write([]byte(`{"Version":"garbage"}`))
+			return
+		}
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	withCreds := strings.Replace(srv.URL, "http://", "http://user:hunter2@", 1)
+	c := client(withCreds, "")
+	for _, m := range []string{"example.com/bad", "example.com/500"} {
+		_, err := c.Latest(ctx, m)
+		if err == nil {
+			t.Fatalf("%s: expected an error", m)
+		}
+		if strings.Contains(err.Error(), "hunter2") {
+			t.Errorf("%s: error leaks the proxy password: %v", m, err)
+		}
+		if !strings.Contains(err.Error(), "user:xxxxx@") {
+			t.Errorf("%s: error should show the redacted form: %v", m, err)
+		}
+	}
+}
+
 func TestNewerMajors(t *testing.T) {
 	srv := newServer(t, map[string]string{
 		"/example.com/m/@latest":       "v1.9.0",

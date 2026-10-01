@@ -181,7 +181,17 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		p.CaddyVersion = v
 	}
 
-	// Start from the installed plugin set, pinned.
+	// Start from the installed plugin set, pinned. Modules Caddy listed
+	// without package metadata cannot be pinned, and dropping them would
+	// be exactly the loss this tool exists to prevent, so refuse.
+	if src != nil && len(src.UnknownModules) > 0 {
+		ids := make([]string, len(src.UnknownModules))
+		for i, u := range src.UnknownModules {
+			ids[i] = u.ModuleID
+		}
+		return nil, fmt.Errorf("%s reports %d module(s) without package information (%s), so its plugin set cannot be reproduced; "+
+			"pass --fresh with --with for each plugin to build from scratch", src.Path, len(ids), strings.Join(ids, ", "))
+	}
 	index := map[string]int{} // package path -> position in p.Plugins
 	if src != nil {
 		for _, ip := range src.Plugins {

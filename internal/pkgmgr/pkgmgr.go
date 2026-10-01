@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 )
 
@@ -28,24 +29,33 @@ type Owner struct {
 // ErrUnknown wraps a failure to determine ownership either way.
 var ErrUnknown = errors.New("could not determine package ownership")
 
-// Find returns the package owning path, nil when the installed package
+// Find returns the package owning path, nil when every installed package
 // manager positively reports the file as not owned, and an error wrapping
-// ErrUnknown when it could not tell. With no package manager present the
-// answer is nil, nil.
+// ErrUnknown when one could not tell. On Linux, no package manager at all
+// means not owned. On macOS and FreeBSD it means ownership cannot be
+// established (Homebrew and pkg are the managers looked for there), which
+// is also ErrUnknown, so a caller gating on ownership fails closed.
 func Find(ctx context.Context, path string) (*Owner, error) {
 	type probe struct {
 		bin string
 		fn  func(ctx context.Context, path string) (*Owner, error)
 	}
-	for _, p := range []probe{
+	probes := []probe{
 		{"dpkg", dpkg},
 		{"rpm", rpm},
 		{"pacman", pacman},
 		{"apk", apk},
-	} {
+		{"brew", brew}, // Homebrew on macOS and Linux
+	}
+	if runtime.GOOS == "freebsd" {
+		probes = append(probes, probe{"pkg", pkgng})
+	}
+	found := false
+	for _, p := range probes {
 		if _, err := exec.LookPath(p.bin); err != nil {
 			continue
 		}
+		found = true
 		o, err := p.fn(ctx, path)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s: %v", ErrUnknown, p.bin, err)
@@ -53,6 +63,9 @@ func Find(ctx context.Context, path string) (*Owner, error) {
 		if o != nil {
 			return o, nil
 		}
+	}
+	if !found && runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("%w: no package manager found on %s to ask", ErrUnknown, runtime.GOOS)
 	}
 	return nil, nil
 }
@@ -247,6 +260,72 @@ func parseApkOwner(out string) *Owner {
 		}
 	}
 	return &Owner{Manager: "apk", Package: rest}
+}
+
+func brew(ctx context.Context, path string) (*Owner, error) {
+	r, err := run(ctx, "brew", "--cellar")
+	if err != nil {
+		return nil, err
+	}
+	if r.code != 0 || r.stdout == "" {
+		return nil, fmt.Errorf("brew --cellar: exit %d: %s", r.code, firstNonEmpty(r.stderr, r.stdout))
+	}
+	return brewOwner(r.stdout, path), nil
+}
+
+// brewOwner reports whether path (already resolved through symlinks) lives
+// in Homebrew's Cellar, whose layout is <cellar>/<formula>/<version>/...;
+// Homebrew installs binaries there and links them from its bin directory.
+func brewOwner(cellar, path string) *Owner {
+	cellar = strings.TrimRight(cellar, "/") + "/"
+	if !strings.HasPrefix(path, cellar) {
+		return nil
+	}
+	parts := strings.SplitN(strings.TrimPrefix(path, cellar), "/", 3)
+	if len(parts) < 3 || parts[0] == "" {
+		return nil
+	}
+	return &Owner{Manager: "brew", Package: parts[0], Version: parts[1]}
+}
+
+func pkgng(ctx context.Context, path string) (*Owner, error) {
+	r, err := run(ctx, "pkg", "which", path)
+	if err != nil {
+		return nil, err
+	}
+	return classifyPkgWhich(r)
+}
+
+// classifyPkgWhich reads `pkg which`: exit 0 with "<file> was installed by
+// package name-version" means owned (pkg's src/which.c), exit 1 with
+// nothing on stderr means not owned, anything else is unknown.
+func classifyPkgWhich(r result) (*Owner, error) {
+	switch {
+	case r.code == 0:
+		if o := parsePkgWhich(r.stdout); o != nil {
+			return o, nil
+		}
+		return nil, fmt.Errorf("unrecognised output: %q", r.stdout)
+	case r.code == 1 && r.stderr == "":
+		return nil, nil
+	}
+	return nil, fmt.Errorf("exit %d: %s", r.code, firstNonEmpty(r.stderr, r.stdout))
+}
+
+// parsePkgWhich parses "/usr/local/bin/caddy was installed by package
+// caddy-2.8.4". A FreeBSD package version never contains "-", so the split
+// is at the last one.
+func parsePkgWhich(out string) *Owner {
+	_, rest, found := strings.Cut(strings.TrimSpace(out), " was installed by package ")
+	if !found || rest == "" {
+		return nil
+	}
+	rest, _, _ = strings.Cut(rest, "\n")
+	i := strings.LastIndex(rest, "-")
+	if i <= 0 {
+		return &Owner{Manager: "pkg", Package: rest}
+	}
+	return &Owner{Manager: "pkg", Package: rest[:i], Version: rest[i+1:]}
 }
 
 func firstNonEmpty(a, b string) string {

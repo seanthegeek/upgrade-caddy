@@ -242,6 +242,15 @@ func TestResolveCaddyMajorFreshWording(t *testing.T) {
 	}
 }
 
+func TestResolveRefusesUnknownModules(t *testing.T) {
+	src := installed()
+	src.UnknownModules = []caddybin.Plugin{{ModuleID: "http.handlers.mystery"}}
+	_, err := resolve(t, src, Options{})
+	if err == nil || !strings.Contains(err.Error(), "http.handlers.mystery") || !strings.Contains(err.Error(), "--fresh") {
+		t.Errorf("modules without package info must refuse reproduction: %v", err)
+	}
+}
+
 func TestResolveRefusesDistroBuild(t *testing.T) {
 	src := &caddybin.Info{Path: "/usr/bin/caddy", ResolvedPath: "/usr/bin/caddy", Version: "2.6.2"}
 	_, err := resolve(t, src, Options{})
