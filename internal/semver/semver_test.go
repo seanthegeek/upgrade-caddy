@@ -35,3 +35,12 @@ func TestIsPseudo(t *testing.T) {
 		t.Error("unexpected pseudo")
 	}
 }
+
+func TestMajor(t *testing.T) {
+	cases := map[string]int{"v2.11.6": 2, "3.0.0": 3, "v0.0.0-20240101000000-aaaaaaaaaaaa": 0, "main": -1, "": -1}
+	for in, want := range cases {
+		if got := Major(in); got != want {
+			t.Errorf("Major(%q)=%d want %d", in, got, want)
+		}
+	}
+}

@@ -11,7 +11,7 @@ plugins compiled into it. It has three commands:
 - `check` reports whether Caddy, or any plugin compiled into the installed
   binary, is behind the latest version on the Go module proxy. Implemented.
 - `build` builds a new Caddy with the same plugins at the same pinned
-  versions, using the xcaddy library. Not yet implemented.
+  versions, using the xcaddy library, and writes a lockfile. Implemented.
 - `install` builds, validates against the live config, swaps the binary and
   restarts the service. Not yet implemented.
 
@@ -32,6 +32,11 @@ only state that matters, and the tool is built around that.
 - `main.go` parses flags, dispatches to a command and maps the result to an
   exit code. No logic lives here.
 - `internal/check` the check command: gathers, compares, prints.
+- `internal/build` the build command. `Resolve` turns the installed binary
+  and flags into a `Plan` with every version decided and talks only to the
+  module proxy, so it is tested with a fake one. `Plan.Build` runs xcaddy,
+  inspects the result to confirm it matches the plan, moves it into place
+  and writes `<output>.lock.json`.
 - `internal/caddybin` inspects a Caddy binary: Go build info read straight
   from the file, plus `caddy version` and `caddy list-modules` run as
   subprocesses.
@@ -169,12 +174,16 @@ every collaborator picks them up the same way.
 
 - Formatter: `gofmt`. Static checks: `go vet`. Both must be clean. No
   third-party linters are required.
-- Standard library only unless a dependency earns its place. The planned
-  exception is the xcaddy library for `build`, which will also raise the
-  minimum Go version in `go.mod`.
-- `go.mod` currently declares Go 1.22, the local toolchain is 1.22 with
-  `GOTOOLCHAIN=auto`. Upstream Caddy builds with Go 1.26. Expect a toolchain
-  download the first time xcaddy is added.
+- Standard library only unless a dependency earns its place. The one
+  exception is the xcaddy library (`github.com/caddyserver/xcaddy`), which
+  `build` uses. Read its `builder.go` and `environment.go` in the module
+  cache before changing how it is driven; its `OnStep` callback and the way
+  it derives the Caddy module path from the version's major are the parts
+  this tool depends on.
+- `go.mod` declares Go 1.22 and the local toolchain is 1.22 with
+  `GOTOOLCHAIN=auto`. Building Caddy itself needs whatever Caddy's own
+  `go.mod` asks for (1.26 at the time of writing); xcaddy shells out to `go`
+  and the auto toolchain switch handles the download.
 - One package per concern under `internal/`. Packages that shell out keep a
   thin runner and a pure parser so the parser can be tested on captured
   output without root, a package manager or systemd present.
@@ -203,6 +212,10 @@ go vet ./...
 go test ./...         # add -short to skip the test that runs the host's caddy
 go build -o upgrade-caddy . && ./upgrade-caddy check
 
+# build: dry runs are cheap and cover Resolve end to end
+./upgrade-caddy build --dry-run                      # refuses on the distro build here
+./upgrade-caddy build --fresh --dry-run --with github.com/caddy-dns/cloudflare --output /tmp/x
+
 # Markdown
 npx --yes markdownlint-cli '*.md' --disable MD013
 ```
@@ -212,6 +225,12 @@ should be run against both a distribution build (Ubuntu's `/usr/bin/caddy`)
 and an upstream release binary (download the tarball from GitHub releases
 and pass `--binary`) whenever `internal/caddybin` or `internal/check`
 changes, since the two take different paths through the code.
+
+A real `build` (no `--dry-run`) downloads a Go toolchain and Caddy's
+dependencies and takes several minutes. Run one to a scratch path whenever
+`Plan.Build`, the step logger or the lockfile writer changes, then run
+`check --binary` on the result: a built binary with a plugin is the only
+way to exercise check's plugin table against real data.
 
 ## GitHub releases
 

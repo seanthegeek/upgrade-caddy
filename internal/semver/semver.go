@@ -120,3 +120,13 @@ func comparePre(a, b string) int {
 	}
 	return 1
 }
+
+// Major returns the major version number of v, or -1 when v is not a
+// parseable semantic version (a branch name or commit hash, for example).
+func Major(v string) int {
+	p := parse(v)
+	if !p.ok {
+		return -1
+	}
+	return p.nums[0]
+}
