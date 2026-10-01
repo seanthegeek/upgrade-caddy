@@ -91,7 +91,10 @@ func GoEnv(key string) string {
 }
 
 // readGoEnvFile parses the file `go env -w` maintains, KEY=VALUE per line,
-// following the go command's location rules.
+// following the go command's location rules. As in the go command's own
+// readEnvFile (cmd/go/internal/cfg), an unreadable file and malformed lines
+// are ignored rather than treated as errors, so lookups here see the same
+// environment `go get` would.
 func readGoEnvFile() map[string]string {
 	file := os.Getenv("GOENV")
 	switch file {
