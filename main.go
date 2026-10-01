@@ -59,11 +59,10 @@ func runCheck(ctx context.Context, args []string) int {
 	binary := fs.String("binary", "", "path to the caddy binary (default: first caddy on PATH)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	timeout := fs.Duration("timeout", 60*time.Second, "overall timeout for version lookups")
-	includeMajor := fs.Bool("include-major", false, "treat a newer major version as an available update (affects exit status)")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: upgrade-caddy check [flags]")
 		fmt.Fprintln(fs.Output(), "\nExit status is 0 when everything is current, 2 when updates are available, 1 on error.")
-		fmt.Fprintln(fs.Output(), "A newer major version is reported but only affects the exit status with --include-major.")
+		fmt.Fprintln(fs.Output(), "A newer major version counts as an available update: Caddy does not backport fixes to older majors.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -71,7 +70,7 @@ func runCheck(ctx context.Context, args []string) int {
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 
-	report, err := check.Run(ctx, check.Options{Binary: *binary, IncludeMajor: *includeMajor})
+	report, err := check.Run(ctx, check.Options{Binary: *binary})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade-caddy check:", err)
 		return ExitError
