@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: go test (hermetic)
+        run: go test -short ./...
+      - name: markdownlint
+        run: npx --yes markdownlint-cli '*.md' --disable MD013
+      - name: shellcheck
+        run: shellcheck ci/integration.sh
+
+  integration:
+    name: Privileged integration (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      GOTOOLCHAIN: auto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build upgrade-caddy
+        run: go build -o upgrade-caddy .
+      - name: Run privileged integration script
+        run: ci/integration.sh
+        env:
+          UPGRADE_CADDY_CI: "1"
+      - name: go test with a custom Caddy on PATH
+        run: go test ./...
+      - name: Show Caddy unit journal
+        if: failure()
+        run: sudo journalctl -u caddy-ci.service --no-pager | tail -n 100
