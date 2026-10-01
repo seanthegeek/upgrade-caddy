@@ -168,7 +168,6 @@ and FreeBSD (amd64). The Go toolchain must be installed separately for
 go build -o upgrade-caddy .
 go test ./...
 
-# or, once pushed:
 go install github.com/seanthegeek/upgrade-caddy@latest
 ```
 
