@@ -1,6 +1,10 @@
 package caddybin
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+)
 
 const sample = `admin.api.load
 admin.api.metrics
@@ -53,5 +57,31 @@ func TestParseListModulesBareIDs(t *testing.T) {
 	_, _, unknown := ParseListModules("a.b\nc.d\n")
 	if len(unknown) != 2 {
 		t.Errorf("bare IDs should become unknown: %+v", unknown)
+	}
+}
+
+// TestInspectHostCaddy runs against whatever caddy is on PATH. It is skipped
+// under -short and when no caddy is installed, so the hermetic tests above
+// stay the ones CI relies on.
+func TestInspectHostCaddy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short")
+	}
+	path, err := Find("")
+	if err != nil {
+		t.Skip("no caddy on PATH")
+	}
+	info, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Version == "" || info.GoVersion == "" || info.StandardCount == 0 {
+		t.Errorf("incomplete info: %+v", info)
+	}
+	if info.HasModuleInfo && !strings.HasPrefix(info.MainVersion, "v") {
+		t.Errorf("module info present but main version is %q", info.MainVersion)
+	}
+	if !info.HasModuleInfo && len(info.Plugins) != 0 {
+		t.Errorf("no module info but plugins listed: %+v", info.Plugins)
 	}
 }

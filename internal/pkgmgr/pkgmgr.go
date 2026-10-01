@@ -1,5 +1,9 @@
 // Package pkgmgr finds out whether a file on disk is owned by a system
 // package manager.
+//
+// Each manager has a thin runner that shells out and a pure parser that
+// turns the command's output into an Owner. The parsers are what the tests
+// cover, using output captured from real systems.
 package pkgmgr
 
 import (
@@ -47,20 +51,34 @@ func run(ctx context.Context, name string, args ...string) (string, bool) {
 }
 
 func dpkg(ctx context.Context, path string) *Owner {
-	// "caddy: /usr/bin/caddy"
 	out, ok := run(ctx, "dpkg", "-S", path)
 	if !ok {
 		return nil
 	}
-	pkg, _, found := strings.Cut(out, ":")
-	if !found || pkg == "" {
+	pkg := parseDpkgSearch(out)
+	if pkg == "" {
 		return nil
 	}
-	pkg = strings.TrimSpace(pkg)
-	// Multi-arch packages print "caddy:amd64"; keep only the name.
-	pkg, _, _ = strings.Cut(pkg, ":")
 	ver, _ := run(ctx, "dpkg-query", "-W", "-f=${Version}", pkg)
 	return &Owner{Manager: "dpkg", Package: pkg, Version: ver}
+}
+
+// parseDpkgSearch extracts the package name from `dpkg -S` output such as
+// "caddy: /usr/bin/caddy" or "caddy:amd64: /usr/bin/caddy". Diversion
+// lines ("diversion by caddy from: /usr/bin/caddy") are skipped, since the
+// file is then not the package's own copy.
+func parseDpkgSearch(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		pkg, rest, ok := strings.Cut(line, ": ")
+		if !ok || !strings.HasPrefix(rest, "/") || strings.ContainsAny(pkg, " \t") {
+			continue
+		}
+		pkg, _, _ = strings.Cut(pkg, ":") // drop ":amd64"
+		if pkg != "" {
+			return pkg
+		}
+	}
+	return ""
 }
 
 func rpm(ctx context.Context, path string) *Owner {
@@ -68,36 +86,56 @@ func rpm(ctx context.Context, path string) *Owner {
 	if !ok {
 		return nil
 	}
-	name, ver, _ := strings.Cut(out, " ")
+	return parseRpmQuery(out)
+}
+
+// parseRpmQuery parses "caddy 2.8.4-1.fc40" as produced by the query format
+// used in rpm above.
+func parseRpmQuery(out string) *Owner {
+	name, ver, _ := strings.Cut(strings.TrimSpace(out), " ")
+	if name == "" {
+		return nil
+	}
 	return &Owner{Manager: "rpm", Package: name, Version: ver}
 }
 
 func pacman(ctx context.Context, path string) *Owner {
-	// "/usr/bin/caddy is owned by caddy 2.8.4-1"
 	out, ok := run(ctx, "pacman", "-Qo", path)
 	if !ok {
 		return nil
 	}
-	_, rest, found := strings.Cut(out, " is owned by ")
+	return parsePacmanOwner(out)
+}
+
+// parsePacmanOwner parses "/usr/bin/caddy is owned by caddy 2.8.4-1".
+func parsePacmanOwner(out string) *Owner {
+	_, rest, found := strings.Cut(strings.TrimSpace(out), " is owned by ")
 	if !found {
 		return nil
 	}
 	name, ver, _ := strings.Cut(rest, " ")
+	if name == "" {
+		return nil
+	}
 	return &Owner{Manager: "pacman", Package: name, Version: ver}
 }
 
 func apk(ctx context.Context, path string) *Owner {
-	// "/usr/bin/caddy is owned by caddy-2.8.4-r0"
 	out, ok := run(ctx, "apk", "info", "-W", path)
 	if !ok {
 		return nil
 	}
-	_, rest, found := strings.Cut(out, " is owned by ")
-	if !found {
+	return parseApkOwner(out)
+}
+
+// parseApkOwner parses "/usr/bin/caddy is owned by caddy-2.8.4-r0". Alpine
+// joins name and version with "-", so the split is at the first "-" that
+// is followed by a digit.
+func parseApkOwner(out string) *Owner {
+	_, rest, found := strings.Cut(strings.TrimSpace(out), " is owned by ")
+	if !found || rest == "" {
 		return nil
 	}
-	// Alpine package-version strings are "name-ver-rN"; split at the first
-	// "-" followed by a digit.
 	for i := 1; i < len(rest)-1; i++ {
 		if rest[i] == '-' && rest[i+1] >= '0' && rest[i+1] <= '9' {
 			return &Owner{Manager: "apk", Package: rest[:i], Version: rest[i+1:]}

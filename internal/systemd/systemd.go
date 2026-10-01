@@ -32,7 +32,26 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		return nil, err
 	}
 	var units []Unit
-	for _, block := range strings.Split(string(out), "\n\n") {
+	for _, u := range parseShow(string(out)) {
+		for _, exe := range execPaths(u.ExecStart) {
+			if r, err := filepath.EvalSymlinks(exe); err == nil {
+				exe = r
+			}
+			if exe == want {
+				units = append(units, u)
+				break
+			}
+		}
+	}
+	return units, nil
+}
+
+// parseShow turns `systemctl show` output, one "Key=Value" block per unit
+// separated by blank lines, into Units. Units without an ExecStart are
+// dropped.
+func parseShow(out string) []Unit {
+	var units []Unit
+	for _, block := range strings.Split(out, "\n\n") {
 		var u Unit
 		for _, line := range strings.Split(block, "\n") {
 			k, v, ok := strings.Cut(line, "=")
@@ -50,28 +69,28 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 				u.SubState = v
 			}
 		}
-		if u.Name == "" || u.ExecStart == "" {
-			continue
-		}
-		if exe := execPath(u.ExecStart); exe != "" {
-			if r, err := filepath.EvalSymlinks(exe); err == nil {
-				exe = r
-			}
-			if exe == want {
-				units = append(units, u)
-			}
+		if u.Name != "" && u.ExecStart != "" {
+			units = append(units, u)
 		}
 	}
-	return units, nil
+	return units
 }
 
-// execPath extracts "path=..." from systemd's ExecStart rendering:
-// "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run ... }".
-func execPath(execStart string) string {
-	_, rest, ok := strings.Cut(execStart, "path=")
-	if !ok {
-		return ""
+// execPaths extracts every "path=..." from systemd's ExecStart rendering:
+// "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run ... }". A unit with
+// several ExecStart lines renders them as consecutive "{ ... }" groups.
+func execPaths(execStart string) []string {
+	var paths []string
+	rest := execStart
+	for {
+		_, after, ok := strings.Cut(rest, "path=")
+		if !ok {
+			return paths
+		}
+		p, remainder, _ := strings.Cut(after, " ;")
+		if p = strings.TrimSpace(p); p != "" {
+			paths = append(paths, p)
+		}
+		rest = remainder
 	}
-	p, _, _ := strings.Cut(rest, " ;")
-	return strings.TrimSpace(p)
 }
