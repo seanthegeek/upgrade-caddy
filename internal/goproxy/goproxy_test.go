@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -146,6 +147,16 @@ func TestLatestFallback(t *testing.T) {
 	if info, err := p.Latest(ctx, "b.example/m"); err != nil || info.Version != "v1.2.0" {
 		t.Errorf("pipe fallback on 500: %v %+v", err, info)
 	}
+	// An invalid version from the primary is an error like any other: a
+	// pipe falls through to the healthy secondary, a comma does not.
+	bad := newServer(t, map[string]string{"/d.example/m/@latest": "garbage"})
+	good := newServer(t, map[string]string{"/d.example/m/@latest": "v1.0.0"})
+	if info, err := client(bad.URL+"|"+good.URL, "").Latest(ctx, "d.example/m"); err != nil || info.Version != "v1.0.0" {
+		t.Errorf("pipe must fall through an invalid-version answer: %v %+v", err, info)
+	}
+	if _, err := client(bad.URL+","+good.URL, "").Latest(ctx, "d.example/m"); err == nil || !strings.Contains(err.Error(), "invalid version") {
+		t.Errorf("comma must treat an invalid-version answer as terminal: %v", err)
+	}
 	// Missing everywhere, ending in direct: ErrNotFound.
 	if _, err := client(primary.URL+","+secondary.URL+",direct", "").Latest(ctx, "nowhere.example/m"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing everywhere: %v", err)
@@ -220,27 +231,33 @@ func TestNewerMajors(t *testing.T) {
 	ctx := context.Background()
 	c := client(srv.URL+",direct", "")
 
-	got, err := c.NewerMajors(ctx, "example.com/m")
+	got, err := c.NewerMajors(ctx, "example.com/m", "v1.9.0")
 	if err != nil || len(got) != 2 || got[0].Path != "example.com/m/v2" || got[1].Version != "v3.0.1" || got[1].Major != 3 {
 		t.Errorf("from v1: %+v err=%v", got, err)
 	}
-	got, err = c.NewerMajors(ctx, "example.com/m/v2")
+	got, err = c.NewerMajors(ctx, "example.com/m/v2", "v2.1.0")
 	if err != nil || len(got) != 1 || got[0].Path != "example.com/m/v3" {
 		t.Errorf("from v2: %+v err=%v", got, err)
 	}
-	if got, err = c.NewerMajors(ctx, "example.com/m/v3"); err != nil || len(got) != 0 {
+	if got, err = c.NewerMajors(ctx, "example.com/m/v3", ""); err != nil || len(got) != 0 {
 		t.Errorf("from v3: expected none, got %+v err=%v", got, err)
 	}
-	if got, err = c.NewerMajors(ctx, "example.com/n/v2"); err != nil || len(got) != 0 {
+	if got, err = c.NewerMajors(ctx, "example.com/n/v2", "v2.0.0"); err != nil || len(got) != 0 {
 		t.Errorf("n/v2: expected none, got %+v err=%v", got, err)
 	}
+	// A bare path can hold v2+incompatible: then /v2 is the same major and
+	// the probe starts at /v3.
+	got, err = c.NewerMajors(ctx, "example.com/m", "v2.0.0+incompatible")
+	if err != nil || len(got) != 1 || got[0].Path != "example.com/m/v3" {
+		t.Errorf("installed v2+incompatible on a bare path must not report /v2 as newer: %+v err=%v", got, err)
+	}
 	// gopkg.in uses a dot suffix and is probed like any other module.
-	got, err = c.NewerMajors(ctx, "gopkg.in/yaml.v2")
+	got, err = c.NewerMajors(ctx, "gopkg.in/yaml.v2", "v2.4.0")
 	if err != nil || len(got) != 1 || got[0].Path != "gopkg.in/yaml.v3" {
 		t.Errorf("gopkg.in: %+v err=%v", got, err)
 	}
 	// One skipped major number is tolerated; two consecutive misses end the walk.
-	got, err = c.NewerMajors(ctx, "example.com/skip")
+	got, err = c.NewerMajors(ctx, "example.com/skip", "v1.0.0")
 	if err != nil || len(got) != 0 {
 		t.Errorf("skip: v2 and v3 both missing should end the walk before v4, got %+v err=%v", got, err)
 	}
@@ -248,16 +265,16 @@ func TestNewerMajors(t *testing.T) {
 		"/example.com/skip/@latest":    "v1.0.0",
 		"/example.com/skip/v3/@latest": "v3.1.0", // only v2 skipped
 	})
-	got, err = client(srv2.URL, "").NewerMajors(ctx, "example.com/skip")
+	got, err = client(srv2.URL, "").NewerMajors(ctx, "example.com/skip", "v1.0.0")
 	if err != nil || len(got) != 1 || got[0].Version != "v3.1.0" {
 		t.Errorf("one skipped major should be found, got %+v err=%v", got, err)
 	}
 	// A proxy failure other than not-found stops the probe with an error.
 	srv3 := newServer(t, map[string]string{}, "/example.com/m/v2/@latest")
-	if _, err := client(srv3.URL, "").NewerMajors(ctx, "example.com/m"); err == nil {
+	if _, err := client(srv3.URL, "").NewerMajors(ctx, "example.com/m", "v1.0.0"); err == nil {
 		t.Error("a 500 while probing should be reported")
 	}
-	if _, err := client("off", "").NewerMajors(ctx, "example.com/m"); !errors.Is(err, ErrOff) {
+	if _, err := client("off", "").NewerMajors(ctx, "example.com/m", "v1.0.0"); !errors.Is(err, ErrOff) {
 		t.Errorf("GOPROXY=off while probing: %v", err)
 	}
 }

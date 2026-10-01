@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/mod/module"
+	xsemver "golang.org/x/mod/semver"
 )
 
 // Errors a lookup can end with. ErrNotFound means every proxy consulted
@@ -160,11 +161,13 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			// A proxy answer that is not a canonical version compatible
 			// with the module path is a broken proxy, not a version.
 			// Without this a value like "garbage" would sort below every
-			// real version and read as "current".
+			// real version and read as "current". It is an error like any
+			// other, so a "|" separator falls through to the next source.
 			if cerr := module.Check(modPath, info.Version); cerr != nil {
-				return Info{}, fmt.Errorf("%s: proxy %s returned an invalid version %q: %w", modPath, s.URL, info.Version, cerr)
+				err = fmt.Errorf("%s: proxy %s returned an invalid version %q: %w", modPath, s.URL, info.Version, cerr)
+			} else {
+				return info, nil
 			}
-			return info, nil
 		}
 		lastErr = err
 		if i == len(sources)-1 {
@@ -226,6 +229,15 @@ func decodeInfo(body []byte, where string) (Info, error) {
 	return info, nil
 }
 
+// Canonical returns v with a leading "v", as module versions are written.
+func Canonical(v string) string {
+	v = strings.TrimSpace(v)
+	if v != "" && v[0] != 'v' {
+		return "v" + v
+	}
+	return v
+}
+
 // EscapePath applies the module proxy's case encoding: every upper-case
 // letter becomes "!" followed by its lower-case form. An invalid module
 // path is returned unchanged.
@@ -256,13 +268,23 @@ type MajorVersion struct {
 // NewerMajors lists every newer major version of modPath, lowest first.
 // Go puts the major version in the module path (".../v3", or ".v3" for
 // gopkg.in), so a plain @latest query never sees one. This probes
-// successive major paths above the module's own, stopping after
+// successive major paths above the current major, stopping after
 // missTolerance consecutive paths the proxy does not have. That is a
 // deliberate bound: a project that skips two consecutive major numbers
 // would go unseen, in exchange for not sending ten requests per module on
 // every check.
-func (c *Client) NewerMajors(ctx context.Context, modPath string) ([]MajorVersion, error) {
+//
+// The current major is the higher of the path's suffix and the installed
+// version's major, because a bare path can hold v0, v1 or a
+// vN+incompatible release: with v2.0.0+incompatible installed the probe
+// starts at /v3, not /v2. installed may be "" when unknown.
+func (c *Client) NewerMajors(ctx context.Context, modPath, installed string) ([]MajorVersion, error) {
 	base, cur := SplitMajor(modPath)
+	if m := xsemver.Major(Canonical(installed)); m != "" {
+		if n, err := strconv.Atoi(m[1:]); err == nil && n > cur {
+			cur = n
+		}
+	}
 	var found []MajorVersion
 	misses := 0
 	for m := cur + 1; m <= cur+maxMajorProbe && misses < missTolerance; m++ {

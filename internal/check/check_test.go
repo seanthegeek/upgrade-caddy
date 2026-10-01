@@ -92,6 +92,22 @@ func TestResolveStatus(t *testing.T) {
 	if s.Error != "" || s.Note == "" || s.Outdated {
 		t.Errorf("GOPROXY=off: %+v", s)
 	}
+	// v0 installed, v1 latest on the same bare path: a major change, not a
+	// within-major update.
+	p = fakeProxy(t, map[string]string{"/example.com/m/@latest": "v1.3.0"})
+	s = Status{Name: "m", Package: "example.com/m", Installed: "v0.9.0"}
+	resolveStatus(ctx, p, &s)
+	if s.NewerInMajor || !s.Outdated || s.MajorAvailable == nil || s.MajorAvailable.Package != "example.com/m" || s.MajorAvailable.Version != "v1.3.0" || s.MajorAvailable.Behind != 1 {
+		t.Errorf("v0 -> v1 on the same path: %+v", s)
+	}
+	// v2+incompatible installed on a bare path: an existing /v2 is the same
+	// major and must not be reported as newer.
+	p = fakeProxy(t, map[string]string{"/example.com/m/@latest": "v2.0.0+incompatible", "/example.com/m/v2/@latest": "v2.3.0"})
+	s = Status{Name: "m", Package: "example.com/m", Installed: "v2.0.0+incompatible"}
+	resolveStatus(ctx, p, &s)
+	if s.Outdated || s.MajorAvailable != nil {
+		t.Errorf("v2+incompatible must not see /v2 as a newer major: %+v", s)
+	}
 	// Current within the major, newer major available: outdated.
 	p = fakeProxy(t, map[string]string{"/example.com/m/@latest": "v1.0.0", "/example.com/m/v2/@latest": "v2.0.0"})
 	s = Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}

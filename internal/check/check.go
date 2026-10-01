@@ -100,19 +100,31 @@ func resolveStatus(ctx context.Context, proxy *goproxy.Client, s *Status) {
 		return
 	}
 	s.Latest = info.Version
-	s.NewerInMajor = semver.Compare(s.Installed, s.Latest) < 0
-	s.Outdated = s.NewerInMajor
+	newer := semver.Compare(s.Installed, s.Latest) < 0
+	// A bare module path holds v0, v1 and vN+incompatible alike, so the
+	// latest version on the same path can be a different major. That is a
+	// major change, not a within-major update.
+	samePathMajor := newer && semver.Major(s.Installed) >= 0 && semver.Major(s.Latest) > semver.Major(s.Installed)
+	s.NewerInMajor = newer && !samePathMajor
+	s.Outdated = newer
+	if samePathMajor {
+		s.MajorAvailable = &Major{Package: s.Package, Version: s.Latest, Behind: 1}
+	}
 	if s.NewerInMajor && s.PseudoVersion && semver.IsPseudo(s.Latest) {
 		s.Note = "untagged module: newer commit on default branch"
 	}
-	majors, err := proxy.NewerMajors(ctx, s.Package)
+	majors, err := proxy.NewerMajors(ctx, s.Package, s.Installed)
 	if err != nil {
 		s.Error = fmt.Sprintf("could not probe for newer major versions: %v", err)
 		return
 	}
 	if len(majors) > 0 {
 		newest := majors[len(majors)-1]
-		s.MajorAvailable = &Major{Package: newest.Path, Version: newest.Version, Behind: len(majors)}
+		behind := len(majors)
+		if samePathMajor {
+			behind++
+		}
+		s.MajorAvailable = &Major{Package: newest.Path, Version: newest.Version, Behind: behind}
 		s.Outdated = true
 	}
 }
@@ -277,9 +289,12 @@ func writeRow(w io.Writer, s Status) {
 		status += " (" + s.Note + ")"
 	}
 	if m := s.MajorAvailable; m != nil {
-		if m.Behind > 1 {
+		switch {
+		case m.Behind > 1:
 			status += fmt.Sprintf(" (%d majors behind: %s at %s)", m.Behind, m.Version, m.Package)
-		} else {
+		case m.Package == s.Package:
+			status += " (new major " + m.Version + " on the same path)"
+		default:
 			status += " (major " + m.Version + " at " + m.Package + ")"
 		}
 	}

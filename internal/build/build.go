@@ -235,7 +235,7 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 			pl.Version = info.Version
 			pl.Source = Upgraded
 		}
-		if majors, err := proxy.NewerMajors(ctx, pl.Package); err == nil && len(majors) > 0 {
+		if majors, err := proxy.NewerMajors(ctx, pl.Package, pl.Installed); err == nil && len(majors) > 0 {
 			m := majors[len(majors)-1]
 			pl.Note = join(pl.Note, fmt.Sprintf("newer major %s at %s; use --with %s@%s --allow-major to move to it", m.Version, m.Path, m.Path, m.Version))
 		}

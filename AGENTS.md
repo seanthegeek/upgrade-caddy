@@ -91,7 +91,10 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    `2`, with no switch to hide it. Go keeps the major in the module path
    (`.../caddy/v2`) and plugins built for one major do not compile against
    the next, so `build` must refuse to cross one without an explicit flag.
-   Reporting and acting are deliberately separate.
+   Reporting and acting are deliberately separate. A bare path holds v0,
+   v1 and `vN+incompatible` alike, so the installed version's major, not
+   the path's, decides what counts as "newer major" and where probing
+   starts.
 4. **Never use Caddy's download/build server.** Builds go through the xcaddy
    library on the local machine. The build server is the thing upstream is
    removing.
@@ -163,7 +166,10 @@ These are implemented in `internal/install`; keep them true.
   the open handle, so a path planted in a shared directory is never
   followed by a privileged install.
 - When a unit has several `ExecStart` commands, the config flags come from
-  the command whose executable is the target, not the first one.
+  the command whose executable is the target, not the first one, and the
+  argv comes from the unit's D-Bus `ExecStart` property (`busctl
+  --json=short`), which keeps argument boundaries that `systemctl show`
+  flattens; the flattened parse is only the fallback when busctl fails.
 - The service is found by scanning unit `ExecStart` paths for the target.
   It is never assumed to be `caddy.service`.
 - Restart, don't reload. Reload keeps the old process and so the old binary.

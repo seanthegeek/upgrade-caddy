@@ -124,3 +124,48 @@ func TestExecArgsNoArgv(t *testing.T) {
 		t.Errorf("no argv: %v", got)
 	}
 }
+
+// Captured with `busctl --json=short get-property org.freedesktop.systemd1
+// <unit> org.freedesktop.systemd1.Service ExecStart` on Ubuntu 24.04: Caddy's
+// packaged unit, and a probe unit whose --config value contains a space.
+const busCaddy = `{"type":"a(sasbttttuii)","data":[["/usr/bin/caddy",["/usr/bin/caddy","run","--environ","--config","/etc/caddy/Caddyfile"],false,0,0,0,0,0,0,0]]}`
+const busSpace = `{"type":"a(sasbttttuii)","data":[["/usr/bin/true",["/usr/bin/true","--config","/srv/my site/Caddyfile"],false,0,0,0,0,0,0,0]]}`
+
+func TestParseBusExecStart(t *testing.T) {
+	cmds, err := parseBusExecStart([]byte(busCaddy))
+	if err != nil || len(cmds) != 1 || cmds[0].Path != "/usr/bin/caddy" || len(cmds[0].Args) != 5 {
+		t.Fatalf("caddy: %+v %v", cmds, err)
+	}
+	cmds, err = parseBusExecStart([]byte(busSpace))
+	if err != nil || len(cmds) != 1 {
+		t.Fatalf("space: %+v %v", cmds, err)
+	}
+	u := Unit{Args: cmds[0].Args}
+	if config, _, _ := u.ConfigArgs(); config != "/srv/my site/Caddyfile" {
+		t.Errorf("an argument with a space must survive: %q", config)
+	}
+	// The flattened systemctl rendering of the same unit loses it.
+	flat := Unit{Args: execArgs("path=/usr/bin/true ; argv[]=/usr/bin/true --config /srv/my site/Caddyfile ; ignore_errors=no")}
+	if config, _, _ := flat.ConfigArgs(); config == "/srv/my site/Caddyfile" {
+		t.Error("the flattened form was not expected to preserve the space; the D-Bus path exists for that")
+	}
+	if _, err := parseBusExecStart([]byte(`{"data":[["/x"]]}`)); err == nil {
+		t.Error("a short tuple must be an error")
+	}
+	if _, err := parseBusExecStart([]byte(`junk`)); err == nil {
+		t.Error("junk must be an error")
+	}
+}
+
+func TestUnitObjectPath(t *testing.T) {
+	cases := map[string]string{
+		"caddy.service":          "/org/freedesktop/systemd1/unit/caddy_2eservice",
+		"uc-space-probe.service": "/org/freedesktop/systemd1/unit/uc_2dspace_2dprobe_2eservice",
+		"a@b.service":            "/org/freedesktop/systemd1/unit/a_40b_2eservice",
+	}
+	for in, want := range cases {
+		if got := unitObjectPath(in); got != want {
+			t.Errorf("unitObjectPath(%q)=%q want %q", in, got, want)
+		}
+	}
+}

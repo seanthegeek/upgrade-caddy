@@ -4,6 +4,8 @@ package systemd
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -85,19 +87,92 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 	}
 	var units []Unit
 	for _, u := range parseShow(string(out)) {
+		matched := false
 		for _, c := range u.Commands {
-			exe := c.Path
-			if r, err := filepath.EvalSymlinks(exe); err == nil {
-				exe = r
-			}
-			if exe == want {
-				u.Args = c.Args // the command that runs this binary, not necessarily the first
-				units = append(units, u)
+			if resolves(c.Path, want) {
+				matched = true
 				break
 			}
 		}
+		if !matched {
+			continue
+		}
+		// systemctl show flattens argv with spaces, so an argument that
+		// contains one cannot be recovered from it. The D-Bus property keeps
+		// the array; take the commands from there when it can be read.
+		if cmds, err := execStartFromBus(ctx, u.Name); err == nil && len(cmds) > 0 {
+			u.Commands = cmds
+		}
+		for _, c := range u.Commands {
+			if resolves(c.Path, want) {
+				u.Args = c.Args // the command that runs this binary, not necessarily the first
+				break
+			}
+		}
+		units = append(units, u)
 	}
 	return units, nil
+}
+
+func resolves(path, want string) bool {
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		path = r
+	}
+	return path == want
+}
+
+// execStartFromBus reads the unit's ExecStart property over D-Bus as JSON,
+// which preserves argument boundaries exactly.
+func execStartFromBus(ctx context.Context, unit string) ([]Command, error) {
+	out, err := exec.CommandContext(ctx, "busctl", "--json=short", "get-property",
+		"org.freedesktop.systemd1", unitObjectPath(unit), "org.freedesktop.systemd1.Service", "ExecStart").Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseBusExecStart(out)
+}
+
+// parseBusExecStart decodes busctl's JSON for the ExecStart property, an
+// array of (path, argv, ignore_errors, times..., pid, code, status) tuples.
+func parseBusExecStart(data []byte) ([]Command, error) {
+	var prop struct {
+		Data [][]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &prop); err != nil {
+		return nil, fmt.Errorf("busctl ExecStart: %w", err)
+	}
+	var cmds []Command
+	for _, tuple := range prop.Data {
+		if len(tuple) < 2 {
+			return nil, errors.New("busctl ExecStart: tuple too short")
+		}
+		var c Command
+		if err := json.Unmarshal(tuple[0], &c.Path); err != nil {
+			return nil, fmt.Errorf("busctl ExecStart path: %w", err)
+		}
+		if err := json.Unmarshal(tuple[1], &c.Args); err != nil {
+			return nil, fmt.Errorf("busctl ExecStart argv: %w", err)
+		}
+		cmds = append(cmds, c)
+	}
+	return cmds, nil
+}
+
+// unitObjectPath is systemd's D-Bus object path for a unit: the name with
+// every byte outside [A-Za-z0-9] written as "_" plus two hex digits.
+func unitObjectPath(unit string) string {
+	var b strings.Builder
+	b.WriteString("/org/freedesktop/systemd1/unit/")
+	for i := 0; i < len(unit); i++ {
+		ch := unit[i]
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+			b.WriteByte(ch)
+		default:
+			fmt.Fprintf(&b, "_%02x", ch)
+		}
+	}
+	return b.String()
 }
 
 // parseShow turns `systemctl show` output, one "Key=Value" block per unit
@@ -187,9 +262,11 @@ func execPath(group string) string {
 	return strings.TrimSpace(p)
 }
 
-// execArgs extracts the argv of one command group. systemd joins the
-// arguments with single spaces, so an argument containing a space cannot be
-// told apart from two arguments; Caddy's flags never contain one.
+// execArgs extracts the argv of one command group from systemctl show's
+// rendering. systemd joins the arguments with single spaces there, so an
+// argument containing a space cannot be told apart from two; UnitsUsing
+// replaces these with the D-Bus array whenever busctl can be read, and this
+// parse is the fallback.
 func execArgs(group string) []string {
 	_, after, ok := strings.Cut(group, "argv[]=")
 	if !ok {

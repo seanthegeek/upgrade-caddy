@@ -41,7 +41,11 @@ checked" and does not affect the status.
 Go keeps the major version in the module path (`.../caddy/v2`), so a plain
 latest-version query never sees a new major. `check` also probes the next
 major path for Caddy and every plugin and reports any it finds, giving up
-after two consecutive major numbers that do not exist. A newer major
+after two consecutive major numbers that do not exist. A bare module path
+can hold v0, v1 and `vN+incompatible` releases alike, so a newer major can
+also appear on the same path (a v0 plugin whose latest is v1); that is
+reported as a major change too, and probing starts above the installed
+major, not the path's. A newer major
 counts as an available update, because Caddy has never backported security
 fixes to a previous major: staying on the old one means going unpatched.
 `build` will still not cross a major on its own, since plugins built for one
@@ -118,7 +122,8 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    is followed and the file it points to is what gets replaced), the systemd units
    whose `ExecStart` runs it, and the configs to validate against (every
    distinct set of `--config`, `--adapter` and `--envfile` flags across
-   those units, or the `--config` flag).
+   those units, read from the command that runs the target via D-Bus so an
+   argument containing a space survives, or the `--config` flag).
 2. Refuses if the target belongs to a system package, or if the package
    manager cannot say either way, and checks up front
    whether root is needed (to write the directory, restart the unit, or
