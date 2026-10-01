@@ -554,6 +554,55 @@ type Lockfile struct {
 	SourceBinary *LockSource  `json:"source_binary,omitempty"`
 }
 
+// ReadLockfile parses a lockfile from disk.
+func ReadLockfile(path string) (*Lockfile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var lf Lockfile
+	if err := json.Unmarshal(data, &lf); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if lf.Schema != 1 {
+		return nil, fmt.Errorf("%s: unsupported lockfile schema %d", path, lf.Schema)
+	}
+	return &lf, nil
+}
+
+// Describes reports whether the lockfile matches the inspected binary:
+// same Caddy path, version and checksum, and the same set of plugin
+// modules at the same versions and checksums. A lockfile that does not
+// describe the binary beside it is treated as absent by install.
+func (lf *Lockfile) Describes(built *caddybin.Info) error {
+	if lf.Caddy.Package != built.MainPath || lf.Caddy.Version != built.MainVersion {
+		return fmt.Errorf("lockfile says Caddy %s %s, binary is %s %s", lf.Caddy.Package, lf.Caddy.Version, built.MainPath, built.MainVersion)
+	}
+	if lf.Caddy.Sum != "" && built.MainSum != "" && lf.Caddy.Sum != built.MainSum {
+		return fmt.Errorf("lockfile Caddy checksum %s does not match the binary's %s", lf.Caddy.Sum, built.MainSum)
+	}
+	key := func(pkg, ver, sum string) string { return pkg + "@" + ver + " " + sum }
+	want := map[string]bool{}
+	for _, m := range lf.Plugins {
+		want[key(m.Package, m.Version, m.Sum)] = true
+	}
+	have := map[string]bool{}
+	for _, p := range built.Plugins {
+		have[key(p.Package, p.Version, p.Sum)] = true
+	}
+	for k := range want {
+		if !have[k] {
+			return fmt.Errorf("lockfile lists %s, which the binary does not carry", k)
+		}
+	}
+	for k := range have {
+		if !want[k] {
+			return fmt.Errorf("binary carries %s, which the lockfile does not list", k)
+		}
+	}
+	return nil
+}
+
 // LockModule is one module in a Lockfile.
 type LockModule struct {
 	ModuleID   string `json:"module_id,omitempty"`

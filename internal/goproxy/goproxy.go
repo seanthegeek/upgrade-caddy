@@ -65,6 +65,11 @@ type Client struct {
 	Sources []Source
 	NoProxy string // GONOPROXY (or GOPRIVATE when GONOPROXY is unset) glob list
 	HTTP    *http.Client
+
+	// ConfigErr, when set, is returned by every lookup: the GOPROXY value
+	// was present but unusable, which the go command also refuses rather
+	// than falling back to the default proxy.
+	ConfigErr error
 }
 
 // New builds a client from the effective Go environment: GOPROXY,
@@ -133,11 +138,17 @@ func FromEnv(goproxy, gonoproxy, goprivate string) *Client {
 	if noProxy == "" {
 		noProxy = goprivate
 	}
-	return &Client{
+	c := &Client{
 		Sources: ParseGOPROXY(goproxy),
 		NoProxy: noProxy,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 	}
+	if strings.TrimSpace(goproxy) != "" && len(c.Sources) == 0 {
+		// Mirrors the go command: "GOPROXY list is not the empty string,
+		// but contains no entries".
+		c.ConfigErr = errors.New("GOPROXY is set but contains no entries")
+	}
+	return c
 }
 
 // ParseGOPROXY splits a GOPROXY value into sources, keeping track of
@@ -204,6 +215,9 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 		return Info{}, fmt.Errorf("%s: %w", modPath, err)
 	}
 	sources := c.Sources
+	if c.ConfigErr != nil {
+		return Info{}, c.ConfigErr
+	}
 	if len(sources) == 0 {
 		sources = ParseGOPROXY("")
 	}
@@ -222,7 +236,7 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			return Info{}, fmt.Errorf("%s: %w", modPath, ErrDirect)
 		}
 		var info Info
-		if dir, isFile, perr := fileProxyDir(s.URL); perr != nil {
+		if dir, isFile, perr := fileProxyDir(i, s.URL); perr != nil {
 			err = perr
 		} else if isFile {
 			info, err = c.fetchFile(dir+"/"+escaped+"/@latest", modPath)
@@ -267,14 +281,19 @@ func (c *Client) fetch(ctx context.Context, url, modPath string) (Info, error) {
 		return Info{}, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		// Bytes that happen to form valid JSON are not an answer if the
+		// connection failed before the body was complete.
+		return Info{}, fmt.Errorf("%s: reading response: %w", redacted(url), err)
+	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 		return Info{}, fmt.Errorf("%s: %w", modPath, ErrNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Info{}, fmt.Errorf("%s: HTTP %d: %s", redacted(url), resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return decodeInfo(body, url)
+	return decodeInfo(body, redacted(url))
 }
 
 // redacted returns a URL with any password replaced by "xxxxx", for error
@@ -291,17 +310,20 @@ func redacted(raw string) string {
 
 // fileProxyDir parses a proxy entry and, for a file:// URL, returns its
 // decoded directory. As the go command requires, a file URL may carry
-// nothing but a path: a host, query or fragment is an error.
-func fileProxyDir(entry string) (dir string, isFile bool, err error) {
+// nothing but a path: a host, query or fragment is an error. Errors name
+// the entry by position, never by content: an unparseable entry cannot be
+// redacted (url.Parse's own error echoes the input), and a parseable one
+// is printed in redacted form.
+func fileProxyDir(index int, entry string) (dir string, isFile bool, err error) {
 	u, err := url.Parse(entry)
 	if err != nil {
-		return "", false, fmt.Errorf("GOPROXY entry %q: %w", entry, err)
+		return "", false, fmt.Errorf("GOPROXY entry %d is not a valid URL", index+1)
 	}
 	if u.Scheme != "file" {
 		return "", false, nil
 	}
 	if *u != (url.URL{Scheme: u.Scheme, Path: u.Path, RawPath: u.RawPath}) {
-		return "", false, fmt.Errorf("GOPROXY entry %q: a file URL may contain only a path", entry)
+		return "", false, fmt.Errorf("GOPROXY entry %d (%s): a file URL may contain only a path", index+1, u.Redacted())
 	}
 	return strings.TrimSuffix(filepath.FromSlash(u.Path), string(filepath.Separator)), true, nil
 }

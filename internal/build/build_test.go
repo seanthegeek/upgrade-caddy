@@ -433,3 +433,51 @@ func TestUnplannedAndTransitiveLockfile(t *testing.T) {
 		t.Errorf("lockfile sources: %+v", lf.Plugins)
 	}
 }
+
+func TestLockfileDescribes(t *testing.T) {
+	built := &caddybin.Info{HasModuleInfo: true, MainPath: caddybin.CaddyModulePath, MainVersion: "v2.11.6", MainSum: "h1:caddy", Plugins: []caddybin.Plugin{
+		{ModuleID: "a", Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"},
+	}}
+	good := &Lockfile{Schema: 1, Caddy: LockModule{Package: caddybin.CaddyModulePath, Version: "v2.11.6", Sum: "h1:caddy"},
+		Plugins: []LockModule{{Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"}}}
+	if err := good.Describes(built); err != nil {
+		t.Errorf("matching lockfile: %v", err)
+	}
+	stale := *good
+	stale.Caddy.Version = "v2.11.4"
+	if err := stale.Describes(built); err == nil {
+		t.Error("stale Caddy version must be rejected")
+	}
+	wrongSum := *good
+	wrongSum.Plugins = []LockModule{{Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:other"}}
+	if err := wrongSum.Describes(built); err == nil {
+		t.Error("plugin checksum mismatch must be rejected")
+	}
+	missing := *good
+	missing.Plugins = nil
+	if err := missing.Describes(built); err == nil {
+		t.Error("a plugin the lockfile does not list must be rejected")
+	}
+	empty := &Lockfile{Schema: 1}
+	if err := empty.Describes(built); err == nil {
+		t.Error("an empty lockfile must be rejected")
+	}
+	// Round trip through disk.
+	dir := t.TempDir()
+	f, _ := os.CreateTemp(dir, "lock-*.json")
+	p := &Plan{Plugins: []Plugin{{Package: "github.com/example/plugin", Version: "v1.3.0", Source: Added}}}
+	if err := writeLockfile(f, p, built); err != nil {
+		t.Fatal(err)
+	}
+	lf, err := ReadLockfile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lf.Describes(built); err != nil {
+		t.Errorf("a lockfile build wrote must describe its binary: %v", err)
+	}
+	os.WriteFile(f.Name(), []byte("{}"), 0o644)
+	if _, err := ReadLockfile(f.Name()); err == nil {
+		t.Error("{} has no schema and must be rejected")
+	}
+}

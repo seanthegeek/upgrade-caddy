@@ -205,13 +205,25 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 		}
 		fmt.Fprintf(logw, "    %v\n", rerr)
 		if previous == "" {
-			// First install: the state to restore is "nothing there".
-			fmt.Fprintf(logw, "==> removing %s again\n", target)
-			rbErr := errors.Join(removeIfPresent(target), rollbackLockfile(target))
-			if rbErr != nil {
-				return restarted, errors.Join(fmt.Errorf("%s did not come up with the new binary: %w; and the new binary or lockfile could not be removed from %s", u, rerr, target), rbErr)
+			// First install: the state to restore is "nothing there", which
+			// for units already restarted on the new binary means stopped;
+			// left running they would hold an unlinked executable and could
+			// never restart from the removed path.
+			rbCtx, cancel := context.WithTimeout(context.Background(), wait+15*time.Second)
+			var stopErrs []error
+			for _, started := range restarted {
+				fmt.Fprintf(logw, "==> stopping %s again\n", started)
+				if e := ctl.Stop(rbCtx, started); e != nil {
+					stopErrs = append(stopErrs, e)
+				}
 			}
-			return restarted, fmt.Errorf("%s did not come up with the new binary: %w; the new binary and lockfile were removed from %s again (there was nothing installed before)", u, rerr, target)
+			cancel()
+			fmt.Fprintf(logw, "==> removing %s again\n", target)
+			rbErr := errors.Join(errors.Join(stopErrs...), removeIfPresent(target), rollbackLockfile(target))
+			if rbErr != nil {
+				return restarted, errors.Join(fmt.Errorf("%s did not come up with the new binary: %w; and restoring the pre-install state of %s was incomplete", u, rerr, target), rbErr)
+			}
+			return restarted, fmt.Errorf("%s did not come up with the new binary: %w; the new binary and lockfile were removed from %s again and %d already-restarted unit(s) stopped (there was nothing installed before)", u, rerr, target, len(restarted))
 		}
 		fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
 		restoreErr, keepErr := rollback(target, previous)
@@ -365,8 +377,9 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err := os.Stat(abs + ".lock.json"); err != nil {
-			return nil, fmt.Errorf("--from %s: no %s.lock.json beside it; install only takes binaries produced by `upgrade-caddy build`", abs, abs)
+		lf, err := build.ReadLockfile(abs + ".lock.json")
+		if err != nil {
+			return nil, fmt.Errorf("--from %s: no usable lockfile beside it (%v); install only takes binaries produced by `upgrade-caddy build`", abs, err)
 		}
 		info, err := caddybin.Inspect(ctx, abs)
 		if err != nil {
@@ -374,6 +387,11 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		}
 		if info.IsDistroBuild() {
 			return nil, fmt.Errorf("--from %s: no Go module information; not a build output", abs)
+		}
+		// The lockfile is installed beside the binary as its attestation,
+		// so it must actually describe this binary, not a stale or foreign one.
+		if err := lf.Describes(info); err != nil {
+			return nil, fmt.Errorf("--from %s: the lockfile beside it does not describe this binary: %w", abs, err)
 		}
 		p.From, p.FromInfo = abs, info
 		return p, nil
@@ -807,8 +825,13 @@ func restartAndVerify(ctx context.Context, ctl systemd.Controller, unit, target 
 		return nil // no main process to inspect; active is the best we can confirm
 	}
 	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if errors.Is(err, os.ErrPermission) {
+		return nil // unprivileged; being active is the best we can confirm
+	}
 	if err != nil {
-		return nil // not readable unprivileged; being active is enough
+		// A vanished process (ENOENT) or anything else is not a healthy
+		// restart, however active systemd said the unit was a moment ago.
+		return fmt.Errorf("%s is active but its main process %d could not be inspected: %w", unit, pid, err)
 	}
 	want := target
 	if r, err := filepath.EvalSymlinks(target); err == nil {

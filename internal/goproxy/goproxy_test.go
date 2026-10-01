@@ -224,12 +224,55 @@ func TestFileProxyURLParsing(t *testing.T) {
 		t.Errorf("escaped file URL: %v %+v", err, info)
 	}
 	for _, bad := range []string{"file://host/srv/proxy", "file:///srv/proxy?x=1", "file:///srv/proxy#f"} {
-		if _, _, err := fileProxyDir(bad); err == nil {
+		if _, _, err := fileProxyDir(0, bad); err == nil {
 			t.Errorf("%q: a file URL with more than a path must be rejected", bad)
 		}
 	}
-	if _, isFile, err := fileProxyDir("https://proxy.golang.org"); err != nil || isFile {
+	if _, isFile, err := fileProxyDir(0, "https://proxy.golang.org"); err != nil || isFile {
 		t.Errorf("https entry: isFile=%v err=%v", isFile, err)
+	}
+	// Errors about an entry never echo credentials it may carry.
+	_, _, err := fileProxyDir(2, "file://user:hunter2@host/srv/proxy")
+	if err == nil || strings.Contains(err.Error(), "hunter2") || !strings.Contains(err.Error(), "entry 3") {
+		t.Errorf("disallowed file URL error must be redacted and positional: %v", err)
+	}
+	_, _, err = fileProxyDir(0, "http://user:hunter2@[::1]:namedport")
+	if err == nil || strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("unparseable entry error must not echo the entry: %v", err)
+	}
+}
+
+func TestEmptyGOPROXYListIsAnError(t *testing.T) {
+	c := FromEnv(",", "", "")
+	if c.ConfigErr == nil {
+		t.Fatal("GOPROXY=, must be a configuration error, not the default proxy")
+	}
+	if _, err := c.Latest(context.Background(), "example.com/m"); err == nil || !strings.Contains(err.Error(), "contains no entries") {
+		t.Errorf("lookups must fail with the configuration error: %v", err)
+	}
+	if FromEnv("", "", "").ConfigErr != nil {
+		t.Error("an unset GOPROXY is the default, not an error")
+	}
+	if FromEnv("|", "", "").ConfigErr == nil {
+		t.Error("GOPROXY=| has no entries either")
+	}
+}
+
+func TestBodyReadErrorIsHard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Promise more bytes than are sent: the client sees a truncated
+		// body even though what arrived is valid JSON.
+		w.Header().Set("Content-Length", "200")
+		w.Write([]byte(`{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}`))
+	}))
+	t.Cleanup(srv.Close)
+	withCreds := strings.Replace(srv.URL, "http://", "http://user:hunter2@", 1)
+	_, err := client(withCreds, "").Latest(context.Background(), "example.com/m")
+	if err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("a truncated body must be a hard error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("read error leaks the proxy password: %v", err)
 	}
 }
 
@@ -311,6 +354,23 @@ func TestErrorsRedactProxyCredentials(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "user:xxxxx@") {
 			t.Errorf("%s: error should show the redacted form: %v", m, err)
+		}
+	}
+	// Malformed JSON and an empty version go through decodeInfo, which
+	// must see the redacted URL too.
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/example.com/empty/@latest" {
+			w.Write([]byte(`{"Version":""}`))
+			return
+		}
+		w.Write([]byte("not json"))
+	}))
+	t.Cleanup(srv2.Close)
+	c2 := client(strings.Replace(srv2.URL, "http://", "http://user:hunter2@", 1), "")
+	for _, m := range []string{"example.com/json", "example.com/empty"} {
+		_, err := c2.Latest(ctx, m)
+		if err == nil || strings.Contains(err.Error(), "hunter2") || !strings.Contains(err.Error(), "user:xxxxx@") {
+			t.Errorf("%s: decode error must be redacted: %v", m, err)
 		}
 	}
 }

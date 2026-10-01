@@ -280,6 +280,7 @@ func execArgs(group string) []string {
 // the restart-and-verify sequence can be tested without systemd.
 type Controller interface {
 	Restart(ctx context.Context, unit string) error
+	Stop(ctx context.Context, unit string) error
 	IsActive(ctx context.Context, unit string) (bool, error)
 	MainPID(ctx context.Context, unit string) (int, error)
 }
@@ -292,6 +293,15 @@ func (Systemctl) Restart(ctx context.Context, unit string) error {
 	out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemctl restart %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// Stop runs `systemctl stop`.
+func (Systemctl) Stop(ctx context.Context, unit string) error {
+	out, err := exec.CommandContext(ctx, "systemctl", "stop", unit).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl stop %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

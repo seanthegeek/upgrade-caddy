@@ -100,6 +100,32 @@ func TestRestartUnitsFirstInstallCleansUp(t *testing.T) {
 	}
 }
 
+func TestRestartUnitsFirstInstallStopsAlreadyRestartedUnits(t *testing.T) {
+	settleDelay = 10 * time.Millisecond
+	t.Cleanup(func() { settleDelay = time.Second })
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("new"), 0o755)
+	// a.service comes up (active, still active after settle); b.service
+	// never does. Nothing was installed before, so a.service must be
+	// stopped again before the binary is removed from under it.
+	ctl := &fakeCtl{active: []bool{true, true}}
+	var log strings.Builder
+	restarted, err := restartUnits(context.Background(), ctl, []string{"a.service", "b.service"}, target, "", 50*time.Millisecond, &log)
+	if err == nil || len(restarted) != 1 || restarted[0] != "a.service" {
+		t.Fatalf("expected a.service restarted then failure on b.service: restarted=%v err=%v", restarted, err)
+	}
+	if len(ctl.stops) != 1 || ctl.stops[0] != "a.service" {
+		t.Errorf("the already-restarted unit must be stopped again: %v", ctl.stops)
+	}
+	if !strings.Contains(err.Error(), "1 already-restarted unit(s) stopped") {
+		t.Errorf("the error should say what was undone: %v", err)
+	}
+	if _, statErr := os.Stat(target); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("the new binary must be removed again")
+	}
+}
+
 func inode(t *testing.T, path string) uint64 {
 	t.Helper()
 	fi, err := os.Stat(path)
@@ -342,6 +368,7 @@ func TestSwapFirstInstall(t *testing.T) {
 // fakeCtl records calls and answers IsActive from a script.
 type fakeCtl struct {
 	restarts      []string
+	stops         []string
 	active        []bool // scripted answers; once exhausted, defaultActive
 	defaultActive bool
 	pid           int
@@ -353,6 +380,11 @@ type fakeCtl struct {
 func (f *fakeCtl) Restart(_ context.Context, unit string) error {
 	f.restarts = append(f.restarts, unit)
 	return f.restartErr
+}
+
+func (f *fakeCtl) Stop(_ context.Context, unit string) error {
+	f.stops = append(f.stops, unit)
+	return nil
 }
 
 func (f *fakeCtl) IsActive(_ context.Context, _ string) (bool, error) {
@@ -506,9 +538,17 @@ func TestRestartAndVerifyErrors(t *testing.T) {
 	if err := restartAndVerify(cancelled, &fakeCtl{active: []bool{false}}, "x.service", "/x", time.Second); !errors.Is(err, context.Canceled) {
 		t.Errorf("cancelled context while waiting: %v", err)
 	}
-	// A PID whose /proc entry cannot be read: being active is enough.
-	if err := restartAndVerify(ctx, &fakeCtl{active: []bool{true, true}, pid: 2147483000}, "x.service", "/x", time.Second); err != nil {
-		t.Errorf("unreadable /proc entry should not fail: %v", err)
+	// A PID with no /proc entry means the process vanished after it was
+	// seen active: that is a failed restart, not a successful one.
+	if err := restartAndVerify(ctx, &fakeCtl{active: []bool{true, true}, pid: 2147483000}, "x.service", "/x", time.Second); err == nil || !strings.Contains(err.Error(), "could not be inspected") {
+		t.Errorf("a vanished process must fail verification: %v", err)
+	}
+	// A /proc entry that exists but cannot be read (another user's
+	// process, unprivileged): being active is the best we can confirm.
+	if os.Geteuid() != 0 {
+		if err := restartAndVerify(ctx, &fakeCtl{active: []bool{true, true}, pid: 1}, "x.service", "/x", time.Second); err != nil {
+			t.Errorf("permission denied on /proc/1/exe should fall back to active: %v", err)
+		}
 	}
 	// A failure to query MainPID is not "no main process": verification
 	// could not be done, so the restart check fails.
