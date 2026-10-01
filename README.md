@@ -62,7 +62,8 @@ environment first and then from the file `go env -w` writes (`GOENV`, or
 the user config directory's `go/env`; `GOENV=off` disables it), so values
 persisted that way are honoured. `GOPROXY=off` and `GOPROXY=direct` mean
 nothing can be looked up, as does a `direct` reached after a failure that a
-pipe let through, and
+pipe let through; a `GOPROXY` that is set but lists no entries is a
+configuration error, as it is for the go command; and
 the component is reported as "not checked", as is any module matching
 `GONOPROXY` or `GOPRIVATE`, which is never sent to a proxy. A module a proxy
 answers 404 for is reported as not found even when `direct` follows, since
@@ -139,7 +140,9 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    denied".
 3. Builds the new binary into the target's directory with the same rules
    and flags as `build`, or stages one from `--from PATH` (a binary that
-   `build` produced, with its lockfile beside it). This lets the build run
+   `build` produced, with its lockfile beside it; the lockfile must
+   describe that exact binary, versions and checksums included, or it is
+   refused). This lets the build run
    as your own user and only the swap run as root:
 
    ```bash
@@ -166,8 +169,10 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    lockfile are restored, the units are restarted and verified again on
    the restored binary, the failed binary is kept as `<target>.failed`, and
    `install` exits 1 with a message that says whether the rollback itself
-   succeeded and whether the service came back up on it. SIGTERM, like
-   Ctrl-C, cancels the run and lets this rollback happen.
+   succeeded and whether the service came back up on it. On a first
+   install the pre-install state is restored instead: units already
+   restarted are stopped and the new binary and lockfile removed. SIGTERM,
+   like Ctrl-C, cancels the run and lets this rollback happen.
 
 `--no-restart` stops after step 5. `--dry-run` prints the plan after step 2.
 

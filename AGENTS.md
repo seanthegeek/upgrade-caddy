@@ -197,7 +197,16 @@ These are implemented in `internal/install`; keep them true.
   rather than assuming "not owned". On Linux, none of the known managers
   being present means not owned.
 - Error messages never contain proxy credentials: our own errors run
-  GOPROXY URLs through `url.Redacted`, and net/http redacts its own.
+  GOPROXY URLs through `url.Redacted`, an entry that cannot be parsed is
+  named by position only (url.Parse's error echoes its input), and
+  net/http redacts its own.
+- `--from` accepts only a binary whose lockfile describes it
+  (`Lockfile.Describes`: Caddy path, version and checksum, and the exact
+  plugin set with versions and checksums), since the lockfile is installed
+  beside the target as its attestation.
+- After a restart, a main process whose `/proc/<pid>/exe` is missing has
+  vanished and fails verification; only a permission error falls back to
+  the active state.
 - Rollback restores the previous binary before trying to keep the failed
   one as `.failed`, returns the restore outcome separately from the
   diagnostic-copy outcome, and its restarts are verified the same way as
