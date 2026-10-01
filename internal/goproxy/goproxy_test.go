@@ -130,11 +130,11 @@ func TestLatestKeywordsAndPrivate(t *testing.T) {
 func TestLatestFallback(t *testing.T) {
 	ctx := context.Background()
 	primary := newServer(t, map[string]string{"/a.example/m/@latest": "v1.0.0"}, "/b.example/m/@latest")
-	secondary := newServer(t, map[string]string{"/b.example/m/@latest": "v2.0.0", "/c.example/m/@latest": "v3.0.0"})
+	secondary := newServer(t, map[string]string{"/b.example/m/@latest": "v1.2.0", "/c.example/m/@latest": "v1.3.0"})
 
 	// Comma: fall back on 404 only. c is missing on primary (404) -> secondary.
 	c := client(primary.URL+","+secondary.URL, "")
-	if info, err := c.Latest(ctx, "c.example/m"); err != nil || info.Version != "v3.0.0" {
+	if info, err := c.Latest(ctx, "c.example/m"); err != nil || info.Version != "v1.3.0" {
 		t.Errorf("comma fallback on 404: %v %+v", err, info)
 	}
 	// Comma: a 500 from primary is terminal.
@@ -143,7 +143,7 @@ func TestLatestFallback(t *testing.T) {
 	}
 	// Pipe: a 500 from primary falls through to secondary.
 	p := client(primary.URL+"|"+secondary.URL, "")
-	if info, err := p.Latest(ctx, "b.example/m"); err != nil || info.Version != "v2.0.0" {
+	if info, err := p.Latest(ctx, "b.example/m"); err != nil || info.Version != "v1.2.0" {
 		t.Errorf("pipe fallback on 500: %v %+v", err, info)
 	}
 	// Missing everywhere, ending in direct: ErrNotFound.
@@ -160,16 +160,29 @@ func TestLatestBadResponses(t *testing.T) {
 			w.Write([]byte("not json"))
 		case "/bad.example/empty/@latest":
 			w.Write([]byte(`{"Version":""}`))
+		case "/bad.example/garbage/@latest":
+			w.Write([]byte(`{"Version":"garbage"}`))
+		case "/bad.example/noncanonical/@latest":
+			w.Write([]byte(`{"Version":"1.2.3"}`)) // proxies must return the v-prefixed canonical form
+		case "/bad.example/wrongmajor/@latest":
+			w.Write([]byte(`{"Version":"v3.0.0"}`)) // a v3 version cannot live on a bare path
+		case "/bad.example/wrongmajor/v2/@latest":
+			w.Write([]byte(`{"Version":"v1.0.0"}`)) // nor v1 on a /v2 path
+		case "/good.example/incompatible/@latest":
+			w.Write([]byte(`{"Version":"v2.0.0+incompatible"}`)) // this one is legal on a bare path
 		default:
 			http.Error(w, "boom", http.StatusInternalServerError)
 		}
 	}))
 	t.Cleanup(srv.Close)
 	c := client(srv.URL, "")
-	for _, m := range []string{"bad.example/json", "bad.example/empty", "bad.example/500"} {
+	for _, m := range []string{"bad.example/json", "bad.example/empty", "bad.example/500", "bad.example/garbage", "bad.example/noncanonical", "bad.example/wrongmajor", "bad.example/wrongmajor/v2"} {
 		if _, err := c.Latest(ctx, m); err == nil || errors.Is(err, ErrNotFound) {
 			t.Errorf("%s: want a hard error, got %v", m, err)
 		}
+	}
+	if info, err := c.Latest(ctx, "good.example/incompatible"); err != nil || info.Version != "v2.0.0+incompatible" {
+		t.Errorf("+incompatible on a bare path is valid: %v %+v", err, info)
 	}
 }
 

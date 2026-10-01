@@ -157,6 +157,13 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			info, err = c.fetch(ctx, s.URL+"/"+escaped+"/@latest", modPath)
 		}
 		if err == nil {
+			// A proxy answer that is not a canonical version compatible
+			// with the module path is a broken proxy, not a version.
+			// Without this a value like "garbage" would sort below every
+			// real version and read as "current".
+			if cerr := module.Check(modPath, info.Version); cerr != nil {
+				return Info{}, fmt.Errorf("%s: proxy %s returned an invalid version %q: %w", modPath, s.URL, info.Version, cerr)
+			}
 			return info, nil
 		}
 		lastErr = err
