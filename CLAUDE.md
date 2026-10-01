@@ -24,3 +24,16 @@
 - Design decisions already made with the author (plugin set from the binary,
   versions pinned, no build server, refuse on distro builds, majors never
   crossed automatically) are recorded in AGENTS.md. Do not re-ask them.
+- When editing files with a script, compute every replacement before
+  opening anything for writing, and make the doc edits part of the same
+  guarded step as the code edits, before the commit. Two rounds landed
+  code without their docs because a README pattern failed after the commit
+  command was already queued, and one script truncated a test file by
+  opening it for writing before the replacement raised.
+- Copilot review threads on #1 number in the dozens and every reply is
+  itself a "review" in the API, so always list reviews with
+  `gh api --paginate`; without it the newest Copilot review falls off the
+  first page and looks absent.
+- Each Copilot round on this project has produced three to eight confirmed
+  defects, mostly in the patterns under "Lessons from review" in AGENTS.md.
+  Run `/address-copilot-review` until a round confirms nothing new.

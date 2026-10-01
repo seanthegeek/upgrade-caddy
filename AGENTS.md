@@ -221,6 +221,62 @@ These are implemented in `internal/install`; keep them true.
   CI cancellation or `timeout(1)` lets install roll back instead of dying
   mid-swap.
 
+## Lessons from review
+
+Eight rounds of Copilot review plus a layered cross-check review found
+about fifty real defects in this codebase. Almost all of them fell into a
+handful of patterns. Check new code against this list before calling it
+done; each item names where the pattern bit before.
+
+- **An error is never a negative answer.** When a check that gates a safety
+  decision cannot be performed, that is a refusal, not the permissive
+  branch. Bitten by: package ownership (command failure read as "not
+  owned"), file capabilities (missing `getcap` read as "none"), the
+  newer-major probe (failure read as "no newer major"), `MainPID` and
+  `/proc/<pid>/exe` lookups (error read as "verified"), modules without
+  package metadata (silently dropped), `systemctl show` failing (read as
+  "no unit runs this binary"), a response body that failed to read (bytes
+  that arrived parsed anyway). Write the error path first.
+- **Every state change has a verified inverse, and the first install is
+  its own case.** Define the pre-change state explicitly (for a first
+  install it is "nothing there, units stopped"), restore it on any failure,
+  verify the restore the same way as the forward step, and word the
+  message from the actual outcome. Bitten by: lockfile outside the
+  rollback, rollback restarts not verified, a cancelled context reused
+  for recovery, "rolled back" claimed when the restore failed, a failed
+  `.failed` link aborting the restore, earlier units left running after a
+  failed first install.
+- **Nothing from configuration goes into an error message unredacted.**
+  `GOPROXY` entries carry credentials; `url.Redacted` for anything
+  parseable, position only for anything that is not (`url.Parse`'s error
+  echoes its input). Bitten four times across three rounds.
+- **"Like the go command" means read the go command.** `cmd/go` source is
+  in `$(go env GOROOT)/src/cmd/go`; `modfetch/proxy.go` for GOPROXY,
+  `cfg/cfg.go` for GOENV. Cite the file in the comment. Bitten by: `off`
+  and `direct`, scheme-less hosts, `file://` URLs, the GOENV file, an
+  entry list with no entries, and (declined, correctly) an unreadable
+  GOENV file that the go command itself ignores.
+- **Parse structured output, not display output.** `systemctl show`
+  flattens argv, so a path with a space is lost; the D-Bus property via
+  `busctl --json=short` keeps it. Caddy's `list-modules --json` exists on
+  newer versions and would replace the text parser the same way. When
+  only display output exists, capture it from a real system into the test
+  fixture and say so.
+- **The module path does not say what the major is.** A bare path holds
+  v0, v1 and vN+incompatible; the installed version's major decides what
+  "newer major" and "within major" mean, and v0 is a major like any other.
+  Bitten three times.
+- **Temporary files are exclusive and unpredictable** (`os.CreateTemp`,
+  written through the handle), never a derived or PID-based name opened
+  with `O_TRUNC`. Bitten by the build lockfile and the staging files.
+- **Edge-case checklist for anything touching binaries, units or
+  versions:** a symlinked target; an argument containing a space; several
+  units running one binary; several `ExecStart` commands in one unit; a Go
+  module registering several Caddy modules; v0, v1, `+incompatible` and
+  `gopkg.in` paths; a first install versus an upgrade; a cancelled
+  context; set-ID and sticky mode bits; macOS and FreeBSD, which have none
+  of the Linux package managers; a stray positional argument.
+
 ## Conventions
 
 These rules apply to anyone, human or agent, making changes to this repo.
