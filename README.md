@@ -7,13 +7,13 @@ Plugin versions are never bumped unless you ask.
 
 ## Commands
 
-- `check` (implemented) reports whether Caddy or any compiled-in plugin is
+- `check` reports whether Caddy or any compiled-in plugin is
   behind the latest version on the Go module proxy. Also shows which package
   owns the binary and which systemd services run it.
-- `build` (implemented) builds a new Caddy with the same plugins at the
+- `build` builds a new Caddy with the same plugins at the
   same versions, via the xcaddy library, and writes a lockfile recording
-  every module version and checksum.
-- `install` (implemented) builds, validates against the live config, swaps
+  the version and checksum of Caddy and every plugin.
+- `install` builds, validates against the live config, swaps
   the binary atomically with a rollback copy kept, restarts the service and
   rolls back if it does not come up.
 - `version` prints the tool's version, commit and Go toolchain.
@@ -125,11 +125,14 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    config stops everything before anything changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the
-   path. Mode, owner and file capabilities (`getcap`) are carried over.
-6. Restarts each unit, waits for it to become active, and when running as
-   root confirms the main process executes the new binary. If that fails,
-   the previous binary is restored, the unit is restarted again, the failed
-   binary is kept as `<target>.failed`, and `install` exits 1.
+   path. Mode and file capabilities (`getcap`) are carried over; owner is
+   too when running as root.
+6. Restarts each unit, waits up to `--restart-wait` (default 15s) for it to
+   become active and one more second to be sure it stays up, and where
+   `/proc/<pid>/exe` is readable (root, or the same user) confirms the main
+   process executes the new binary. If that fails, the previous binary is
+   restored, the unit is restarted again, the failed binary is kept as
+   `<target>.failed`, and `install` exits 1.
 
 `--no-restart` stops after step 5. `--dry-run` prints the plan after step 2.
 
@@ -137,11 +140,16 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
 
 If `/usr/bin/caddy` came from your distribution (Ubuntu's `caddy` package,
 for example), `install` refuses to replace it: the next package upgrade
-would silently put the old binary back. Uninstall the package first
-(`sudo apt remove caddy` and so on). That also removes the package's systemd
-unit and `caddy` user, while `/etc/caddy` stays. Recreate the unit and user
-following [Caddy's manual installation docs](https://caddyserver.com/docs/running#manual-installation),
-then do a first install from scratch:
+would silently put the old binary back. Uninstall the package first with
+`sudo apt remove caddy` or your distribution's equivalent, then check what
+it left behind. On Debian and Ubuntu, `remove` deletes the unit file but
+leaves `caddy.service` masked (a symlink to `/dev/null` that would swallow
+a new unit file), keeps the `caddy` user, and keeps `/etc/caddy`; `purge`
+would delete `/etc/caddy`. So run `sudo systemctl unmask caddy.service`,
+recreate the unit following
+[Caddy's manual installation docs](https://caddyserver.com/docs/running#manual-installation)
+while skipping the `useradd` step if the user already exists, then do a
+first install from scratch:
 
 ```bash
 sudo upgrade-caddy install --fresh --target /usr/bin/caddy --with github.com/caddy-dns/cloudflare
@@ -170,9 +178,11 @@ Download the archive for your platform from the
 verify it against `checksums.txt`, and put `upgrade-caddy` on your `PATH`.
 Builds are provided for Linux (amd64, arm64, armv7), macOS (amd64, arm64)
 and FreeBSD (amd64).
-Or run `go install github.com/seanthegeek/upgrade-caddy@latest`
-The Go toolchain must be installed separately for
-`build` and `install`; `check` needs nothing else.
+Or, with Go installed, run
+`go install github.com/seanthegeek/upgrade-caddy@latest`.
+
+The Go toolchain must be installed for `build` and `install`; `check`
+needs nothing else.
 
 ## Build
 

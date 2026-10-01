@@ -129,7 +129,7 @@ func runBuild(ctx context.Context, args []string) int {
 		fmt.Fprintln(fs.Output(), "usage: upgrade-caddy build [flags]")
 		fmt.Fprintln(fs.Output(), "\nReproduces the installed binary's plugin set at the same versions with the latest Caddy.")
 		fmt.Fprintln(fs.Output(), "Plugin versions only change with --upgrade, --upgrade-all or --with. Major versions are never crossed without --allow-major.")
-		fmt.Fprintln(fs.Output(), "Writes <output>.lock.json recording every module version and checksum in the build.")
+		fmt.Fprintln(fs.Output(), "Writes <output>.lock.json recording the version and checksum of Caddy and every plugin.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)

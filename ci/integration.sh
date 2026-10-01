@@ -2,7 +2,7 @@
 # Integration test for upgrade-caddy's privileged paths: first install,
 # in-place upgrade with a running systemd unit, file capabilities, rollback
 # when the new binary cannot serve the live config, refusal over a system
-# package, and a plain `sudo upgrade-caddy install` that builds as root.
+# package, and an install that builds as root from the installed binary.
 #
 # It writes a systemd unit, installs a distribution package and runs the tool
 # as root. It is meant for a throwaway CI virtual machine with passwordless

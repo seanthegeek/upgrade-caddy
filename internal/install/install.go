@@ -95,8 +95,11 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		return plan, nil, nil
 	}
 	if plan.NeedsRoot {
-		return plan, nil, fmt.Errorf("root is required to %s; re-run with sudo, or build as your own user and run `sudo upgrade-caddy install --from <path>`",
-			strings.Join(plan.RootReasons, " and "))
+		how := "re-run with sudo, or build as your own user and run `sudo upgrade-caddy install --from <path>`"
+		if plan.From != "" {
+			how = "re-run with sudo"
+		}
+		return plan, nil, fmt.Errorf("root is required to %s; %s", strings.Join(plan.RootReasons, " and "), how)
 	}
 	logw := opts.Log
 	if logw == nil {
@@ -138,7 +141,7 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		}
 		result.Validated = plan.Config
 	} else {
-		fmt.Fprintln(logw, "==> no config found to validate against (no service runs this binary and --config was not given); skipping validation")
+		fmt.Fprintln(logw, "==> no config known to validate against (no unit passes --config to this binary and --config was not given); skipping validation")
 	}
 
 	// 3. Swap.
@@ -197,7 +200,8 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 // Resolve decides what install would do. It inspects the target, refuses
 // system packages and distribution builds, finds the service, works out
 // what to validate against and whether root is needed, and resolves the
-// build plan. Nothing on disk changes.
+// build plan. Nothing on disk changes beyond a temporary writability probe
+// file in the target directory.
 func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	if opts.From != "" && opts.Fresh {
 		return nil, errors.New("--from and --fresh cannot be combined")
@@ -218,7 +222,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		}
 		p.Target = abs
 	case opts.Fresh:
-		return nil, errors.New("--fresh needs --target: there is no installed binary to take the path from")
+		return nil, errors.New("--fresh needs --target: --fresh ignores any installed binary, so there is no path to default to")
 	default:
 		path, err := caddybin.Find("")
 		if err != nil {
@@ -364,13 +368,21 @@ func refuseSystemPackage(target string, owner *pkgmgr.Owner) error {
 		what = fmt.Sprintf("%s is a distribution-style build with no Go module information", target)
 		remove = "uninstall it with the package manager that installed it"
 	}
+	leftovers := "check what the package manager left behind (unit file, service user, config)"
+	if owner != nil && owner.Manager == "dpkg" {
+		// Verified against Ubuntu's caddy maintainer scripts: remove masks the
+		// unit, never deletes the user, and only purge deletes /etc/caddy.
+		leftovers = "on Debian and Ubuntu this leaves " + owner.Package + ".service masked and keeps the caddy user and /etc/caddy; purge would delete /etc/caddy"
+	}
 	return fmt.Errorf(`%s. install never writes over a system package: the next package upgrade would silently undo it.
 
 To switch to a custom build:
   1. uninstall the system package first: %s
-     (the package's systemd unit and caddy user go with it; /etc/caddy is kept)
-  2. recreate the service and user per https://caddyserver.com/docs/running#manual-installation
-  3. run: sudo upgrade-caddy install --fresh --target %s --with <plugin> ...`, what, remove, target)
+     (%s)
+  2. systemctl unmask the unit if it was masked, then recreate the unit per
+     https://caddyserver.com/docs/running#manual-installation, skipping any
+     step that already exists (the service user usually does)
+  3. run: sudo upgrade-caddy install --fresh --target %s --with <plugin> ...`, what, remove, leftovers, target)
 }
 
 func removeCommand(o *pkgmgr.Owner) string {
@@ -514,9 +526,10 @@ func validate(ctx context.Context, bin string, p *Plan, logw io.Writer, verbose 
 
 // swap puts newPath at target with no moment where nothing is there. The
 // current file is hard-linked to <target>.previous first, so a rollback
-// copy exists before the atomic rename replaces the target. Mode and
-// ownership are copied from the old file; file capabilities are re-applied.
-// It returns the rollback path, or "" when there was no previous file.
+// copy exists before the atomic rename replaces the target. Mode is copied
+// from the old file, and ownership too when the caller is allowed to chown
+// (root); file capabilities are re-applied. It returns the rollback path,
+// or "" when there was no previous file.
 func swap(target, newPath, caps string) (previous string, err error) {
 	if old, err := os.Stat(target); err == nil {
 		if err := os.Chmod(newPath, old.Mode().Perm()); err != nil {

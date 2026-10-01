@@ -6,7 +6,7 @@ Instructions for AI coding agents working on this project.
 
 `upgrade-caddy` is a Go command-line tool that keeps a custom-built
 [Caddy](https://caddyserver.com) web server current without losing the
-plugins compiled into it. It has three commands:
+plugins compiled into it. It has three commands, plus `version`:
 
 - `check` reports whether Caddy, or any plugin compiled into the installed
   binary, is behind the latest version on the Go module proxy. Implemented.
@@ -58,8 +58,9 @@ only state that matters, and the tool is built around that.
   parses their config flags, and drives systemctl through a `Controller`
   interface so install's restart sequence can be tested with a fake.
 - `README.md` user-facing docs.
-- `.github/workflows/ci.yml` runs the hermetic checks on every push and
-  pull request, then `ci/integration.sh` on throwaway Ubuntu runners.
+- `.github/workflows/ci.yml` runs the hermetic checks on every push to
+  main and every pull request, then `ci/integration.sh` on throwaway Ubuntu
+  runners.
 - `.github/workflows/codeql.yml` runs CodeQL's security-and-quality
   queries over the Go code and the workflow files on pushes, pull requests
   and weekly. Findings land in the repository's Security tab and on pull
@@ -105,8 +106,11 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    official Caddy apt repository installs a dpkg-owned `/usr/bin/caddy` that
    *does* carry module info, and it is still refused, because the next
    package upgrade would undo the install. The refusal message tells the
-   user to uninstall the package, recreate the unit and user per Caddy's
-   manual-install docs, and then run `install --fresh --target`. The author
+   user to uninstall the package, unmask and recreate the unit per Caddy's
+   manual-install docs, and then run `install --fresh --target`. The Debian
+   specifics in that message (unit left masked, `caddy` user kept,
+   `/etc/caddy` kept on remove and deleted on purge) were verified against
+   Ubuntu's maintainer scripts and are stated only for dpkg. The author
    chose this over a `dpkg-divert` escape hatch; do not add one.
 7. **`check` is strictly read-only.** It is the tool used to debug the other
    two commands, so it must never be the thing that changes state. The only
@@ -114,8 +118,10 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    `list-modules`, and read-only package manager and systemctl queries.
 8. **Build info is read from the file, not from the binary's own report.**
    `debug/buildinfo.ReadFile` is the source of truth for versions and
-   checksums. The binary is only executed to map Caddy module IDs to Go
-   module paths, which build info does not contain.
+   checksums; the version `list-modules` prints is kept only when build
+   info has none. The binary is executed only for `version` and for
+   `list-modules`, which maps Caddy module IDs to Go module paths, something
+   build info does not contain.
 9. **Latest versions come from the Go module proxy, not the GitHub API.**
    One mechanism covers Caddy and every plugin and it needs no credentials.
    `GOPROXY`, `GONOPROXY` and `GOPRIVATE` are followed the way the `go`
@@ -140,11 +146,13 @@ These are implemented in `internal/install`; keep them true.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is
   renamed over the target. There is never an instant without a binary at
-  the path. Mode, owner and `getcap` file capabilities carry over.
+  the path. Mode and `getcap` file capabilities carry over, and owner does
+  when running as root.
 - The service is found by scanning unit `ExecStart` paths for the target.
   It is never assumed to be `caddy.service`.
 - Restart, don't reload. Reload keeps the old process and so the old binary.
-- After restart, wait for active, and as root confirm `/proc/<MainPID>/exe`
+- After restart, wait for active and for it to stay active, and where
+  `/proc/<MainPID>/exe` is readable (root, or the same user) confirm it
   is the target. On failure restore `.previous`, restart again, keep the
   bad binary as `<target>.failed`, exit 1.
 - Root is required only for what actually needs it (unwritable directory,
@@ -326,9 +334,9 @@ belongs in bite-sized pages under `docs/` rather than a monolithic readme.
 
 ## Out of scope
 
-- Service managers other than systemd. `install` should detect that
-  systemctl is absent and say so, not try to drive OpenRC, launchd or
-  Windows services.
+- Service managers other than systemd. When systemctl is absent `install`
+  says so in its plan and swaps the binary without restarting anything; it
+  does not try to drive OpenRC, launchd or Windows services.
 - Caddy's download/build server, in any form. See invariant 4.
 - Making distribution builds "work". The refusal in invariant 5 is the
   correct behaviour, not a placeholder.

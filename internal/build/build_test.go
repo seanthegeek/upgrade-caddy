@@ -188,6 +188,13 @@ func TestResolveCaddyMajor(t *testing.T) {
 	}
 }
 
+func TestResolveCaddyMajorFreshWording(t *testing.T) {
+	_, err := resolve(t, nil, Options{CaddyVersion: "v3.0.0"})
+	if err == nil || strings.Contains(err.Error(), "installed") || !strings.Contains(err.Error(), "builds by default") {
+		t.Errorf("fresh build must not claim a Caddy is installed: %v", err)
+	}
+}
+
 func TestResolveRefusesDistroBuild(t *testing.T) {
 	src := &caddybin.Info{Path: "/usr/bin/caddy", ResolvedPath: "/usr/bin/caddy", Version: "2.6.2"}
 	_, err := resolve(t, src, Options{})

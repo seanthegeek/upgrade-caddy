@@ -137,10 +137,12 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 	}
 	std, nonstd, unknown := ParseListModules(listOut)
 	info.StandardCount = std
+	// Build info is the source of truth for versions and checksums; the
+	// version list-modules printed is only kept when build info has none.
 	for i := range nonstd {
 		if d, ok := deps[nonstd[i].Package]; ok {
 			nonstd[i].Sum = d.Sum
-			if nonstd[i].Version == "" {
+			if d.Version != "" {
 				nonstd[i].Version = d.Version
 			}
 			if d.Replace != nil {

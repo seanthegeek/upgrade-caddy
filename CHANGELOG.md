@@ -19,7 +19,7 @@ and this project adheres to
   pinned versions with the latest Caddy, through the xcaddy library. Plugin
   versions change only with `--upgrade`, `--upgrade-all` or `--with`, and a
   major version is never crossed without `--allow-major`. Writes a lockfile
-  with every module's version and checksum.
+  with the version and checksum of Caddy and every plugin.
 - `install` command: builds or takes a prior build, validates it against
   the live config, swaps it over the installed binary with no gap and a
   rollback copy kept, restarts the service and rolls back if it does not

@@ -24,7 +24,7 @@ type Options struct {
 }
 
 // Major describes the newest major version living at a different module
-// path, and how many majors lie between it and the installed one.
+// path, and how many newer majors exist, counting it.
 type Major struct {
 	Package string `json:"package"`
 	Version string `json:"version"`
@@ -173,7 +173,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	r.UpdatesAvailable = r.anyOutdated()
 
 	if m := r.Caddy.MajorAvailable; m != nil {
-		behind := "a newer major version"
+		behind := "one major version"
 		if m.Behind > 1 {
 			behind = fmt.Sprintf("%d major versions", m.Behind)
 		}

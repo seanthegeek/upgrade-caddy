@@ -164,7 +164,11 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 	} else {
 		v := semver.Canonical(opts.CaddyVersion)
 		if m := semver.Major(v); m > 0 && m != installedMajor && !opts.AllowMajor {
-			return nil, fmt.Errorf("--caddy-version %s is a different major version than the installed v%d; plugins built for one major do not compile against another, pass --allow-major to do this deliberately", v, installedMajor)
+			than := fmt.Sprintf("the installed v%d", installedMajor)
+			if src == nil {
+				than = fmt.Sprintf("the v%d this tool builds by default", installedMajor)
+			}
+			return nil, fmt.Errorf("--caddy-version %s is a different major version than %s; plugins built for one major do not compile against another, pass --allow-major to do this deliberately", v, than)
 		}
 		p.CaddyVersion = v
 	}
@@ -343,7 +347,7 @@ func (p *Plan) WriteText(w io.Writer) {
 		fmt.Fprintf(w, "Caddy:    %s\n", p.CaddyVersion)
 	}
 	if p.HostGoVersion != "" {
-		fmt.Fprintf(w, "Host Go:  %s (a newer toolchain is fetched automatically if Caddy requires it)\n", p.HostGoVersion)
+		fmt.Fprintf(w, "Host Go:  %s (with GOTOOLCHAIN=auto a newer toolchain is fetched if Caddy requires it)\n", p.HostGoVersion)
 	}
 	fmt.Fprintf(w, "Output:   %s\n", p.Output)
 	if len(p.Plugins) == 0 {
