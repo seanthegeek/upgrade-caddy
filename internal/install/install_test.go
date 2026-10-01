@@ -53,6 +53,53 @@ func TestParseCaps(t *testing.T) {
 	}
 }
 
+func TestReadCapsDistinguishesNoneFromUnknown(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain")
+	os.WriteFile(plain, []byte("x"), 0o755)
+	caps, err := readCaps(plain)
+	if err != nil || caps != nil {
+		t.Errorf("a plain file has no capabilities: %v %v", caps, err)
+	}
+	if _, err := readCaps(filepath.Join(dir, "missing")); err == nil {
+		t.Error("an unreadable target is an error, not 'no capabilities'")
+	}
+	// Writing capabilities needs CAP_SETFCAP; unprivileged, swap must
+	// report the failure and roll back rather than drop them silently.
+	if os.Geteuid() != 0 {
+		target := filepath.Join(dir, "caddy")
+		os.WriteFile(target, []byte("old"), 0o755)
+		staged := filepath.Join(dir, "staged")
+		os.WriteFile(staged, []byte("new"), 0o755)
+		_, err := swap(target, staged, []byte{1, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+		if err == nil || !strings.Contains(err.Error(), "file capabilities") {
+			t.Errorf("unprivileged capability write must fail loudly: %v", err)
+		}
+		if got, _ := os.ReadFile(target); string(got) != "old" {
+			t.Errorf("target must be rolled back after a capability failure, got %q", got)
+		}
+	}
+}
+
+func TestRestartUnitsFirstInstallCleansUp(t *testing.T) {
+	settleDelay = 10 * time.Millisecond
+	t.Cleanup(func() { settleDelay = time.Second })
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("new"), 0o755)
+	os.WriteFile(target+".lock.json", []byte("newlock"), 0o644)
+	var log strings.Builder
+	_, err := restartUnits(context.Background(), &fakeCtl{}, []string{"a.service"}, target, "", 50*time.Millisecond, &log)
+	if err == nil || !strings.Contains(err.Error(), "removed from") {
+		t.Errorf("first install restart failure: %v", err)
+	}
+	for _, f := range []string{target, target + ".lock.json"} {
+		if _, statErr := os.Stat(f); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("%s must be removed again after a failed first-install restart", f)
+		}
+	}
+}
+
 func inode(t *testing.T, path string) uint64 {
 	t.Helper()
 	fi, err := os.Stat(path)
@@ -74,7 +121,7 @@ func TestSwapAndRollback(t *testing.T) {
 	}
 	oldIno := inode(t, target)
 
-	previous, err := swap(target, newPath, "")
+	previous, err := swap(target, newPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +277,7 @@ func TestSwapFirstInstall(t *testing.T) {
 	target := filepath.Join(dir, "caddy")
 	newPath := filepath.Join(dir, "staged")
 	os.WriteFile(newPath, []byte("new"), 0o755)
-	previous, err := swap(target, newPath, "")
+	previous, err := swap(target, newPath, nil)
 	if err != nil || previous != "" {
 		t.Fatalf("first install: previous=%q err=%v", previous, err)
 	}
@@ -338,6 +385,19 @@ func TestStageAndCopy(t *testing.T) {
 	if filepath.Dir(bin) != dst || filepath.Dir(lock) != dst {
 		t.Errorf("staged outside target dir: %s %s", bin, lock)
 	}
+	if !strings.HasPrefix(filepath.Base(bin), ".caddy-install-") || !strings.HasSuffix(lock, ".lock.json") {
+		t.Errorf("staged names: %s %s", bin, lock)
+	}
+	// A path planted beforehand is never written through: the staged
+	// names are unpredictable and created exclusively.
+	planted := filepath.Join(dst, ".caddy-install-"+strings.TrimPrefix(filepath.Base(bin), ".caddy-install-"))
+	if planted != bin {
+		t.Fatal("test assumption broken")
+	}
+	bin2, _, err := stage(from, filepath.Join(dst, "caddy"))
+	if err != nil || bin2 == bin {
+		t.Errorf("a second staging must get a fresh exclusive file: %s %v", bin2, err)
+	}
 	if got, _ := os.ReadFile(bin); string(got) != "bin" {
 		t.Errorf("staged content: %q", got)
 	}
@@ -404,10 +464,10 @@ func TestStageAndCopyErrors(t *testing.T) {
 	}
 	src := filepath.Join(dst, "src")
 	os.WriteFile(src, []byte("x"), 0o644)
-	if err := copyFile(src, filepath.Join(dst, "no", "such", "dir", "out"), 0o644); err == nil {
+	if _, err := copyToTemp(src, filepath.Join(dst, "no", "such", "dir"), "x-*", 0o644); err == nil {
 		t.Error("unwritable destination should fail")
 	}
-	if err := copyFile(filepath.Join(dst, "nope"), filepath.Join(dst, "out"), 0o644); err == nil {
+	if _, err := copyToTemp(filepath.Join(dst, "nope"), dst, "x-*", 0o644); err == nil {
 		t.Error("unreadable source should fail")
 	}
 }
@@ -417,7 +477,7 @@ func TestSwapErrors(t *testing.T) {
 	// Target exists but the new file is missing: nothing to rename.
 	target := filepath.Join(dir, "caddy")
 	os.WriteFile(target, []byte("old"), 0o755)
-	if _, err := swap(target, filepath.Join(dir, "missing"), ""); err == nil {
+	if _, err := swap(target, filepath.Join(dir, "missing"), nil); err == nil {
 		t.Error("missing new binary should fail")
 	}
 	if _, err := os.Stat(target + ".previous"); !errors.Is(err, os.ErrNotExist) {
@@ -462,7 +522,7 @@ func TestSwapRefusesSymlink(t *testing.T) {
 	os.Symlink(real, link)
 	staged := filepath.Join(dir, "staged")
 	os.WriteFile(staged, []byte("new"), 0o755)
-	if _, err := swap(link, staged, ""); err == nil || !strings.Contains(err.Error(), "symlink") {
+	if _, err := swap(link, staged, nil); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("swap on a symlink must refuse: %v", err)
 	}
 	if got, _ := os.ReadFile(real); string(got) != "old" {

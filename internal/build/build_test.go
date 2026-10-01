@@ -2,8 +2,10 @@ package build
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -373,5 +375,35 @@ func TestVerifyMoreBranches(t *testing.T) {
 	wrongPlugin := &caddybin.Info{HasModuleInfo: true, MainVersion: "v2.11.6", Plugins: []caddybin.Plugin{{Package: "github.com/caddy-dns/cloudflare", Version: "v0.2.3"}}}
 	if err := p.verify(wrongPlugin); err == nil || !strings.Contains(err.Error(), "wanted v0.2.4") {
 		t.Errorf("plugin version mismatch: %v", err)
+	}
+}
+
+func TestUnplannedAndTransitiveLockfile(t *testing.T) {
+	p := &Plan{CaddyVersion: "v2.11.6", Plugins: []Plugin{{Package: "github.com/example/plugin", Version: "v1.3.0", Source: Added}}}
+	built := &caddybin.Info{HasModuleInfo: true, MainPath: caddybin.CaddyModulePath, MainVersion: "v2.11.6", Plugins: []caddybin.Plugin{
+		{ModuleID: "a", Package: "github.com/example/plugin", Version: "v1.3.0"},
+		{ModuleID: "b", Package: "github.com/example/dep", Version: "v0.4.0"}, // registered by a dependency of the plugin
+		{ModuleID: "c", Package: "github.com/example/dep", Version: "v0.4.0"},
+	}}
+	if err := p.verify(built); err != nil {
+		t.Fatalf("a transitive plugin must not fail verification: %v", err)
+	}
+	if got := p.Unplanned(built); len(got) != 1 || got[0] != "github.com/example/dep@v0.4.0" {
+		t.Errorf("unplanned: %v", got)
+	}
+	f, err := os.CreateTemp(t.TempDir(), "lock-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeLockfile(f, p, built); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(f.Name())
+	var lf Lockfile
+	if err := json.Unmarshal(data, &lf); err != nil {
+		t.Fatal(err)
+	}
+	if len(lf.Plugins) != 3 || lf.Plugins[0].Source != Added || lf.Plugins[1].Source != Transitive {
+		t.Errorf("lockfile sources: %+v", lf.Plugins)
 	}
 }

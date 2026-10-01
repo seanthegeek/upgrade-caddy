@@ -11,15 +11,22 @@ import (
 	"strings"
 )
 
+// Command is one ExecStart= command of a unit.
+type Command struct {
+	Path string   `json:"path"`
+	Args []string `json:"args"`
+}
+
 // Unit is a systemd service that runs the binary of interest.
 type Unit struct {
-	Name             string   `json:"name"`
-	ExecStart        string   `json:"exec_start"`     // every ExecStart= line, newline-joined
-	Args             []string `json:"args,omitempty"` // argv of the first ExecStart command
-	WorkingDirectory string   `json:"working_directory,omitempty"`
-	MainPID          int      `json:"main_pid,omitempty"`
-	ActiveState      string   `json:"active_state"`
-	SubState         string   `json:"sub_state"`
+	Name             string    `json:"name"`
+	ExecStart        string    `json:"exec_start"`         // every ExecStart= line, newline-joined
+	Commands         []Command `json:"commands,omitempty"` // every ExecStart= command, in order
+	Args             []string  `json:"args,omitempty"`     // argv of the command that runs the binary of interest (the first, until matched)
+	WorkingDirectory string    `json:"working_directory,omitempty"`
+	MainPID          int       `json:"main_pid,omitempty"`
+	ActiveState      string    `json:"active_state"`
+	SubState         string    `json:"sub_state"`
 }
 
 // ConfigArgs reads the Caddy config flags out of the unit's command line:
@@ -78,11 +85,13 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 	}
 	var units []Unit
 	for _, u := range parseShow(string(out)) {
-		for _, exe := range execPaths(u.ExecStart) {
+		for _, c := range u.Commands {
+			exe := c.Path
 			if r, err := filepath.EvalSymlinks(exe); err == nil {
 				exe = r
 			}
 			if exe == want {
+				u.Args = c.Args // the command that runs this binary, not necessarily the first
 				units = append(units, u)
 				break
 			}
@@ -111,9 +120,14 @@ func parseShow(out string) []Unit {
 			case "ExecStart":
 				if u.ExecStart == "" {
 					u.ExecStart = v
-					u.Args = execArgs(v)
 				} else {
 					u.ExecStart += "\n" + v
+				}
+				for _, g := range execGroups(v) {
+					u.Commands = append(u.Commands, Command{Path: execPath(g), Args: execArgs(g)})
+				}
+				if u.Args == nil && len(u.Commands) > 0 {
+					u.Args = u.Commands[0].Args
 				}
 			case "ActiveState":
 				u.ActiveState = v
@@ -132,30 +146,52 @@ func parseShow(out string) []Unit {
 	return units
 }
 
-// execPaths extracts every "path=..." from systemd's ExecStart rendering,
-// "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run ... }", one such group
-// per line when a unit has several ExecStart commands.
-func execPaths(execStart string) []string {
-	var paths []string
+// execGroups splits systemd's ExecStart rendering into its "{ ... }"
+// groups, one per command.
+func execGroups(execStart string) []string {
+	var groups []string
 	rest := execStart
 	for {
-		_, after, ok := strings.Cut(rest, "path=")
+		_, after, ok := strings.Cut(rest, "{")
 		if !ok {
-			return paths
+			return groups
 		}
-		p, remainder, _ := strings.Cut(after, " ;")
-		if p = strings.TrimSpace(p); p != "" {
-			paths = append(paths, p)
+		g, remainder, _ := strings.Cut(after, "}")
+		if g = strings.TrimSpace(g); g != "" {
+			groups = append(groups, g)
 		}
 		rest = remainder
 	}
 }
 
-// execArgs extracts the argv of the first ExecStart command. systemd joins
-// the arguments with single spaces, so an argument containing a space
-// cannot be told apart from two arguments; Caddy's flags never contain one.
-func execArgs(execStart string) []string {
-	_, after, ok := strings.Cut(execStart, "argv[]=")
+// execPaths extracts every "path=..." from systemd's ExecStart rendering,
+// "{ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run ... }", one such group
+// per line when a unit has several ExecStart commands.
+func execPaths(execStart string) []string {
+	var paths []string
+	for _, g := range execGroups(execStart) {
+		if p := execPath(g); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// execPath extracts "path=..." from one command group.
+func execPath(group string) string {
+	_, after, ok := strings.Cut(group, "path=")
+	if !ok {
+		return ""
+	}
+	p, _, _ := strings.Cut(after, " ;")
+	return strings.TrimSpace(p)
+}
+
+// execArgs extracts the argv of one command group. systemd joins the
+// arguments with single spaces, so an argument containing a space cannot be
+// told apart from two arguments; Caddy's flags never contain one.
+func execArgs(group string) []string {
+	_, after, ok := strings.Cut(group, "argv[]=")
 	if !ok {
 		return nil
 	}

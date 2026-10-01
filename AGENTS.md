@@ -153,8 +153,17 @@ These are implemented in `internal/install`; keep them true.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is
   renamed over the target. There is never an instant without a binary at
-  the path. Mode and `getcap` file capabilities carry over, and owner does
-  when running as root.
+  the path. Mode and file capabilities carry over, and owner does when
+  running as root. Capabilities are read and written as the raw
+  `security.capability` extended attribute (Linux only; a no-op elsewhere):
+  no `getcap`/`setcap` dependency, and an unreadable attribute is an error
+  in `Resolve`, never "no capabilities", because a rename drops them.
+- Staged files (`--from` copies, the build output's lockfile) are created
+  with `os.CreateTemp`, unpredictable and exclusive, and written through
+  the open handle, so a path planted in a shared directory is never
+  followed by a privileged install.
+- When a unit has several `ExecStart` commands, the config flags come from
+  the command whose executable is the target, not the first one.
 - The service is found by scanning unit `ExecStart` paths for the target.
   It is never assumed to be `caddy.service`.
 - Restart, don't reload. Reload keeps the old process and so the old binary.
@@ -176,7 +185,9 @@ These are implemented in `internal/install`; keep them true.
 - Rollback restores the previous binary before trying to keep the failed
   one as `.failed`, and its restarts run under a fresh deadline because the
   caller's context is often already cancelled. Error messages say "rolled
-  back" only when the restore succeeded.
+  back" only when the restore succeeded. On a first install the state to
+  restore is "nothing there": a failed restart removes the new binary and
+  lockfile again.
 
 ## Conventions
 

@@ -61,10 +61,11 @@ type Plan struct {
 
 	Validations []Validation `json:"validations,omitempty"` // every distinct config the new binary is checked against
 
-	FileCapabilities string   `json:"file_capabilities,omitempty"` // getcap output to re-apply
+	FileCapabilities string   `json:"file_capabilities,omitempty"` // human-readable, from getcap when available, else "present"
 	NeedsRoot        bool     `json:"needs_root"`
 	RootReasons      []string `json:"root_reasons,omitempty"`
 
+	caps      []byte // raw security.capability value to carry over, nil when none
 	buildOpts build.Options
 }
 
@@ -155,7 +156,7 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 
 	// 3. Swap the binary, then the lockfile, keeping both previous copies.
 	fmt.Fprintf(logw, "==> installing %s\n", plan.Target)
-	previous, err := swap(plan.Target, newPath, plan.FileCapabilities)
+	previous, err := swap(plan.Target, newPath, plan.caps)
 	if err != nil {
 		cleanup()
 		return plan, nil, err
@@ -204,7 +205,13 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 		}
 		fmt.Fprintf(logw, "    %v\n", rerr)
 		if previous == "" {
-			return restarted, fmt.Errorf("%s did not come up with the new binary and there is no previous binary to roll back to", u)
+			// First install: the state to restore is "nothing there".
+			fmt.Fprintf(logw, "==> removing %s again\n", target)
+			rbErr := errors.Join(removeIfPresent(target), rollbackLockfile(target))
+			if rbErr != nil {
+				return restarted, errors.Join(fmt.Errorf("%s did not come up with the new binary: %w; and the new binary or lockfile could not be removed from %s", u, rerr, target), rbErr)
+			}
+			return restarted, fmt.Errorf("%s did not come up with the new binary: %w; the new binary and lockfile were removed from %s again (there was nothing installed before)", u, rerr, target)
 		}
 		fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
 		rbErr := errors.Join(rollback(target, previous), rollbackLockfile(target))
@@ -221,6 +228,13 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 			rbErr, errors.Join(restartErrs...))
 	}
 	return restarted, nil
+}
+
+func removeIfPresent(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // rolledBack words the outcome of a rollback for an error message, so a
@@ -316,9 +330,17 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		p.Validations = validationsFromUnits(units)
 	}
 
-	// File capabilities to carry over.
+	// File capabilities to carry over. Not being able to read them is an
+	// error, not "none": a rename silently drops them.
 	if p.TargetExists {
-		p.FileCapabilities = fileCaps(ctx, p.Target)
+		caps, err := readCaps(p.Target)
+		if err != nil {
+			return nil, err
+		}
+		p.caps = caps
+		if caps != nil {
+			p.FileCapabilities = describeCaps(ctx, p.Target)
+		}
 	}
 
 	// Privileges.
@@ -326,7 +348,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	if opts.NoRestart {
 		restartCount = 0
 	}
-	p.NeedsRoot, p.RootReasons = needsRoot(os.Geteuid(), dirWritable(filepath.Dir(p.Target)), filepath.Dir(p.Target), restartCount, unitNames(units), p.FileCapabilities != "")
+	p.NeedsRoot, p.RootReasons = needsRoot(os.Geteuid(), dirWritable(filepath.Dir(p.Target)), filepath.Dir(p.Target), restartCount, unitNames(units), p.caps != nil)
 
 	// Source of the new binary.
 	if opts.From != "" {
@@ -529,22 +551,23 @@ func dirWritable(dir string) bool {
 	return true
 }
 
-// fileCaps returns the binary's file capabilities as getcap prints them,
-// or "" when there are none or getcap is unavailable.
-func fileCaps(ctx context.Context, path string) string {
-	if _, err := exec.LookPath("getcap"); err != nil {
-		return ""
+// describeCaps renders the binary's file capabilities for the plan, using
+// getcap when it is installed and "present" otherwise. The raw value that is
+// actually carried over comes from readCaps and does not depend on getcap.
+func describeCaps(ctx context.Context, path string) string {
+	if _, err := exec.LookPath("getcap"); err == nil {
+		if out, err := exec.CommandContext(ctx, "getcap", path).Output(); err == nil {
+			if text := parseCaps(string(out)); text != "" {
+				return text
+			}
+		}
 	}
-	out, err := exec.CommandContext(ctx, "getcap", path).Output()
-	if err != nil {
-		return ""
-	}
-	return parseCaps(string(out))
+	return "present"
 }
 
 // parseCaps extracts the capability text from getcap output. Newer libcap
 // prints "/usr/bin/caddy cap_net_bind_service=ep", older prints
-// "/usr/bin/caddy = cap_net_bind_service+ep". setcap accepts either form.
+// "/usr/bin/caddy = cap_net_bind_service+ep".
 func parseCaps(out string) string {
 	line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
 	if line == "" {
@@ -567,39 +590,46 @@ func unitNames(units []systemd.Unit) string {
 }
 
 // stage copies a --from binary and its lockfile into the target's
-// directory so the final rename cannot cross filesystems.
+// directory so the final rename cannot cross filesystems. Both files are
+// created with unpredictable names and O_EXCL and written through the open
+// handles, so a path planted in a shared directory beforehand (a symlink,
+// say) is never followed by a privileged install.
 func stage(from, target string) (binPath, lockPath string, err error) {
 	dir := filepath.Dir(target)
-	binPath = filepath.Join(dir, fmt.Sprintf(".%s-install-%d", filepath.Base(target), os.Getpid()))
-	lockPath = binPath + ".lock.json"
-	if err := copyFile(from, binPath, 0o755); err != nil {
+	base := filepath.Base(target)
+	binPath, err = copyToTemp(from, dir, "."+base+"-install-*", 0o755)
+	if err != nil {
 		return "", "", fmt.Errorf("staging %s: %w", from, err)
 	}
-	if err := copyFile(from+".lock.json", lockPath, 0o644); err != nil {
+	lockPath, err = copyToTemp(from+".lock.json", dir, "."+base+"-install-*.lock.json", 0o644)
+	if err != nil {
 		os.Remove(binPath)
 		return "", "", fmt.Errorf("staging lockfile: %w", err)
 	}
 	return binPath, lockPath, nil
 }
 
-func copyFile(src, dst string, mode os.FileMode) error {
+// copyToTemp copies src into a new exclusively created file in dir and
+// returns its path.
+func copyToTemp(src, dir, pattern string, mode os.FileMode) (string, error) {
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	out, err := os.CreateTemp(dir, pattern)
 	if err != nil {
-		return err
+		return "", err
 	}
 	_, copyErr := io.Copy(out, in)
+	modeErr := out.Chmod(mode)
 	// Close can report a write failure of its own, so its error matters on
 	// both paths, not just the successful one.
-	if err := errors.Join(copyErr, out.Close()); err != nil {
-		os.Remove(dst)
-		return err
+	if err := errors.Join(copyErr, modeErr, out.Close()); err != nil {
+		os.Remove(out.Name())
+		return "", err
 	}
-	return nil
+	return out.Name(), nil
 }
 
 // validate runs `<new binary> validate` against one config.
@@ -661,9 +691,9 @@ func rollbackLockfile(target string) error {
 // current file is hard-linked to <target>.previous first, so a rollback
 // copy exists before the atomic rename replaces the target. Mode is copied
 // from the old file, and ownership too when the caller is allowed to chown
-// (root); file capabilities are re-applied. It returns the rollback path,
-// or "" when there was no previous file.
-func swap(target, newPath, caps string) (previous string, err error) {
+// (root); the raw file-capability attribute is re-applied. It returns the
+// rollback path, or "" when there was no previous file.
+func swap(target, newPath string, caps []byte) (previous string, err error) {
 	if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("%s is a symlink; install replaces the file it points to, so the target must be resolved first", target)
 	}
@@ -688,10 +718,10 @@ func swap(target, newPath, caps string) (previous string, err error) {
 		}
 		return "", fmt.Errorf("replacing %s: %w", target, err)
 	}
-	if caps != "" {
-		if out, err := exec.Command("setcap", caps, target).CombinedOutput(); err != nil {
+	if caps != nil {
+		if err := writeCaps(target, caps); err != nil {
 			rbErr := rollback(target, previous)
-			return "", errors.Join(fmt.Errorf("re-applying file capabilities %q: %w: %s; %s", caps, err, strings.TrimSpace(string(out)), rolledBack(rbErr)), rbErr)
+			return "", errors.Join(fmt.Errorf("re-applying file capabilities: %w; %s", err, rolledBack(rbErr)), rbErr)
 		}
 	}
 	return previous, nil

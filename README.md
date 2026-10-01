@@ -98,8 +98,11 @@ being built is downloaded automatically.
 The new binary is written to `--output` and never over the installed
 binary or one a service runs; that is `install`'s job. Before it is moved
 into place the binary is inspected to confirm it carries exactly the planned
-Caddy and plugin versions. A lockfile at `<output>.lock.json` records the
-resolved version and checksum of Caddy and every plugin.
+Caddy and plugin versions. A plugin can depend on another module that
+registers Caddy modules of its own; such modules are reported after the
+build and recorded in the lockfile with source `transitive`. A lockfile at
+`<output>.lock.json` records the resolved version and checksum of Caddy and
+every plugin.
 
 ## install
 
@@ -135,8 +138,11 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    config stops everything before anything changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the
-   path. Mode and file capabilities (`getcap`) are carried over; owner is
-   too when running as root. The lockfile is installed the same way, with
+   path. Mode and file capabilities are carried over (the raw
+   `security.capability` attribute is copied, so no `getcap`/`setcap` is
+   needed, and an unreadable attribute stops the install rather than
+   silently dropping it); owner is too when running as root. The lockfile
+   is installed the same way, with
    the old one kept as `<target>.lock.json.previous`; if it cannot be, the
    binary swap is undone (a first install removes the new binary again).
 6. Restarts each unit, waits up to `--restart-wait` (default 15s) for it to

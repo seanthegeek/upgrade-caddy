@@ -50,7 +50,31 @@ func TestParseShow(t *testing.T) {
 		t.Errorf("both ExecStart lines should be kept, got %d newlines in %q", lines, units[1].ExecStart)
 	}
 	if got := units[1].Args; len(got) == 0 || got[0] != "/usr/bin/true" {
-		t.Errorf("args should come from the first ExecStart, got %v", got)
+		t.Errorf("before matching, args default to the first ExecStart, got %v", got)
+	}
+	if cmds := units[1].Commands; len(cmds) != 2 || cmds[1].Path != "/opt/caddy/caddy" || cmds[1].Args[2] != "--config" {
+		t.Errorf("every ExecStart command should be kept with its own argv: %+v", cmds)
+	}
+}
+
+func TestArgsComeFromTheMatchingCommand(t *testing.T) {
+	// A Type=oneshot unit where Caddy is the second command: the config
+	// flags must come from that command, not from /usr/bin/true.
+	units := parseShow(sample)
+	u := units[1]
+	var matched *Unit
+	for _, c := range u.Commands {
+		if c.Path == "/opt/caddy/caddy" {
+			u.Args = c.Args
+			matched = &u
+		}
+	}
+	if matched == nil {
+		t.Fatal("fixture should contain the caddy command")
+	}
+	config, adapter, env := matched.ConfigArgs()
+	if config != "/srv/site.json" || adapter != "json" || len(env) != 3 {
+		t.Errorf("config flags from the matched command: %q %q %v", config, adapter, env)
 	}
 }
 
@@ -73,10 +97,11 @@ func TestConfigArgs(t *testing.T) {
 	if config != "/etc/caddy/Caddyfile" || adapter != "" || env != nil {
 		t.Errorf("packaged unit: %q %q %v", config, adapter, env)
 	}
-	// Only the first ExecStart's argv is parsed; here that is /usr/bin/true.
+	// Before UnitsUsing matches a command, Args is the first command's
+	// argv; here that is /usr/bin/true, which has no --config.
 	config, _, _ = units[1].ConfigArgs()
 	if config != "" {
-		t.Errorf("multi ExecStart should use the first argv only, got %q", config)
+		t.Errorf("unmatched multi-ExecStart unit should expose the first argv, got %q", config)
 	}
 	u := Unit{Args: []string{"/opt/caddy/caddy", "run", "--config", "/srv/site.json", "--adapter", "json",
 		"--envfile", "/etc/caddy/a.env,/etc/caddy/b.env", "--envfile=/etc/caddy/c.env"}}

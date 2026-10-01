@@ -60,6 +60,7 @@ const (
 	Upgraded   Source = "upgraded"   // bumped to latest within its major by --upgrade or --upgrade-all
 	Added      Source = "added"      // new via --with
 	Overridden Source = "overridden" // an installed plugin whose version or major was changed by --with
+	Transitive Source = "transitive" // not planned; pulled in as a dependency of a planned plugin
 )
 
 // Plugin is one module the new binary will carry.
@@ -410,6 +411,15 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 	tmpPath := tmp.Name()
 	tmp.Close()
 	defer os.Remove(tmpPath) // no-op once renamed into place
+	// The lockfile is created exclusively now and written through this
+	// handle later, so nobody can plant a symlink at its path during the
+	// build and have a privileged build write through it.
+	lockf, err := os.CreateTemp(dir, ".caddy-build-*.lock.json")
+	if err != nil {
+		return nil, fmt.Errorf("creating lockfile in %s: %w", dir, err)
+	}
+	tmpLock := lockf.Name()
+	defer os.Remove(tmpLock) // no-op once renamed into place
 
 	deps := make([]xcaddy.Dependency, 0, len(p.Plugins))
 	for _, pl := range p.Plugins {
@@ -436,19 +446,24 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 
 	built, err := caddybin.Inspect(ctx, tmpPath)
 	if err != nil {
+		lockf.Close()
 		return nil, fmt.Errorf("inspecting the new binary: %w", err)
 	}
 	if err := p.verify(built); err != nil {
+		lockf.Close()
 		return nil, fmt.Errorf("the new binary does not match the plan: %w", err)
 	}
+	if extra := p.Unplanned(built); len(extra) > 0 {
+		fmt.Fprintf(logw, "==> also compiled in, pulled in by the plugins above: %s\n", strings.Join(extra, ", "))
+	}
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		lockf.Close()
 		return nil, err
 	}
-	// Write the lockfile beside the staged binary first, so a lockfile
+	// Write the lockfile through the reserved handle first, so a lockfile
 	// failure leaves the requested output untouched; then move both.
 	built.Path, built.ResolvedPath = p.Output, p.Output
-	tmpLock := tmpPath + ".lock.json"
-	if err := writeLockfile(tmpLock, p, built); err != nil {
+	if err := writeLockfile(lockf, p, built); err != nil {
 		return nil, err
 	}
 	if err := os.Rename(tmpPath, p.Output); err != nil {
@@ -460,6 +475,26 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 		return nil, fmt.Errorf("the binary is at %s but its lockfile could not be moved into place: %w", p.Output, err)
 	}
 	return &Result{Output: p.Output, Lockfile: lockPath, Built: built}, nil
+}
+
+// Unplanned lists non-standard Go modules compiled into the binary that the
+// plan did not name. A requested plugin can depend on another module that
+// registers Caddy modules of its own, so these are expected rather than an
+// error; they are reported and recorded in the lockfile as "transitive".
+func (p *Plan) Unplanned(built *caddybin.Info) []string {
+	planned := map[string]bool{}
+	for _, pl := range p.Plugins {
+		planned[pl.Package] = true
+	}
+	var extra []string
+	seen := map[string]bool{}
+	for _, bp := range built.Plugins {
+		if !planned[bp.Package] && !seen[bp.Package] {
+			seen[bp.Package] = true
+			extra = append(extra, bp.Package+"@"+bp.Version)
+		}
+	}
+	return extra
 }
 
 // verify checks the built binary against the plan: right Caddy version, and
@@ -517,7 +552,10 @@ type LockSource struct {
 	Version string `json:"version"`
 }
 
-func writeLockfile(path string, p *Plan, built *caddybin.Info) error {
+// writeLockfile writes the lockfile through an already-open, exclusively
+// created file and closes it.
+func writeLockfile(f *os.File, p *Plan, built *caddybin.Info) error {
+	defer f.Close()
 	lf := Lockfile{
 		Schema:    1,
 		BuiltAt:   time.Now().UTC().Truncate(time.Second),
@@ -530,7 +568,11 @@ func writeLockfile(path string, p *Plan, built *caddybin.Info) error {
 		source[pl.Package] = pl.Source
 	}
 	for _, bp := range built.Plugins {
-		lm := LockModule{ModuleID: bp.ModuleID, Package: bp.Package, Version: bp.Version, Sum: bp.Sum, Source: source[bp.Package]}
+		src, ok := source[bp.Package]
+		if !ok {
+			src = Transitive
+		}
+		lm := LockModule{ModuleID: bp.ModuleID, Package: bp.Package, Version: bp.Version, Sum: bp.Sum, Source: src}
 		if bp.Replace != "" {
 			lm.ReplacedBy = bp.Replace
 			if bp.ReplaceVersion != "" {
@@ -546,7 +588,16 @@ func writeLockfile(path string, p *Plan, built *caddybin.Info) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // stepLog prints xcaddy's progress. In verbose mode every line is written
