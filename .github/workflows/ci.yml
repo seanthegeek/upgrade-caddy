@@ -36,8 +36,6 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
-    env:
-      GOTOOLCHAIN: auto
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -45,12 +43,17 @@ jobs:
           go-version-file: go.mod
       - name: Build upgrade-caddy
         run: go build -o upgrade-caddy .
+      # setup-go exports GOTOOLCHAIN=local; the build needs auto so the Go
+      # release Caddy requires is fetched, as it is on a developer machine.
       - name: Run privileged integration script
         run: ci/integration.sh
         env:
           UPGRADE_CADDY_CI: "1"
+          GOTOOLCHAIN: auto
       - name: go test with a custom Caddy on PATH
         run: go test ./...
+        env:
+          GOTOOLCHAIN: auto
       - name: Show Caddy unit journal
         if: failure()
         run: sudo journalctl -u caddy-ci.service --no-pager | tail -n 100
