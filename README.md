@@ -60,7 +60,8 @@ through to the next source after a 404 or 410, a pipe after any error.
 environment first and then from the file `go env -w` writes (`GOENV`, or
 the user config directory's `go/env`; `GOENV=off` disables it), so values
 persisted that way are honoured. `GOPROXY=off` and `GOPROXY=direct` mean
-nothing can be looked up and
+nothing can be looked up, as does a `direct` reached after a failure that a
+pipe let through, and
 the component is reported as "not checked", as is any module matching
 `GONOPROXY` or `GOPRIVATE`, which is never sent to a proxy. A module a proxy
 answers 404 for is reported as not found even when `direct` follows, since
@@ -147,7 +148,8 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    config stops everything before anything changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the
-   path. Mode and file capabilities are carried over (the raw
+   path. Mode (including setuid, setgid and sticky bits) and file
+   capabilities are carried over (the raw
    `security.capability` attribute is copied, so no `getcap`/`setcap` is
    needed, and an unreadable attribute stops the install rather than
    silently dropping it); owner is too when running as root. The lockfile

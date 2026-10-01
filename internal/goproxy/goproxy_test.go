@@ -164,6 +164,15 @@ func TestLatestFallback(t *testing.T) {
 	if _, err := client(bad.URL+","+good.URL, "").Latest(ctx, "d.example/m"); err == nil || !strings.Contains(err.Error(), "invalid version") {
 		t.Errorf("comma must treat an invalid-version answer as terminal: %v", err)
 	}
+	// A failure that "|" lets through, ending in direct: the go command
+	// would fetch from version control, which this tool cannot, so it is
+	// "not checked" rather than the proxy's error. A "," keeps the error.
+	if _, err := client(primary.URL+"|direct", "").Latest(ctx, "b.example/m"); !errors.Is(err, ErrDirect) {
+		t.Errorf("500 then |direct should be ErrDirect: %v", err)
+	}
+	if _, err := client(primary.URL+",direct", "").Latest(ctx, "b.example/m"); err == nil || errors.Is(err, ErrDirect) || errors.Is(err, ErrNotFound) {
+		t.Errorf("500 then ,direct should keep the proxy error: %v", err)
+	}
 	// Missing everywhere, ending in direct: ErrNotFound.
 	if _, err := client(primary.URL+","+secondary.URL+",direct", "").Latest(ctx, "nowhere.example/m"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing everywhere: %v", err)

@@ -216,6 +216,23 @@ func TestResolveCaddyMajor(t *testing.T) {
 	if err != nil || p.CaddyVersion != "v2.11.1" {
 		t.Errorf("explicit same-major version: %v %+v", err, p)
 	}
+	// Major 0 is a different major from the installed v2 as well.
+	if _, err := resolve(t, installed(), Options{CaddyVersion: "v0.11.5"}); err == nil || !strings.Contains(err.Error(), "--allow-major") {
+		t.Errorf("v0 must not bypass the major guard: %v", err)
+	}
+}
+
+func TestResolveWithCanonicalisesVersions(t *testing.T) {
+	p, err := resolve(t, installed(), Options{With: []string{"github.com/example/other@0.5.0", "github.com/example/plugin@main"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plugin(p, "github.com/example/other").Version; got != "v0.5.0" {
+		t.Errorf("a semantic version without v must reach go get as %q, got %q", "v0.5.0", got)
+	}
+	if got := plugin(p, "github.com/example/plugin").Version; got != "main" {
+		t.Errorf("a branch name must be left alone, got %q", got)
+	}
 }
 
 func TestResolveCaddyMajorFreshWording(t *testing.T) {

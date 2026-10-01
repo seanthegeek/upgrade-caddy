@@ -169,7 +169,9 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		p.CaddyVersion = info.Version
 	} else {
 		v := semver.Canonical(opts.CaddyVersion)
-		if m := semver.Major(v); m > 0 && m != installedMajor && !opts.AllowMajor {
+		// Major 0 is a major like any other: v0.x would make xcaddy build
+		// from the bare Caddy module path.
+		if m := semver.Major(v); m >= 0 && m != installedMajor && !opts.AllowMajor {
 			than := fmt.Sprintf("the installed v%d", installedMajor)
 			if src == nil {
 				than = fmt.Sprintf("the v%d this tool builds by default", installedMajor)
@@ -247,6 +249,12 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		path = strings.TrimSpace(path)
 		if path == "" {
 			return nil, fmt.Errorf("--with %q: empty module path", spec)
+		}
+		// A semantic version is passed to go get in its canonical form
+		// ("1.2.3" becomes "v1.2.3"); branch names and commit hashes are
+		// left for go get to resolve.
+		if version != "" && semver.IsValid(version) {
+			version = semver.Canonical(version)
 		}
 		if version == "" {
 			info, err := proxy.Latest(ctx, path)

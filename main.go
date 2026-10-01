@@ -116,17 +116,25 @@ func runCheck(ctx context.Context, args []string) int {
 
 // parseFlags parses args and maps the outcome to an exit code: ok is false
 // when the command should stop, with code 0 after -h and 1 after a usage
-// error. flag.ExitOnError would exit 2, which check uses to mean "updates
-// available".
+// error, including leftover positional arguments. flag.ExitOnError would
+// exit 2, which check uses to mean "updates available".
 func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
 	switch err := fs.Parse(args); {
 	case err == nil:
-		return exitOK, true
 	case errors.Is(err, flag.ErrHelp):
 		return exitOK, false
 	default:
 		return exitError, false
 	}
+	// No command takes positional arguments; a stray one is most likely a
+	// path meant for a flag, and silently ignoring it would make the
+	// command act on the wrong binary.
+	if fs.NArg() > 0 {
+		fmt.Fprintf(fs.Output(), "unexpected argument(s): %s (every option is a flag, e.g. --target PATH)\n", strings.Join(fs.Args(), " "))
+		fs.Usage()
+		return exitError, false
+	}
+	return exitOK, true
 }
 
 // multiFlag collects a repeatable string flag.

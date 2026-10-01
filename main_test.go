@@ -24,4 +24,8 @@ func TestParseFlags(t *testing.T) {
 	if code, ok := parseFlags(newSet(), []string{"--nope"}); ok || code != exitError {
 		t.Errorf("malformed flag: code=%d ok=%v, want stop with 1", code, ok)
 	}
+	// A stray positional argument is a usage error, not silently ignored.
+	if code, ok := parseFlags(newSet(), []string{"--json", "/usr/local/bin/caddy"}); ok || code != exitError {
+		t.Errorf("positional argument: code=%d ok=%v, want stop with 1", code, ok)
+	}
 }

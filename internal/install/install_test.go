@@ -302,6 +302,29 @@ func TestValidationsFromUnits(t *testing.T) {
 	}
 }
 
+func TestSwapPreservesSetIDAndStickyBits(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	newPath := filepath.Join(dir, "staged")
+	os.WriteFile(target, []byte("old"), 0o755)
+	// setuid, setgid and sticky on a file the test owns.
+	want := os.FileMode(0o755) | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	if err := os.Chmod(target, want); err != nil {
+		t.Skipf("cannot set set-ID bits here: %v", err)
+	}
+	if fi, _ := os.Stat(target); fi.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) == 0 {
+		t.Skip("filesystem does not keep set-ID bits")
+	}
+	os.WriteFile(newPath, []byte("new"), 0o600)
+	if _, err := swap(target, newPath, nil); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(target)
+	if got := fi.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky); got != want {
+		t.Errorf("mode after swap %v, want %v", got, want)
+	}
+}
+
 func TestSwapFirstInstall(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "caddy")

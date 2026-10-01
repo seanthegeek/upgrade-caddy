@@ -707,13 +707,16 @@ func swap(target, newPath string, caps []byte) (previous string, err error) {
 		return "", fmt.Errorf("%s is a symlink; install replaces the file it points to, so the target must be resolved first", target)
 	}
 	if old, err := os.Stat(target); err == nil {
-		if err := os.Chmod(newPath, old.Mode().Perm()); err != nil {
-			return "", err
-		}
+		// Owner first: chown clears set-ID bits, so the mode goes on
+		// afterwards, and with every bit os.Chmod accepts, not just rwx,
+		// so setuid, setgid and sticky survive the swap.
 		if st, ok := old.Sys().(*syscall.Stat_t); ok {
 			if err := os.Chown(newPath, int(st.Uid), int(st.Gid)); err != nil && !errors.Is(err, os.ErrPermission) {
 				return "", fmt.Errorf("setting owner of new binary: %w", err)
 			}
+		}
+		if err := os.Chmod(newPath, old.Mode()&(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky)); err != nil {
+			return "", err
 		}
 		previous = target + ".previous"
 		os.Remove(previous)

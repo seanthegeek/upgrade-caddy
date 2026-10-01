@@ -160,8 +160,9 @@ These are implemented in `internal/install`; keep them true.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is
   renamed over the target. There is never an instant without a binary at
-  the path. Mode and file capabilities carry over, and owner does when
-  running as root. Capabilities are read and written as the raw
+  the path. Owner is applied first (chown clears set-ID bits), then every
+  mode bit `os.Chmod` accepts, so setuid, setgid and sticky survive; owner
+  applies only when running as root. Capabilities are read and written as the raw
   `security.capability` extended attribute (Linux only; a no-op elsewhere):
   no `getcap`/`setcap` dependency, and an unreadable attribute is an error
   in `Resolve`, never "no capabilities", because a rename drops them.

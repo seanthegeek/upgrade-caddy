@@ -185,7 +185,8 @@ type Info struct {
 // entry was followed by "|". Proxies may be http(s) URLs or file:// paths
 // laid out like a proxy. Reaching "off" or "direct" ends the walk:
 // "direct" after a proxy's 404 is reported as ErrNotFound, since this tool
-// does not consult version control; "direct" or "off" first is ErrDirect or
+// does not consult version control; "direct" reached any other way (first,
+// or after a failure that a "|" let through) is ErrDirect, and "off" is
 // ErrOff. Modules matching GONOPROXY/GOPRIVATE are never sent to a proxy.
 //
 // Resolution relies on the proxy's @latest endpoint, which the protocol
@@ -209,8 +210,11 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 		case "off":
 			return Info{}, fmt.Errorf("%s: %w", modPath, ErrOff)
 		case "direct":
-			if lastErr != nil {
-				return Info{}, lastErr // a proxy said not found; direct is not consulted
+			// A proxy's 404/410 is final (direct is not consulted for a
+			// module the proxy says it has no copy of); any other failure
+			// that fell through a "|" lands here as "cannot look up".
+			if errors.Is(lastErr, ErrNotFound) {
+				return Info{}, lastErr
 			}
 			return Info{}, fmt.Errorf("%s: %w", modPath, ErrDirect)
 		}
