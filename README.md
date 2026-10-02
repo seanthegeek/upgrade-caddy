@@ -156,8 +156,10 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    sudo upgrade-caddy install --from /tmp/caddy
    ```
 
-4. Runs `validate` with the new binary against each real config. A rejected
-   config stops everything before anything changes.
+4. Runs `validate` with the new binary against each real config, in the
+   directory the service runs in (`/` when the unit sets none, the unit
+   user's home for `~`). A rejected config stops everything before
+   anything changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the
    path. Mode (including setuid, setgid and sticky bits) and file

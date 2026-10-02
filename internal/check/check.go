@@ -160,6 +160,23 @@ func resolveStatus(ctx context.Context, proxy *goproxy.Client, s *Status) {
 	}
 }
 
+// ownershipWarnings says what package ownership means for the binary: owned
+// means a custom build would be undone, and "could not tell" is reported as
+// its own state rather than looking like "not owned", because install
+// refuses on it.
+func ownershipWarnings(bin *caddybin.Info) []string {
+	var w []string
+	if bin.Owner != nil {
+		w = append(w, fmt.Sprintf(
+			"this binary is owned by the %s package %q; a custom build written over it would be undone by the next package upgrade",
+			bin.Owner.Manager, bin.Owner.Package))
+	}
+	if bin.OwnerUnknown != "" {
+		w = append(w, "could not determine whether this binary belongs to a system package ("+bin.OwnerUnknown+"); 'install' will refuse to replace it until that can be established")
+	}
+	return w
+}
+
 func (r *Report) warn(msg string) {
 	r.mu.Lock()
 	r.Warnings = append(r.Warnings, msg)
@@ -193,11 +210,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 			"this binary carries no Go module information, which is typical of distribution packages; "+
 				"its plugin set and pinned versions cannot be reproduced, so 'build' and 'install' will refuse to operate on it")
 	}
-	if bin.Owner != nil {
-		r.Warnings = append(r.Warnings, fmt.Sprintf(
-			"this binary is owned by the %s package %q; a custom build written over it would be undone by the next package upgrade",
-			bin.Owner.Manager, bin.Owner.Package))
-	}
+	r.Warnings = append(r.Warnings, ownershipWarnings(bin)...)
 
 	// Caddy itself.
 	installed := bin.MainVersion

@@ -401,6 +401,9 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		p.Validations = []Validation{{Config: abs, From: "--config"}}
 	} else {
 		p.Validations = validationsFromUnits(units)
+		if err := checkWorkDirs(p.Validations); err != nil {
+			return nil, err
+		}
 	}
 
 	// File capabilities to carry over. Not being able to read them is an
@@ -535,6 +538,20 @@ func validationsFromUnits(units []systemd.Unit) []Validation {
 		out = append(out, Validation{Config: cfg, Adapter: adapter, EnvFiles: env, WorkDir: u.WorkingDirectory, From: u.Name})
 	}
 	return out
+}
+
+// checkWorkDirs refuses a validation whose working directory is the unit
+// user's home but could not be resolved (systemd left it as "~" and the
+// user lookup failed): run anywhere else, a relative config path or a
+// relative path inside the config would be checked against the wrong
+// files, and validate would then be an answer to a different question.
+func checkWorkDirs(vals []Validation) error {
+	for _, v := range vals {
+		if v.WorkDir == systemd.UnresolvedHome {
+			return fmt.Errorf("%s runs in the home directory of its user, which could not be looked up, so %s cannot be validated where the service would read it; pass --config with an absolute path to validate explicitly", v.From, v.Config)
+		}
+	}
+	return nil
 }
 
 // buildSelectionFlags names the build-selection options that are set, for
@@ -719,18 +736,25 @@ func recheck(ctx context.Context, plan *Plan) error {
 		return fmt.Errorf("querying systemd: %w", err)
 	}
 	if !sameUnits(plan.Units, units) {
-		return changed(fmt.Sprintf("the set of units running %s (planned: %s; now: %s)", plan.Target, unitNamesOrNone(plan.Units), unitNamesOrNone(units)))
+		return changed(fmt.Sprintf("the units running %s, or their config flags or working directory (planned: %s; now: %s)", plan.Target, unitNamesOrNone(plan.Units), unitNamesOrNone(units)))
 	}
 	return nil
 }
 
-// sameUnits reports whether two unit lists name the same units in order.
+// sameUnits reports whether two unit lists name the same units in order
+// with the same validation inputs: working directory and the --config,
+// --adapter and --envfile flags. A unit whose config moved while the build
+// ran would otherwise be validated against the old one and restarted on
+// the new one unvalidated.
 func sameUnits(a, b []systemd.Unit) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i].Name != b[i].Name {
+		ca, aa, ea := a[i].ConfigArgs()
+		cb, ab, eb := b[i].ConfigArgs()
+		if a[i].Name != b[i].Name || a[i].WorkingDirectory != b[i].WorkingDirectory ||
+			ca != cb || aa != ab || !slices.Equal(ea, eb) {
 			return false
 		}
 	}

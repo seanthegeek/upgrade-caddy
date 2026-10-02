@@ -28,4 +28,11 @@ func TestParseFlags(t *testing.T) {
 	if code, ok := parseFlags(newSet(), []string{"--json", "/usr/local/bin/caddy"}); ok || code != exitError {
 		t.Errorf("positional argument: code=%d ok=%v, want stop with 1", code, ok)
 	}
+	// The same rule for the commands that take no flags.
+	if code := rejectArgs(nil); code != exitOK {
+		t.Errorf("version with no arguments: %d", code)
+	}
+	if code := rejectArgs([]string{"extra"}); code != exitError {
+		t.Errorf("version with a trailing argument must be a usage error: %d", code)
+	}
 }

@@ -196,8 +196,8 @@ func TestParseShowBareNameAndSearchPath(t *testing.T) {
 	if u.WorkingDirectory != "/home/sean" {
 		t.Errorf("the missing-ok marker must be stripped from WorkingDirectory: %q", u.WorkingDirectory)
 	}
-	if got := parseShow("Id=x.service\nExecStart={ path=/x ; argv[]=/x }\nWorkingDirectory=~\n")[0].WorkingDirectory; got != "" {
-		t.Errorf("the home marker cannot be resolved and must be left unknown: %q", got)
+	if got := parseShow("Id=x.service\nExecStart={ path=/x ; argv[]=/x }\nWorkingDirectory=~\n")[0].WorkingDirectory; got != UnresolvedHome {
+		t.Errorf("the home marker must be kept for resolution: %q", got)
 	}
 	dirs, err := parseBusStrings([]byte(busSearchPath))
 	if err != nil || !reflect.DeepEqual(dirs, []string{"/opt/probe", "/usr/bin"}) {
@@ -244,6 +244,58 @@ func TestResolvesBareName(t *testing.T) {
 	os.Symlink(bin, link)
 	if !resolves("caddy", want, []string{link}) {
 		t.Error("a symlinked search directory must resolve to the real file")
+	}
+}
+
+// Captured from `systemctl show -p Id -p User -p WorkingDirectory
+// caddy.service` on Ubuntu 24.04 (systemd 255): the packaged unit sets
+// User= and no WorkingDirectory=, which systemd renders empty.
+const userSample = `WorkingDirectory=
+User=caddy
+Id=caddy.service
+`
+
+func TestResolveWorkingDirectory(t *testing.T) {
+	homes := func(name string) (string, error) {
+		if name == "caddy" {
+			return "/var/lib/caddy", nil
+		}
+		if name == "" {
+			return "/root", nil
+		}
+		return "", errors.New("no such user")
+	}
+	u := parseShow(userSample + "ExecStart={ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run }\n")[0]
+	if u.User != "caddy" {
+		t.Fatalf("User= must be parsed: %+v", u)
+	}
+	cases := []struct {
+		name, wd, user, want string
+	}{
+		{"unset means the root directory, as systemd's empty_to_root", "", "caddy", "/"},
+		{"home of the unit user", "~", "caddy", "/var/lib/caddy"},
+		{"home of root when User= is unset", "~", "", "/root"},
+		{"unknown user stays unresolved", "~", "nobody-here", UnresolvedHome},
+		{"explicit directory kept", "/srv", "caddy", "/srv"},
+	}
+	for _, c := range cases {
+		u := Unit{WorkingDirectory: c.wd, User: c.user}
+		resolveWorkingDirectory(&u, homes)
+		if u.WorkingDirectory != c.want {
+			t.Errorf("%s: got %q want %q", c.name, u.WorkingDirectory, c.want)
+		}
+	}
+	// The real lookup: root by empty name and by ID agree, and a user that
+	// does not exist is an error, not a directory.
+	byEmpty, err := homeOf("")
+	if err != nil {
+		t.Skipf("root lookup unavailable here: %v", err)
+	}
+	if byID, err := homeOf("0"); err != nil || byID != byEmpty || byEmpty == "" {
+		t.Errorf("root by empty name %q and by id %q should agree: %v", byEmpty, byID, err)
+	}
+	if _, err := homeOf("no-such-user-upgrade-caddy"); err == nil {
+		t.Error("an unknown user must be an error")
 	}
 }
 

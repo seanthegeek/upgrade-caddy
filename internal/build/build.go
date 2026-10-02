@@ -315,6 +315,11 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 			return nil, fmt.Errorf("%s was built with a module replacement (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version>", pl.Package, pl.replacedBy, pl.Package)
 		}
 	}
+	// Caddy itself can be replaced too (a fork, a local checkout), and a
+	// default rebuild would otherwise quietly swap it for upstream Caddy.
+	if src != nil && src.MainReplace != "" && !covered[src.MainPath] {
+		return nil, fmt.Errorf("%s was built with Caddy itself replaced (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version>, or --fresh to build upstream Caddy deliberately", src.Path, replacedBy(src.MainReplace, src.MainReplaceVer), src.MainPath)
+	}
 
 	// Output path. Never the binary we are reproducing.
 	out := opts.Output
@@ -539,7 +544,45 @@ func (p *Plan) verify(built *caddybin.Info) error {
 			return fmt.Errorf("plugin %s is %s, wanted %s", pl.Package, got, pl.Version)
 		}
 	}
+	// Replacements: every one requested must be in effect, and nothing may
+	// be replaced that was not requested. Only this build's go.mod can
+	// introduce a replacement (Go ignores replace directives in
+	// dependencies), so the two lists must agree exactly.
+	want := map[string]string{}
+	for _, r := range p.Replacements {
+		want[string(r.Old)] = string(r.New)
+	}
+	if err := replacementMatches(built.MainPath, want[built.MainPath], replacedBy(built.MainReplace, built.MainReplaceVer)); err != nil {
+		return err
+	}
+	for _, bp := range built.Plugins {
+		if err := replacementMatches(bp.Package, want[bp.Package], replacedBy(bp.Replace, bp.ReplaceVersion)); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// replacementMatches compares the replacement asked for (as passed to
+// --replace) with the one the output's build info records. A requested
+// version that is not a semantic version (a branch or commit) is resolved
+// by go get, so for those only the path is compared.
+func replacementMatches(pkg, want, got string) error {
+	if want == got {
+		return nil
+	}
+	wantPath, wantVer, _ := strings.Cut(want, "@")
+	gotPath, gotVer, _ := strings.Cut(got, "@")
+	if want != "" && got != "" && wantPath == gotPath && semver.Major(wantVer) < 0 && gotVer != "" {
+		return nil
+	}
+	if want == "" {
+		return fmt.Errorf("%s is replaced by %s in the output, which was not asked for", pkg, got)
+	}
+	if got == "" {
+		return fmt.Errorf("%s is not replaced in the output; --replace %s=%s did not take effect", pkg, pkg, want)
+	}
+	return fmt.Errorf("%s is replaced by %s in the output, wanted %s", pkg, got, want)
 }
 
 // Lockfile records exactly what went into a build, with checksums, so an

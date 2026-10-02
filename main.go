@@ -63,9 +63,13 @@ func main() {
 	case "install":
 		code = runInstall(ctx, os.Args[2:])
 	case "version", "-v", "--version":
-		fmt.Println(versionString())
+		if code = rejectArgs(os.Args[2:]); code == exitOK {
+			fmt.Println(versionString())
+		}
 	case "-h", "--help", "help":
-		fmt.Print(usage)
+		if code = rejectArgs(os.Args[2:]); code == exitOK {
+			fmt.Print(usage)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", os.Args[1], usage)
 		code = exitError
@@ -135,6 +139,17 @@ func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
 		return exitError, false
 	}
 	return exitOK, true
+}
+
+// rejectArgs applies the no-positional-arguments rule to the commands that
+// take no flags at all, so a mistyped command line is reported rather than
+// silently accepted.
+func rejectArgs(args []string) int {
+	if len(args) == 0 {
+		return exitOK
+	}
+	fmt.Fprintf(os.Stderr, "unexpected argument(s): %s\n\n%s", strings.Join(args, " "), usage)
+	return exitError
 }
 
 // multiFlag collects a repeatable string flag.

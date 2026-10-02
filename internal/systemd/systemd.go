@@ -9,10 +9,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+// UnresolvedHome is what WorkingDirectory holds when the unit runs in its
+// user's home directory ("WorkingDirectory=~") and that user could not be
+// looked up. Callers that need the real directory must treat it as unknown.
+const UnresolvedHome = "~"
 
 // Command is one ExecStart= command of a unit.
 type Command struct {
@@ -23,11 +29,12 @@ type Command struct {
 // Unit is a systemd service that runs the binary of interest.
 type Unit struct {
 	Name             string    `json:"name"`
-	ExecStart        string    `json:"exec_start"`         // every ExecStart= line, newline-joined
-	Commands         []Command `json:"commands,omitempty"` // every ExecStart= command, in order
-	Args             []string  `json:"args,omitempty"`     // argv of the command that runs the binary of interest (the first, until matched)
-	WorkingDirectory string    `json:"working_directory,omitempty"`
-	ExecSearchPath   []string  `json:"exec_search_path,omitempty"` // ExecSearchPath=, the directories a bare executable name is looked up in
+	ExecStart        string    `json:"exec_start"`                  // every ExecStart= line, newline-joined
+	Commands         []Command `json:"commands,omitempty"`          // every ExecStart= command, in order
+	Args             []string  `json:"args,omitempty"`              // argv of the command that runs the binary of interest (the first, until matched)
+	WorkingDirectory string    `json:"working_directory,omitempty"` // resolved by UnitsUsing: "/" when unset, the user's home for "~"
+	User             string    `json:"user,omitempty"`              // User=, as given (name or numeric ID)
+	ExecSearchPath   []string  `json:"exec_search_path,omitempty"`  // ExecSearchPath=, the directories a bare executable name is looked up in
 	MainPID          int       `json:"main_pid,omitempty"`
 	ActiveState      string    `json:"active_state"`
 	SubState         string    `json:"sub_state"`
@@ -64,7 +71,7 @@ func (u Unit) ConfigArgs() (config, adapter string, envfiles []string) {
 	return config, adapter, envfiles
 }
 
-const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p ExecSearchPath -p MainPID"
+const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p User -p ExecSearchPath -p MainPID"
 
 // defaultSearchPathCompat is systemd's compiled-in executable search path
 // on a split-/usr system (DEFAULT_PATH_COMPAT in src/basic/path-util.h);
@@ -130,9 +137,51 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 				break
 			}
 		}
+		resolveWorkingDirectory(&u, homeOf)
 		units = append(units, u)
 	}
 	return units, nil
+}
+
+// resolveWorkingDirectory turns systemd's rendering of WorkingDirectory
+// into the directory the service actually starts in, the way
+// apply_working_directory in src/core/exec-invoke.c does: unset means "/"
+// (empty_to_root), and "~" means the home of the unit's user, root when
+// User= is not set. A "~" whose user cannot be looked up stays as
+// UnresolvedHome rather than becoming some other directory.
+func resolveWorkingDirectory(u *Unit, homeOf func(user string) (string, error)) {
+	switch u.WorkingDirectory {
+	case "":
+		u.WorkingDirectory = "/"
+	case UnresolvedHome:
+		if home, err := homeOf(u.User); err == nil && home != "" {
+			u.WorkingDirectory = home
+		}
+	}
+}
+
+// homeOf looks up a user's home directory by name or numeric ID; an empty
+// name is root, which is what a unit without User= runs as.
+func homeOf(name string) (string, error) {
+	var (
+		acct *user.User
+		err  error
+	)
+	switch {
+	case name == "":
+		acct, err = user.LookupId("0")
+	case strings.Trim(name, "0123456789") == "":
+		acct, err = user.LookupId(name)
+	default:
+		acct, err = user.Lookup(name)
+	}
+	if err != nil {
+		return "", err
+	}
+	if acct.HomeDir == "" {
+		return "", fmt.Errorf("user %s has no home directory", name)
+	}
+	return acct.HomeDir, nil
 }
 
 // searchPathFor returns the directories a unit's bare executable name is
@@ -335,12 +384,11 @@ func parseShow(out string) []Unit {
 				// systemd prefixes "!" when WorkingDirectory=-/path asked
 				// it to ignore a missing directory, and prints "~" for the
 				// unit user's home (property_get_working_directory in
-				// src/core/dbus-execute.c). "~" cannot be resolved here
-				// without knowing that user, so it is left unknown.
-				v = strings.TrimPrefix(v, "!")
-				if v != "~" {
-					u.WorkingDirectory = v
-				}
+				// src/core/dbus-execute.c). The "~" is kept here and
+				// resolved by resolveWorkingDirectory once User is known.
+				u.WorkingDirectory = strings.TrimPrefix(v, "!")
+			case "User":
+				u.User = v
 			case "ExecSearchPath":
 				// Rendered space-separated; UnitsUsing re-reads it over
 				// D-Bus for a matched unit, where a directory with a space

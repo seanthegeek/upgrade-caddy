@@ -8,7 +8,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/seanthegeek/upgrade-caddy/internal/caddybin"
 	"github.com/seanthegeek/upgrade-caddy/internal/goproxy"
+	"github.com/seanthegeek/upgrade-caddy/internal/pkgmgr"
 )
 
 func TestShort(t *testing.T) {
@@ -115,6 +117,21 @@ func TestResolveStatus(t *testing.T) {
 	resolveStatus(ctx, p, &s)
 	if s.NewerInMajor || !s.Outdated || s.MajorAvailable == nil || s.MajorAvailable.Behind != 1 {
 		t.Errorf("newer major: %+v", s)
+	}
+}
+
+func TestOwnershipWarnings(t *testing.T) {
+	if w := ownershipWarnings(&caddybin.Info{}); len(w) != 0 {
+		t.Errorf("no owner, ownership known: no warning, got %v", w)
+	}
+	owned := &caddybin.Info{Owner: &pkgmgr.Owner{Manager: "dpkg", Package: "caddy"}}
+	if w := ownershipWarnings(owned); len(w) != 1 || !strings.Contains(w[0], `dpkg package "caddy"`) {
+		t.Errorf("owned: %v", w)
+	}
+	// Not knowing is its own state, distinct from "not owned".
+	unknown := &caddybin.Info{OwnerUnknown: "dpkg-query: database locked"}
+	if w := ownershipWarnings(unknown); len(w) != 1 || !strings.Contains(w[0], "could not determine") || !strings.Contains(w[0], "database locked") {
+		t.Errorf("unknown ownership must be reported with its reason: %v", w)
 	}
 }
 

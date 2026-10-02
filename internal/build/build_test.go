@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/caddyserver/xcaddy"
 	"github.com/seanthegeek/upgrade-caddy/internal/caddybin"
 	"github.com/seanthegeek/upgrade-caddy/internal/goproxy"
 )
@@ -285,6 +286,63 @@ func TestResolveReplacements(t *testing.T) {
 	}
 	if _, err := resolve(t, installed(), Options{Replace: []string{"garbage"}}); err == nil {
 		t.Error("malformed --replace should fail")
+	}
+	// Caddy itself replaced in the installed binary must be covered too,
+	// or a rebuild would quietly go back to upstream Caddy.
+	forked := installed()
+	forked.MainPath, forked.MainReplace = caddybin.CaddyModulePath, "/srv/caddy-fork"
+	_, err = resolve(t, forked, Options{})
+	if err == nil || !strings.Contains(err.Error(), "Caddy itself replaced") || !strings.Contains(err.Error(), "--replace "+caddybin.CaddyModulePath+"=") {
+		t.Errorf("an installed Caddy replacement must be covered, got %v", err)
+	}
+	p, err = resolve(t, forked, Options{Replace: []string{caddybin.CaddyModulePath + "=/srv/caddy-fork"}})
+	if err != nil || len(p.Replacements) != 1 {
+		t.Errorf("covered Caddy replacement: %+v %v", p, err)
+	}
+	// --fresh passes no source binary at all (Run hands Resolve nil), so
+	// an installed replacement cannot bind a fresh build.
+	if _, err := resolve(t, nil, Options{Fresh: true}); err != nil {
+		t.Errorf("--fresh ignores the installed binary, replacement included: %v", err)
+	}
+}
+
+func TestVerifyReplacements(t *testing.T) {
+	cf := "github.com/caddy-dns/cloudflare"
+	p := &Plan{CaddyVersion: "v2.11.6", Plugins: []Plugin{{Package: cf, Version: "v0.2.4"}},
+		Replacements: []xcaddy.Replace{xcaddy.NewReplace(cf, "/srv/cloudflare")}}
+	replaced := &caddybin.Info{HasModuleInfo: true, MainPath: caddybin.CaddyModulePath, MainVersion: "v2.11.6",
+		Plugins: []caddybin.Plugin{{Package: cf, Version: "v0.2.4", Replace: "/srv/cloudflare"}}}
+	if err := p.verify(replaced); err != nil {
+		t.Errorf("requested replacement in effect: %v", err)
+	}
+	plain := &caddybin.Info{HasModuleInfo: true, MainPath: caddybin.CaddyModulePath, MainVersion: "v2.11.6",
+		Plugins: []caddybin.Plugin{{Package: cf, Version: "v0.2.4"}}}
+	if err := p.verify(plain); err == nil || !strings.Contains(err.Error(), "did not take effect") {
+		t.Errorf("a requested replacement missing from the output must fail: %v", err)
+	}
+	p.Replacements = nil
+	if err := p.verify(replaced); err == nil || !strings.Contains(err.Error(), "not asked for") {
+		t.Errorf("an unrequested replacement must fail: %v", err)
+	}
+	forkedCaddy := *plain
+	forkedCaddy.MainReplace, forkedCaddy.MainReplaceVer = "github.com/fork/caddy/v2", "v2.11.6-fork"
+	if err := p.verify(&forkedCaddy); err == nil || !strings.Contains(err.Error(), "not asked for") {
+		t.Errorf("an unrequested Caddy replacement must fail: %v", err)
+	}
+	p.Replacements = []xcaddy.Replace{xcaddy.NewReplace(caddybin.CaddyModulePath, "github.com/fork/caddy/v2@v2.11.6-fork")}
+	if err := p.verify(&forkedCaddy); err != nil {
+		t.Errorf("requested Caddy replacement in effect: %v", err)
+	}
+	// A branch name is resolved by go get to a pseudo-version, so only
+	// the path is compared; a different path still fails.
+	p.Replacements = []xcaddy.Replace{xcaddy.NewReplace(caddybin.CaddyModulePath, "github.com/fork/caddy/v2@main")}
+	forkedCaddy.MainReplaceVer = "v2.11.6-0.20260101000000-abcdefabcdef"
+	if err := p.verify(&forkedCaddy); err != nil {
+		t.Errorf("branch replacement should compare the path only: %v", err)
+	}
+	forkedCaddy.MainReplace = "github.com/other/caddy/v2"
+	if err := p.verify(&forkedCaddy); err == nil {
+		t.Error("a replacement by a different module must fail")
 	}
 }
 

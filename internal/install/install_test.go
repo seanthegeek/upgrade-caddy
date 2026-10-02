@@ -190,6 +190,45 @@ func TestIdentifyNoticesReplacement(t *testing.T) {
 		sameUnits([]systemd.Unit{{Name: "a"}}, []systemd.Unit{{Name: "c"}}) {
 		t.Error("sameUnits must compare the unit names in order")
 	}
+	// The same unit with a different config, adapter, envfile or working
+	// directory is a changed unit: validation would otherwise be stale.
+	base := systemd.Unit{Name: "a", WorkingDirectory: "/srv", Args: []string{"caddy", "run", "--config", "/etc/a", "--adapter", "caddyfile", "--envfile", "/e1"}}
+	same := base
+	same.Args = []string{"caddy", "run", "--environ", "--config", "/etc/a", "--adapter", "caddyfile", "--envfile", "/e1"} // an unrelated flag
+	if !sameUnits([]systemd.Unit{base}, []systemd.Unit{same}) {
+		t.Error("a flag that does not affect validation must not count as a change")
+	}
+	for name, args := range map[string][]string{
+		"config":  {"caddy", "run", "--config", "/etc/b"},
+		"adapter": {"caddy", "run", "--config", "/etc/a", "--adapter", "json", "--envfile", "/e1"},
+		"envfile": {"caddy", "run", "--config", "/etc/a", "--adapter", "caddyfile", "--envfile", "/e2"},
+	} {
+		changed := base
+		changed.Args = args
+		if sameUnits([]systemd.Unit{base}, []systemd.Unit{changed}) {
+			t.Errorf("a changed %s must count as a changed unit", name)
+		}
+	}
+	moved := base
+	moved.WorkingDirectory = "/srv2"
+	if sameUnits([]systemd.Unit{base}, []systemd.Unit{moved}) {
+		t.Error("a changed working directory must count as a changed unit")
+	}
+}
+
+func TestCheckWorkDirsRefusesUnresolvedHome(t *testing.T) {
+	units := []systemd.Unit{
+		{Name: "ok.service", Args: []string{"caddy", "run", "--config", "/etc/a"}, WorkingDirectory: "/"},
+		{Name: "home.service", Args: []string{"caddy", "run", "--config", "Caddyfile"}, WorkingDirectory: systemd.UnresolvedHome},
+	}
+	vals := validationsFromUnits(units)
+	err := checkWorkDirs(vals)
+	if err == nil || !strings.Contains(err.Error(), "home.service") || !strings.Contains(err.Error(), "--config") {
+		t.Errorf("an unresolved home directory must refuse validation and name the unit: %v", err)
+	}
+	if err := checkWorkDirs(vals[:1]); err != nil {
+		t.Errorf("a resolved working directory is fine: %v", err)
+	}
 }
 
 func TestLockfileSwapRestoresOnFailedInstall(t *testing.T) {

@@ -89,7 +89,11 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    `install` reproduce the current plugin set at the current versions with a
    newer Caddy. Bumping a plugin only happens through an explicit flag
    (`--upgrade <module>`, `--upgrade-all`, `--with <module@version>`). A
-   silent bump is a supply-chain risk the user has not reviewed.
+   silent bump is a supply-chain risk the user has not reviewed. The same
+   goes for module replacements: one recorded in the installed binary,
+   for a plugin or for Caddy itself, must be covered by `--replace` (or
+   `--fresh`), and `verify` checks the output carries exactly the
+   replacements asked for, no more and no fewer.
 3. **A newer major version always counts as an update, but is never
    crossed automatically.** Caddy has never backported security fixes to a
    previous major, so `check` treats a newer major as "outdated" and exits
@@ -158,8 +162,12 @@ These are implemented in `internal/install`; keep them true.
 
 - `validate` runs with the *new* binary against every distinct live config
   (taken from each unit's `--config`, `--adapter` and `--envfile` flags, in
-  its `WorkingDirectory`) before anything changes. No config known means a
-  warning and no validation, not a failure.
+  its `WorkingDirectory`) before anything changes. The working directory
+  is the one systemd would use: `/` when the unit sets none, the unit
+  user's home for `~` (looked up through `os/user`; when that fails the
+  unit is refused for validation rather than validated in the wrong
+  place). No config known means a warning and no validation, not a
+  failure.
 - The target is resolved through symlinks first and the real file is what
   is replaced; hard-linking and renaming a symlink would leave the referent
   and every service executing it on the old binary. `swap` refuses a
@@ -229,8 +237,9 @@ These are implemented in `internal/install`; keep them true.
   and the swap, because a build can take minutes: the target must resolve
   to the same file (same device, inode, size and modification time), still
   belong to no package, carry the same capabilities, and be run by the
-  same units. Any difference is a refusal that asks for a re-run, never a
-  silent re-plan.
+  same units with the same working directory and config flags (anything
+  that changes what `validate` would check). Any difference is a refusal
+  that asks for a re-run, never a silent re-plan.
 - After a restart, a main process whose `/proc/<pid>/exe` is missing has
   vanished and fails verification; only a permission error falls back to
   the active state.
