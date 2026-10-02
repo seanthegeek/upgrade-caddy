@@ -90,7 +90,9 @@ func LookupAccount(name, group string, extra []string) (*Account, error) {
 // service; the rest of the environment is inherited. A nil account means
 // the current user.
 func (a *Account) Apply(cmd *exec.Cmd) error {
-	if a == nil || (int(a.UID) == os.Geteuid() && int(a.GID) == os.Getegid()) {
+	// Compared as uint32: an ID never exceeds 32 bits, while int is 32 bits
+	// on some targets, so widening the process's IDs is the safe direction.
+	if a == nil || (a.UID == uint32(os.Geteuid()) && a.GID == uint32(os.Getegid())) {
 		return nil
 	}
 	if os.Geteuid() != 0 {
