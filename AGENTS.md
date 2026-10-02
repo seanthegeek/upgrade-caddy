@@ -57,7 +57,11 @@ only state that matters, and the tool is built around that.
   which package owns a file, failing closed when none can say.
 - `internal/systemd` finds service units whose `ExecStart` runs a binary,
   parses their config flags, and drives systemctl through a `Controller`
-  interface so install's restart sequence can be tested with a fake.
+  interface so install's restart sequence can be tested with a fake. A
+  bare executable name in `ExecStart` (`caddy run`, allowed since systemd
+  239) is looked up the way systemd does before running it: in the unit's
+  `ExecSearchPath=` when set, else systemd's compiled-in default path
+  (`systemd-path search-binaries-default`), never the unit's `PATH`.
 - `README.md` user-facing docs.
 - `.github/workflows/ci.yml` runs the hermetic checks on every push to
   main and every pull request, then `ci/integration.sh` on throwaway Ubuntu
@@ -119,7 +123,8 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
 7. **`check` is strictly read-only.** It is the tool used to debug the other
    two commands, so it must never be the thing that changes state. The only
    subprocesses it may run are the Caddy binary itself with `version` and
-   `list-modules`, and read-only package manager and systemctl queries.
+   `list-modules`, and read-only package manager and systemd queries
+   (`systemctl show`, `busctl get-property`, `systemd-path`).
 8. **Build info is read from the file, not from the binary's own report.**
    `debug/buildinfo.ReadFile` is the source of truth for versions and
    checksums; the version `list-modules` prints is kept only when build
@@ -161,7 +166,10 @@ These are implemented in `internal/install`; keep them true.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is
   renamed over the target. There is never an instant without a binary at
-  the path. Owner is applied first (chown clears set-ID bits), then every
+  the path. Only "not there" counts as a first install: any other failure
+  to stat the target, the current lockfile or `.lock.json.previous` stops
+  the install, since going on would replace a file with no rollback copy
+  or delete the live lockfile. Owner is applied first (chown clears set-ID bits), then every
   mode bit `os.Chmod` accepts, so setuid, setgid and sticky survive; owner
   applies only when running as root. Capabilities are read and written as the raw
   `security.capability` extended attribute (Linux only; a no-op elsewhere):
@@ -201,9 +209,13 @@ These are implemented in `internal/install`; keep them true.
   named by position only (url.Parse's error echoes its input), and
   net/http redacts its own.
 - `--from` accepts only a binary whose lockfile describes it
-  (`Lockfile.Describes`: Caddy path, version and checksum, and the exact
-  plugin set with versions and checksums), since the lockfile is installed
-  beside the target as its attestation.
+  (`Lockfile.Describes`: Caddy path, version and checksum, exactly equal
+  and empty included, and the exact plugin set with versions and
+  checksums), since the lockfile is installed beside the target as its
+  attestation. `Resolve` checks the source pair, and `Run` checks the
+  staged copies again before validating, because the source directory is
+  typically writable by a less privileged user and either file could have
+  been replaced between the two.
 - After a restart, a main process whose `/proc/<pid>/exe` is missing has
   vanished and fails verification; only a permission error falls back to
   the active state.
@@ -214,8 +226,10 @@ These are implemented in `internal/install`; keep them true.
   context is often already cancelled. Error messages say "rolled back" only
   when the restore succeeded, and add "did not come back up" when the
   verified restart on the restored binary failed. On a first install the
-  state to restore is "nothing there": a failed restart removes the new
-  binary and lockfile again. A `MainPID` query failure fails verification;
+  state to restore is "nothing there": a failed restart stops every unit
+  that was restarted, the one that failed verification included (it was
+  restarted too and may still be active), then removes the new binary and
+  lockfile again. A `MainPID` query failure fails verification;
   only a PID of 0 falls back to the active state.
 - `main` cancels the context on SIGINT and SIGTERM, so a service manager,
   CI cancellation or `timeout(1)` lets install roll back instead of dying
@@ -236,7 +250,9 @@ done; each item names where the pattern bit before.
   `/proc/<pid>/exe` lookups (error read as "verified"), modules without
   package metadata (silently dropped), `systemctl show` failing (read as
   "no unit runs this binary"), a response body that failed to read (bytes
-  that arrived parsed anyway). Write the error path first.
+  that arrived parsed anyway), a stat failure on the target before the
+  swap (read as "first install", so no `.previous`). Write the error
+  path first.
 - **Every state change has a verified inverse, and the first install is
   its own case.** Define the pre-change state explicitly (for a first
   install it is "nothing there, units stopped"), restore it on any failure,

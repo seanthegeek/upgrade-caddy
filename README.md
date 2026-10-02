@@ -127,7 +127,9 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
 
 1. Resolves the target (the first `caddy` on `PATH` by default; a symlink
    is followed and the file it points to is what gets replaced), the systemd units
-   whose `ExecStart` runs it, and the configs to validate against (every
+   whose `ExecStart` runs it (a bare executable name there is looked up
+   the way systemd does, in the unit's `ExecSearchPath=` or systemd's
+   default search path), and the configs to validate against (every
    distinct set of `--config`, `--adapter` and `--envfile` flags across
    those units, read from the command that runs the target via D-Bus so an
    argument containing a space survives, or the `--config` flag).
@@ -142,7 +144,8 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    and flags as `build`, or stages one from `--from PATH` (a binary that
    `build` produced, with its lockfile beside it; the lockfile must
    describe that exact binary, versions and checksums included, or it is
-   refused). This lets the build run
+   refused, and the check is repeated on the staged copies so the pair
+   that gets installed is the pair that was checked). This lets the build run
    as your own user and only the swap run as root:
 
    ```bash
@@ -170,8 +173,9 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    the restored binary, the failed binary is kept as `<target>.failed`, and
    `install` exits 1 with a message that says whether the rollback itself
    succeeded and whether the service came back up on it. On a first
-   install the pre-install state is restored instead: units already
-   restarted are stopped and the new binary and lockfile removed. SIGTERM,
+   install the pre-install state is restored instead: every unit that was
+   restarted, the failing one included, is stopped and the new binary and
+   lockfile removed. SIGTERM,
    like Ctrl-C, cancels the run and lets this rollback happen.
 
 `--no-restart` stops after step 5. `--dry-run` prints the plan after step 2.

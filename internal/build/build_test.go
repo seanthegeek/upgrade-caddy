@@ -453,6 +453,19 @@ func TestLockfileDescribes(t *testing.T) {
 	if err := wrongSum.Describes(built); err == nil {
 		t.Error("plugin checksum mismatch must be rejected")
 	}
+	// The Caddy checksum must match exactly: a lockfile with the checksum
+	// deleted, or one that carries a checksum the binary does not, was not
+	// written for this binary.
+	noSum := *good
+	noSum.Caddy.Sum = ""
+	if err := noSum.Describes(built); err == nil {
+		t.Error("a deleted Caddy checksum must be rejected")
+	}
+	unsummed := *built
+	unsummed.MainSum = ""
+	if err := good.Describes(&unsummed); err == nil {
+		t.Error("a checksum the binary does not carry must be rejected")
+	}
 	missing := *good
 	missing.Plugins = nil
 	if err := missing.Describes(built); err == nil {

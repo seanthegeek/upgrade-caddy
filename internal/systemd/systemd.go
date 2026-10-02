@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -26,6 +27,7 @@ type Unit struct {
 	Commands         []Command `json:"commands,omitempty"` // every ExecStart= command, in order
 	Args             []string  `json:"args,omitempty"`     // argv of the command that runs the binary of interest (the first, until matched)
 	WorkingDirectory string    `json:"working_directory,omitempty"`
+	ExecSearchPath   []string  `json:"exec_search_path,omitempty"` // ExecSearchPath=, the directories a bare executable name is looked up in
 	MainPID          int       `json:"main_pid,omitempty"`
 	ActiveState      string    `json:"active_state"`
 	SubState         string    `json:"sub_state"`
@@ -62,7 +64,15 @@ func (u Unit) ConfigArgs() (config, adapter string, envfiles []string) {
 	return config, adapter, envfiles
 }
 
-const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p MainPID"
+const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p ExecSearchPath -p MainPID"
+
+// defaultSearchPathCompat is systemd's compiled-in executable search path
+// on a split-/usr system (DEFAULT_PATH_COMPAT in src/basic/path-util.h);
+// the merged-/usr one is its first four entries. It is the fallback when
+// `systemd-path search-binaries-default` cannot report the real value;
+// the extra entries are harmless on merged /usr, where they are symlinks
+// to the first four and come after them.
+const defaultSearchPathCompat = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 // Available reports whether systemctl is on PATH.
 func Available() bool {
@@ -86,10 +96,18 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		return nil, err
 	}
 	var units []Unit
+	var defaultPath []string // systemd's own search path, asked for only when a bare name needs it
 	for _, u := range parseShow(string(out)) {
+		search := u.ExecSearchPath
+		if len(search) == 0 && hasBareName(u.Commands) {
+			if defaultPath == nil {
+				defaultPath = defaultSearchPath(ctx)
+			}
+			search = defaultPath
+		}
 		matched := false
 		for _, c := range u.Commands {
-			if resolves(c.Path, want) {
+			if resolves(c.Path, want, search) {
 				matched = true
 				break
 			}
@@ -99,12 +117,19 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		}
 		// systemctl show flattens argv with spaces, so an argument that
 		// contains one cannot be recovered from it. The D-Bus property keeps
-		// the array; take the commands from there when it can be read.
+		// the array; take the commands from there when it can be read. The
+		// search path is rendered the same way, so for a unit that sets one
+		// it is re-read over D-Bus too.
 		if cmds, err := execStartFromBus(ctx, u.Name); err == nil && len(cmds) > 0 {
 			u.Commands = cmds
 		}
+		if len(u.ExecSearchPath) > 0 {
+			if dirs, err := execSearchPathFromBus(ctx, u.Name); err == nil && len(dirs) > 0 {
+				u.ExecSearchPath, search = dirs, dirs
+			}
+		}
 		for _, c := range u.Commands {
-			if resolves(c.Path, want) {
+			if resolves(c.Path, want, search) {
 				u.Args = c.Args // the command that runs this binary, not necessarily the first
 				break
 			}
@@ -114,11 +139,95 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 	return units, nil
 }
 
-func resolves(path, want string) bool {
+// hasBareName reports whether any command names its executable without a
+// slash, leaving systemd to find it on a search path.
+func hasBareName(cmds []Command) bool {
+	for _, c := range cmds {
+		if !strings.Contains(c.Path, "/") {
+			return true
+		}
+	}
+	return false
+}
+
+// resolves reports whether a unit's ExecStart executable is the wanted
+// file. A bare name (no slash) is looked up the way systemd does before it
+// runs the command (find_executable_full in src/basic/path-util.c): the
+// first directory in search holding a regular file of that name with an
+// execute bit, with non-absolute entries skipped. Note systemd searches
+// the unit's ExecSearchPath= or its own compiled-in default, never the
+// unit's PATH environment. The result is then followed through symlinks
+// and compared.
+func resolves(path, want string, search []string) bool {
+	if !strings.Contains(path, "/") {
+		found := ""
+		for _, dir := range search {
+			if !filepath.IsAbs(dir) {
+				continue
+			}
+			candidate := filepath.Join(dir, path)
+			// systemd moves on past an entry it cannot look at, so a
+			// stat error here means "not this directory", not "no unit".
+			if fi, err := os.Stat(candidate); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+				found = candidate
+				break
+			}
+		}
+		if found == "" {
+			return false
+		}
+		path = found
+	}
 	if r, err := filepath.EvalSymlinks(path); err == nil {
 		path = r
 	}
 	return path == want
+}
+
+// defaultSearchPath asks systemd for its compiled-in executable search path,
+// which is what a bare ExecStart= name is looked up in when the unit sets
+// no ExecSearchPath=. Older systemd without that query, or no systemd-path
+// at all, falls back to the compiled-in default of a split-/usr build.
+func defaultSearchPath(ctx context.Context) []string {
+	out, err := exec.CommandContext(ctx, "systemd-path", "search-binaries-default").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return parseSearchPath(defaultSearchPathCompat)
+	}
+	return parseSearchPath(strings.TrimSpace(string(out)))
+}
+
+// parseSearchPath splits a colon-separated search path, dropping empty and
+// non-absolute entries as systemd does.
+func parseSearchPath(s string) []string {
+	var dirs []string
+	for _, d := range strings.Split(s, ":") {
+		if filepath.IsAbs(d) {
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
+}
+
+// execSearchPathFromBus reads the unit's ExecSearchPath property over D-Bus,
+// a string array that keeps a directory name containing a space intact.
+func execSearchPathFromBus(ctx context.Context, unit string) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "busctl", "--json=short", "get-property",
+		"org.freedesktop.systemd1", unitObjectPath(unit), "org.freedesktop.systemd1.Service", "ExecSearchPath").Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseBusStrings(out)
+}
+
+// parseBusStrings decodes busctl's JSON for a string-array ("as") property.
+func parseBusStrings(data []byte) ([]string, error) {
+	var prop struct {
+		Data []string `json:"data"`
+	}
+	if err := json.Unmarshal(data, &prop); err != nil {
+		return nil, fmt.Errorf("busctl string array: %w", err)
+	}
+	return prop.Data, nil
 }
 
 // execStartFromBus reads the unit's ExecStart property over D-Bus as JSON,
@@ -209,7 +318,20 @@ func parseShow(out string) []Unit {
 			case "SubState":
 				u.SubState = v
 			case "WorkingDirectory":
-				u.WorkingDirectory = v
+				// systemd prefixes "!" when WorkingDirectory=-/path asked
+				// it to ignore a missing directory, and prints "~" for the
+				// unit user's home (property_get_working_directory in
+				// src/core/dbus-execute.c). "~" cannot be resolved here
+				// without knowing that user, so it is left unknown.
+				v = strings.TrimPrefix(v, "!")
+				if v != "~" {
+					u.WorkingDirectory = v
+				}
+			case "ExecSearchPath":
+				// Rendered space-separated; UnitsUsing re-reads it over
+				// D-Bus for a matched unit, where a directory with a space
+				// survives.
+				u.ExecSearchPath = strings.Fields(v)
 			case "MainPID":
 				u.MainPID, _ = strconv.Atoi(v)
 			}

@@ -572,14 +572,18 @@ func ReadLockfile(path string) (*Lockfile, error) {
 
 // Describes reports whether the lockfile matches the inspected binary:
 // same Caddy path, version and checksum, and the same set of plugin
-// modules at the same versions and checksums. A lockfile that does not
-// describe the binary beside it is treated as absent by install.
+// modules at the same versions and checksums. The checksums must be
+// exactly equal, empty included: a lockfile is written from the same
+// build info Inspect reads, so a genuine one never differs from its
+// binary, and a missing or surplus checksum means the file was edited or
+// belongs to another binary. A lockfile that does not describe the binary
+// beside it is refused by install.
 func (lf *Lockfile) Describes(built *caddybin.Info) error {
 	if lf.Caddy.Package != built.MainPath || lf.Caddy.Version != built.MainVersion {
 		return fmt.Errorf("lockfile says Caddy %s %s, binary is %s %s", lf.Caddy.Package, lf.Caddy.Version, built.MainPath, built.MainVersion)
 	}
-	if lf.Caddy.Sum != "" && built.MainSum != "" && lf.Caddy.Sum != built.MainSum {
-		return fmt.Errorf("lockfile Caddy checksum %s does not match the binary's %s", lf.Caddy.Sum, built.MainSum)
+	if lf.Caddy.Sum != built.MainSum {
+		return fmt.Errorf("lockfile Caddy checksum %q does not match the binary's %q", lf.Caddy.Sum, built.MainSum)
 	}
 	key := func(pkg, ver, sum string) string { return pkg + "@" + ver + " " + sum }
 	want := map[string]bool{}

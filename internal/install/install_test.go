@@ -3,15 +3,17 @@ package install
 import (
 	"context"
 	"errors"
-
-	"github.com/seanthegeek/upgrade-caddy/internal/build"
-	"github.com/seanthegeek/upgrade-caddy/internal/systemd"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/seanthegeek/upgrade-caddy/internal/build"
+	"github.com/seanthegeek/upgrade-caddy/internal/caddybin"
+	"github.com/seanthegeek/upgrade-caddy/internal/systemd"
 )
 
 func TestNeedsRoot(t *testing.T) {
@@ -89,7 +91,8 @@ func TestRestartUnitsFirstInstallCleansUp(t *testing.T) {
 	os.WriteFile(target, []byte("new"), 0o755)
 	os.WriteFile(target+".lock.json", []byte("newlock"), 0o644)
 	var log strings.Builder
-	_, err := restartUnits(context.Background(), &fakeCtl{}, []string{"a.service"}, target, "", 50*time.Millisecond, &log)
+	ctl := &fakeCtl{}
+	_, err := restartUnits(context.Background(), ctl, []string{"a.service"}, target, "", 50*time.Millisecond, &log)
 	if err == nil || !strings.Contains(err.Error(), "removed from") {
 		t.Errorf("first install restart failure: %v", err)
 	}
@@ -97,6 +100,12 @@ func TestRestartUnitsFirstInstallCleansUp(t *testing.T) {
 		if _, statErr := os.Stat(f); !errors.Is(statErr, os.ErrNotExist) {
 			t.Errorf("%s must be removed again after a failed first-install restart", f)
 		}
+	}
+	// The unit that failed verification was restarted too and may still
+	// be running (a wrong main process, say), so it is stopped as well
+	// before the binary is removed from under it.
+	if len(ctl.stops) != 1 || ctl.stops[0] != "a.service" {
+		t.Errorf("the failing unit must be stopped before the binary is removed: %v", ctl.stops)
 	}
 }
 
@@ -115,10 +124,10 @@ func TestRestartUnitsFirstInstallStopsAlreadyRestartedUnits(t *testing.T) {
 	if err == nil || len(restarted) != 1 || restarted[0] != "a.service" {
 		t.Fatalf("expected a.service restarted then failure on b.service: restarted=%v err=%v", restarted, err)
 	}
-	if len(ctl.stops) != 1 || ctl.stops[0] != "a.service" {
-		t.Errorf("the already-restarted unit must be stopped again: %v", ctl.stops)
+	if want := []string{"a.service", "b.service"}; !reflect.DeepEqual(ctl.stops, want) {
+		t.Errorf("the already-restarted unit and the failing one must both be stopped again: %v", ctl.stops)
 	}
-	if !strings.Contains(err.Error(), "1 already-restarted unit(s) stopped") {
+	if !strings.Contains(err.Error(), "the 2 restarted unit(s) stopped") {
 		t.Errorf("the error should say what was undone: %v", err)
 	}
 	if _, statErr := os.Stat(target); !errors.Is(statErr, os.ErrNotExist) {
@@ -348,6 +357,71 @@ func TestSwapPreservesSetIDAndStickyBits(t *testing.T) {
 	fi, _ := os.Stat(target)
 	if got := fi.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky); got != want {
 		t.Errorf("mode after swap %v, want %v", got, want)
+	}
+}
+
+func TestSwapFailsClosedOnStatError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can stat anything; no way to make the check fail")
+	}
+	dir := t.TempDir()
+	locked := filepath.Join(dir, "locked")
+	os.Mkdir(locked, 0o755)
+	target := filepath.Join(locked, "caddy")
+	os.WriteFile(target, []byte("old"), 0o755)
+	os.WriteFile(target+".lock.json", []byte("oldlock"), 0o644)
+	staged := filepath.Join(dir, "staged")
+	os.WriteFile(staged, []byte("new"), 0o755)
+	stagedLock := filepath.Join(dir, "staged.lock.json")
+	os.WriteFile(stagedLock, []byte("newlock"), 0o644)
+	// A directory that cannot be searched makes every stat inside it fail
+	// with "permission denied", which is not "does not exist".
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Skip(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	if _, err := swap(target, staged, nil); err == nil || !strings.Contains(err.Error(), "checking") {
+		t.Errorf("a stat failure must stop the swap, not be read as a first install: %v", err)
+	}
+	if _, err := os.Stat(staged); err != nil {
+		t.Error("the staged binary must be left where it was")
+	}
+	if err := swapLockfile(target, stagedLock); err == nil || !strings.Contains(err.Error(), "checking") {
+		t.Errorf("a stat failure must stop the lockfile swap: %v", err)
+	}
+	if _, err := os.Stat(stagedLock); err != nil {
+		t.Error("the staged lockfile must be left where it was")
+	}
+	if err := rollbackLockfile(target); err == nil || !strings.Contains(err.Error(), "checking") {
+		t.Errorf("not knowing whether a previous lockfile exists must not remove the live one: %v", err)
+	}
+	os.Chmod(locked, 0o755)
+	if got, _ := os.ReadFile(target); string(got) != "old" {
+		t.Errorf("target must be untouched, got %q", got)
+	}
+	if got, _ := os.ReadFile(target + ".lock.json"); string(got) != "oldlock" {
+		t.Errorf("lockfile must be untouched, got %q", got)
+	}
+}
+
+func TestAttestStagedPair(t *testing.T) {
+	dir := t.TempDir()
+	info := &caddybin.Info{HasModuleInfo: true, MainPath: caddybin.CaddyModulePath, MainVersion: "v2.11.6", MainSum: "h1:caddy",
+		Plugins: []caddybin.Plugin{{Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"}}}
+	good := filepath.Join(dir, "good.lock.json")
+	os.WriteFile(good, []byte(`{"schema":1,"caddy":{"package":"`+caddybin.CaddyModulePath+`","version":"v2.11.6","sum":"h1:caddy"},"plugins":[{"package":"github.com/example/plugin","version":"v1.3.0","sum":"h1:p"}]}`), 0o644)
+	if err := attest(good, info); err != nil {
+		t.Errorf("a lockfile that describes the binary: %v", err)
+	}
+	// The same lockfile for a different binary (a plugin swapped out)
+	// is refused, and so is a lockfile that cannot be read at all.
+	other := *info
+	other.Plugins = []caddybin.Plugin{{Package: "github.com/example/evil", Version: "v1.0.0", Sum: "h1:e"}}
+	if err := attest(good, &other); err == nil {
+		t.Error("a lockfile for another plugin set must be refused")
+	}
+	if err := attest(filepath.Join(dir, "missing.lock.json"), info); err == nil {
+		t.Error("a missing staged lockfile must be refused")
 	}
 }
 

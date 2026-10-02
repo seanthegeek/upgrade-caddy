@@ -1,6 +1,8 @@
 package systemd
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -154,6 +156,102 @@ func TestParseBusExecStart(t *testing.T) {
 	}
 	if _, err := parseBusExecStart([]byte(`junk`)); err == nil {
 		t.Error("junk must be an error")
+	}
+}
+
+// Captured from `systemctl show -p Id -p ExecStart -p ActiveState -p SubState
+// -p WorkingDirectory -p ExecSearchPath -p MainPID` on Ubuntu 24.04 (systemd
+// 255) for a throwaway user-scope unit with `ExecStart=true run --config
+// /etc/caddy/Caddyfile` and two ExecSearchPath= lines: a bare executable
+// name is rendered as-is, the search path space-separated, and the user
+// manager's default working directory as "!" (missing-ok) plus the home.
+const bareSample = `MainPID=0
+ExecStart={ path=true ; argv[]=true run --config /etc/caddy/Caddyfile ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+WorkingDirectory=!/home/sean
+ExecSearchPath=/opt/probe /usr/bin
+Id=uc-bare-probe.service
+ActiveState=inactive
+SubState=dead
+`
+
+// Captured with `busctl --user --json=short get-property
+// org.freedesktop.systemd1 <unit> org.freedesktop.systemd1.Service
+// ExecSearchPath` for the same unit.
+const busSearchPath = `{"type":"as","data":["/opt/probe","/usr/bin"]}`
+
+func TestParseShowBareNameAndSearchPath(t *testing.T) {
+	units := parseShow(bareSample)
+	if len(units) != 1 {
+		t.Fatalf("got %d units: %+v", len(units), units)
+	}
+	u := units[0]
+	if len(u.Commands) != 1 || u.Commands[0].Path != "true" {
+		t.Errorf("a bare executable name must be kept as given: %+v", u.Commands)
+	}
+	if want := []string{"/opt/probe", "/usr/bin"}; !reflect.DeepEqual(u.ExecSearchPath, want) {
+		t.Errorf("ExecSearchPath: %v", u.ExecSearchPath)
+	}
+	if u.WorkingDirectory != "/home/sean" {
+		t.Errorf("the missing-ok marker must be stripped from WorkingDirectory: %q", u.WorkingDirectory)
+	}
+	if got := parseShow("Id=x.service\nExecStart={ path=/x ; argv[]=/x }\nWorkingDirectory=~\n")[0].WorkingDirectory; got != "" {
+		t.Errorf("the home marker cannot be resolved and must be left unknown: %q", got)
+	}
+	dirs, err := parseBusStrings([]byte(busSearchPath))
+	if err != nil || !reflect.DeepEqual(dirs, []string{"/opt/probe", "/usr/bin"}) {
+		t.Errorf("bus search path: %v %v", dirs, err)
+	}
+	if _, err := parseBusStrings([]byte("junk")); err == nil {
+		t.Error("junk must be an error")
+	}
+}
+
+func TestResolvesBareName(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	sbin := filepath.Join(dir, "sbin")
+	os.Mkdir(bin, 0o755)
+	os.Mkdir(sbin, 0o755)
+	caddy := filepath.Join(bin, "caddy")
+	os.WriteFile(caddy, []byte("x"), 0o755)
+	want, _ := filepath.EvalSymlinks(caddy)
+	// A non-executable file earlier in the path is skipped, as systemd
+	// skips it; a relative entry is ignored; an absent name never matches.
+	os.WriteFile(filepath.Join(sbin, "caddy"), []byte("x"), 0o644)
+	search := []string{"relative/dir", filepath.Join(dir, "missing"), sbin, bin}
+	cases := []struct {
+		name   string
+		path   string
+		search []string
+		want   bool
+	}{
+		{"bare name found", "caddy", search, true},
+		{"bare name absent", "nope", search, false},
+		{"bare name, no search path", "caddy", nil, false},
+		{"bare name, only the non-executable copy", "caddy", []string{sbin}, false},
+		{"absolute path ignores the search path", caddy, nil, true},
+		{"relative path with a slash is not searched", "bin/caddy", search, false},
+	}
+	for _, c := range cases {
+		if got := resolves(c.path, want, c.search); got != c.want {
+			t.Errorf("%s: resolves(%q)=%v want %v", c.name, c.path, got, c.want)
+		}
+	}
+	// A symlinked search directory still resolves to the real file.
+	link := filepath.Join(dir, "linkbin")
+	os.Symlink(bin, link)
+	if !resolves("caddy", want, []string{link}) {
+		t.Error("a symlinked search directory must resolve to the real file")
+	}
+}
+
+func TestParseSearchPath(t *testing.T) {
+	got := parseSearchPath("/usr/local/sbin:/usr/local/bin::relative:/usr/bin")
+	if want := []string{"/usr/local/sbin", "/usr/local/bin", "/usr/bin"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("parseSearchPath: %v", got)
+	}
+	if got := parseSearchPath(defaultSearchPathCompat); len(got) != 6 || got[0] != "/usr/local/sbin" || got[5] != "/bin" {
+		t.Errorf("compiled-in fallback: %v", got)
 	}
 }
 

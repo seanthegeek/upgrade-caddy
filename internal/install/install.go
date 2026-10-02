@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -139,6 +140,14 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		cleanup()
 		return plan, nil, fmt.Errorf("inspecting the new binary: %w", err)
 	}
+	// The lockfile installed beside the target is its attestation, so the
+	// pair checked is the pair that gets installed: the staged copies,
+	// not the --from files Resolve looked at, which anyone able to write
+	// the source directory could have replaced since.
+	if err := attest(newLock, newInfo); err != nil {
+		cleanup()
+		return plan, nil, fmt.Errorf("the staged lockfile does not describe the staged binary: %w", err)
+	}
 	result := &Result{Target: plan.Target, Built: newInfo}
 
 	// 2. Validate with the new binary against every config in use.
@@ -206,12 +215,16 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 		fmt.Fprintf(logw, "    %v\n", rerr)
 		if previous == "" {
 			// First install: the state to restore is "nothing there", which
-			// for units already restarted on the new binary means stopped;
+			// for every unit restarted on the new binary means stopped;
 			// left running they would hold an unlinked executable and could
-			// never restart from the removed path.
+			// never restart from the removed path. That includes the unit
+			// that just failed verification: Restart was issued to it too,
+			// and a wrong main process or a failed settle check leaves it
+			// active.
 			rbCtx, cancel := context.WithTimeout(context.Background(), wait+15*time.Second)
 			var stopErrs []error
-			for _, started := range restarted {
+			toStop := append(slices.Clone(restarted), u)
+			for _, started := range toStop {
 				fmt.Fprintf(logw, "==> stopping %s again\n", started)
 				if e := ctl.Stop(rbCtx, started); e != nil {
 					stopErrs = append(stopErrs, e)
@@ -223,7 +236,7 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 			if rbErr != nil {
 				return restarted, errors.Join(fmt.Errorf("%s did not come up with the new binary: %w; and restoring the pre-install state of %s was incomplete", u, rerr, target), rbErr)
 			}
-			return restarted, fmt.Errorf("%s did not come up with the new binary: %w; the new binary and lockfile were removed from %s again and %d already-restarted unit(s) stopped (there was nothing installed before)", u, rerr, target, len(restarted))
+			return restarted, fmt.Errorf("%s did not come up with the new binary: %w; the new binary and lockfile were removed from %s again and the %d restarted unit(s) stopped (there was nothing installed before)", u, rerr, target, len(toStop))
 		}
 		fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
 		restoreErr, keepErr := rollback(target, previous)
@@ -616,6 +629,17 @@ func unitNames(units []systemd.Unit) string {
 	return strings.Join(names, ", ")
 }
 
+// attest checks that the lockfile at lockPath describes the inspected
+// binary, so the attestation installed beside the target is for the file
+// actually installed.
+func attest(lockPath string, info *caddybin.Info) error {
+	lf, err := build.ReadLockfile(lockPath)
+	if err != nil {
+		return err
+	}
+	return lf.Describes(info)
+}
+
 // stage copies a --from binary and its lockfile into the target's
 // directory so the final rename cannot cross filesystems. Both files are
 // created with unpredictable names and O_EXCL and written through the open
@@ -688,10 +712,17 @@ func swapLockfile(target, newLock string) error {
 	lock := target + ".lock.json"
 	prev := lock + ".previous"
 	os.Remove(prev)
-	if _, err := os.Stat(lock); err == nil {
+	// Only "not there" means there is nothing to keep; any other failure
+	// to look would let the rename below overwrite a lockfile with no
+	// previous copy, so it stops the install instead.
+	switch _, err := os.Stat(lock); {
+	case err == nil:
 		if err := os.Rename(lock, prev); err != nil {
 			return fmt.Errorf("keeping previous lockfile: %w", err)
 		}
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return fmt.Errorf("checking %s before replacing it: %w", lock, err)
 	}
 	if err := os.Rename(newLock, lock); err != nil {
 		os.Rename(prev, lock) // best effort: put the old one back
@@ -705,8 +736,16 @@ func swapLockfile(target, newLock string) error {
 func rollbackLockfile(target string) error {
 	lock := target + ".lock.json"
 	prev := lock + ".previous"
-	if _, err := os.Stat(prev); err == nil {
+	switch _, err := os.Stat(prev); {
+	case err == nil:
 		return os.Rename(prev, lock)
+	case errors.Is(err, os.ErrNotExist):
+		// No previous lockfile: this was a first install, so the new one
+		// is removed again.
+	default:
+		// Not knowing whether a previous lockfile exists must not turn
+		// into deleting the one in place.
+		return fmt.Errorf("checking for %s: %w", prev, err)
 	}
 	if err := os.Remove(lock); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -724,7 +763,14 @@ func swap(target, newPath string, caps []byte) (previous string, err error) {
 	if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("%s is a symlink; install replaces the file it points to, so the target must be resolved first", target)
 	}
-	if old, err := os.Stat(target); err == nil {
+	// Only "not there" is a first install. Any other failure to look at
+	// the target (permission, I/O) must not skip the rollback copy and
+	// let the rename below replace a binary that cannot be restored.
+	old, err := os.Stat(target)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("checking %s before replacing it: %w", target, err)
+	}
+	if err == nil {
 		// Owner first: chown clears set-ID bits, so the mode goes on
 		// afterwards, and with every bit os.Chmod accepts, not just rwx,
 		// so setuid, setgid and sticky survive the swap.
