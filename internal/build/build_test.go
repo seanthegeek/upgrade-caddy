@@ -439,7 +439,7 @@ func TestLockfileDescribes(t *testing.T) {
 		{ModuleID: "a", Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"},
 	}}
 	good := &Lockfile{Schema: 1, Caddy: LockModule{Package: caddybin.CaddyModulePath, Version: "v2.11.6", Sum: "h1:caddy"},
-		Plugins: []LockModule{{Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"}}}
+		Plugins: []LockModule{{ModuleID: "a", Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"}}}
 	if err := good.Describes(built); err != nil {
 		t.Errorf("matching lockfile: %v", err)
 	}
@@ -466,6 +466,46 @@ func TestLockfileDescribes(t *testing.T) {
 	if err := good.Describes(&unsummed); err == nil {
 		t.Error("a checksum the binary does not carry must be rejected")
 	}
+	// A plugin replaced by a local directory has no checksum, so the
+	// directory is its only identity: a lockfile naming another one is
+	// for another build.
+	localBuilt := *built
+	localBuilt.Plugins = []caddybin.Plugin{{ModuleID: "a", Package: "github.com/example/plugin", Version: "v1.3.0", Replace: "/srv/plugin-a"}}
+	localLock := *good
+	localLock.Plugins = []LockModule{{ModuleID: "a", Package: "github.com/example/plugin", Version: "v1.3.0", ReplacedBy: "/srv/plugin-a"}}
+	if err := localLock.Describes(&localBuilt); err != nil {
+		t.Errorf("matching local replacement: %v", err)
+	}
+	localLock.Plugins[0].ReplacedBy = "/srv/plugin-b"
+	if err := localLock.Describes(&localBuilt); err == nil {
+		t.Error("a different local replacement must be rejected")
+	}
+	// The same for Caddy itself, which --replace can target.
+	replacedCaddy := *built
+	replacedCaddy.MainSum, replacedCaddy.MainReplace = "", "/srv/caddy"
+	if err := good.Describes(&replacedCaddy); err == nil {
+		t.Error("a replaced Caddy must not match a lockfile that records no replacement")
+	}
+	caddyLock := *good
+	caddyLock.Caddy = LockModule{Package: caddybin.CaddyModulePath, Version: "v2.11.6", ReplacedBy: "/srv/caddy"}
+	if err := caddyLock.Describes(&replacedCaddy); err != nil {
+		t.Errorf("matching Caddy replacement: %v", err)
+	}
+	// A Go module that registers two Caddy modules appears twice in the
+	// binary and must be listed twice, under its module IDs.
+	twice := *built
+	twice.Plugins = []caddybin.Plugin{
+		{ModuleID: "a", Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"},
+		{ModuleID: "b", Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"},
+	}
+	if err := good.Describes(&twice); err == nil {
+		t.Error("one listed registration for two in the binary must be rejected")
+	}
+	wrongID := *good
+	wrongID.Plugins = []LockModule{{ModuleID: "z", Package: "github.com/example/plugin", Version: "v1.3.0", Sum: "h1:p"}}
+	if err := wrongID.Describes(built); err == nil {
+		t.Error("a different module ID must be rejected")
+	}
 	missing := *good
 	missing.Plugins = nil
 	if err := missing.Describes(built); err == nil {
@@ -488,6 +528,25 @@ func TestLockfileDescribes(t *testing.T) {
 	}
 	if err := lf.Describes(built); err != nil {
 		t.Errorf("a lockfile build wrote must describe its binary: %v", err)
+	}
+	// And with replacements on both Caddy and a plugin, including a
+	// module registering twice.
+	replaced := twice
+	replaced.MainReplace, replaced.MainReplaceVer = "github.com/fork/caddy/v2", "v2.11.6-fork"
+	replaced.Plugins[1].Replace = "/srv/plugin"
+	f2, _ := os.CreateTemp(dir, "lock-*.json")
+	if err := writeLockfile(f2, p, &replaced); err != nil {
+		t.Fatal(err)
+	}
+	lf2, err := ReadLockfile(f2.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lf2.Caddy.ReplacedBy != "github.com/fork/caddy/v2@v2.11.6-fork" {
+		t.Errorf("Caddy replacement must be recorded: %+v", lf2.Caddy)
+	}
+	if err := lf2.Describes(&replaced); err != nil {
+		t.Errorf("a lockfile with replacements must describe its binary: %v", err)
 	}
 	os.WriteFile(f.Name(), []byte("{}"), 0o644)
 	if _, err := ReadLockfile(f.Name()); err == nil {

@@ -53,8 +53,10 @@ type Info struct {
 	MainPath       string            `json:"main_path,omitempty"` // Caddy's module path, e.g. .../caddy/v2; "" when absent
 	MainVersion    string            `json:"main_version"`        // from build info; "" when absent
 	MainSum        string            `json:"main_sum,omitempty"`
-	HasModuleInfo  bool              `json:"has_module_info"` // false for distro-style builds
-	Plugins        []Plugin          `json:"plugins"`         // non-standard modules
+	MainReplace    string            `json:"main_replace,omitempty"`         // replacement path when Caddy itself was replaced
+	MainReplaceVer string            `json:"main_replace_version,omitempty"` // version of that replacement, if it is a module
+	HasModuleInfo  bool              `json:"has_module_info"`                // false for distro-style builds
+	Plugins        []Plugin          `json:"plugins"`                        // non-standard modules
 	UnknownModules []Plugin          `json:"unknown_modules,omitempty"`
 	StandardCount  int               `json:"standard_count"`
 	Owner          *pkgmgr.Owner     `json:"owner,omitempty"`         // OS package that installed the file
@@ -118,8 +120,13 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 			info.MainPath = d.Path
 			info.MainVersion = d.Version
 			info.MainSum = d.Sum
+			// A local replacement has no checksum, so the replacement's
+			// path and version are the only identity the lockfile can
+			// record for it.
 			if d.Replace != nil {
 				info.MainSum = d.Replace.Sum
+				info.MainReplace = d.Replace.Path
+				info.MainReplaceVer = d.Replace.Version
 			}
 		}
 	}

@@ -139,7 +139,10 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    and checks up front
    whether root is needed (to write the directory, restart the unit, or
    re-apply file capabilities) so a long build never ends in "permission
-   denied".
+   denied". These checks are repeated right before step 4: if the target,
+   its package ownership, its capabilities or the set of units running it
+   changed while the build ran, nothing is touched and `install` asks to
+   be re-run.
 3. Builds the new binary into the target's directory with the same rules
    and flags as `build`, or stages one from `--from PATH` (a binary that
    `build` produced, with its lockfile beside it; the lockfile must
@@ -225,8 +228,10 @@ and FreeBSD (amd64).
 Or, with Go installed, run
 `go install github.com/seanthegeek/upgrade-caddy@latest`.
 
-The Go toolchain must be installed for `build` and `install`; `check`
-needs nothing else.
+The Go toolchain must be installed wherever a binary is compiled: for
+`build`, and for `install` without `--from`. `install --from` only stages
+a binary that `build` already produced, so it runs without Go, and
+`check` needs nothing else either.
 
 ## Build
 

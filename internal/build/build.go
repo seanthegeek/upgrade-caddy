@@ -571,13 +571,16 @@ func ReadLockfile(path string) (*Lockfile, error) {
 }
 
 // Describes reports whether the lockfile matches the inspected binary:
-// same Caddy path, version and checksum, and the same set of plugin
-// modules at the same versions and checksums. The checksums must be
+// same Caddy path, version, checksum and replacement, and the same list of
+// plugin registrations (module ID, package, version, checksum and
+// replacement), each present the same number of times. Everything must be
 // exactly equal, empty included: a lockfile is written from the same
 // build info Inspect reads, so a genuine one never differs from its
-// binary, and a missing or surplus checksum means the file was edited or
-// belongs to another binary. A lockfile that does not describe the binary
-// beside it is refused by install.
+// binary, and a missing or surplus field means the file was edited or
+// belongs to another binary. The replacement matters because a module
+// replaced by a local directory has no checksum at all, so the directory
+// is the only thing telling two such builds apart. A lockfile that does
+// not describe the binary beside it is refused by install.
 func (lf *Lockfile) Describes(built *caddybin.Info) error {
 	if lf.Caddy.Package != built.MainPath || lf.Caddy.Version != built.MainVersion {
 		return fmt.Errorf("lockfile says Caddy %s %s, binary is %s %s", lf.Caddy.Package, lf.Caddy.Version, built.MainPath, built.MainVersion)
@@ -585,26 +588,47 @@ func (lf *Lockfile) Describes(built *caddybin.Info) error {
 	if lf.Caddy.Sum != built.MainSum {
 		return fmt.Errorf("lockfile Caddy checksum %q does not match the binary's %q", lf.Caddy.Sum, built.MainSum)
 	}
-	key := func(pkg, ver, sum string) string { return pkg + "@" + ver + " " + sum }
-	want := map[string]bool{}
+	if r := replacedBy(built.MainReplace, built.MainReplaceVer); lf.Caddy.ReplacedBy != r {
+		return fmt.Errorf("lockfile Caddy replacement %q does not match the binary's %q", lf.Caddy.ReplacedBy, r)
+	}
+	key := func(id, pkg, ver, sum, repl string) string {
+		k := id + " " + pkg + "@" + ver + " " + sum
+		if repl != "" {
+			k += " => " + repl
+		}
+		return k
+	}
+	want := map[string]int{}
 	for _, m := range lf.Plugins {
-		want[key(m.Package, m.Version, m.Sum)] = true
+		want[key(m.ModuleID, m.Package, m.Version, m.Sum, m.ReplacedBy)]++
 	}
-	have := map[string]bool{}
+	have := map[string]int{}
 	for _, p := range built.Plugins {
-		have[key(p.Package, p.Version, p.Sum)] = true
+		have[key(p.ModuleID, p.Package, p.Version, p.Sum, replacedBy(p.Replace, p.ReplaceVersion))]++
 	}
-	for k := range want {
-		if !have[k] {
-			return fmt.Errorf("lockfile lists %s, which the binary does not carry", k)
+	for k, n := range want {
+		if have[k] != n {
+			return fmt.Errorf("lockfile lists %s %d time(s), the binary carries it %d time(s)", k, n, have[k])
 		}
 	}
-	for k := range have {
-		if !want[k] {
-			return fmt.Errorf("binary carries %s, which the lockfile does not list", k)
+	for k, n := range have {
+		if want[k] != n {
+			return fmt.Errorf("binary carries %s %d time(s), the lockfile lists it %d time(s)", k, n, want[k])
 		}
 	}
 	return nil
+}
+
+// replacedBy renders a replace directive's target as "path@version", or
+// just the path for a local directory, which has no version.
+func replacedBy(path, version string) string {
+	if path == "" {
+		return ""
+	}
+	if version != "" {
+		return path + "@" + version
+	}
+	return path
 }
 
 // LockModule is one module in a Lockfile.
@@ -631,7 +655,7 @@ func writeLockfile(f *os.File, p *Plan, built *caddybin.Info) error {
 		Schema:    1,
 		BuiltAt:   time.Now().UTC().Truncate(time.Second),
 		GoVersion: built.GoVersion,
-		Caddy:     LockModule{Package: built.MainPath, Version: built.MainVersion, Sum: built.MainSum},
+		Caddy:     LockModule{Package: built.MainPath, Version: built.MainVersion, Sum: built.MainSum, ReplacedBy: replacedBy(built.MainReplace, built.MainReplaceVer)},
 		Plugins:   []LockModule{},
 	}
 	source := map[string]Source{}
@@ -643,13 +667,8 @@ func writeLockfile(f *os.File, p *Plan, built *caddybin.Info) error {
 		if !ok {
 			src = Transitive
 		}
-		lm := LockModule{ModuleID: bp.ModuleID, Package: bp.Package, Version: bp.Version, Sum: bp.Sum, Source: src}
-		if bp.Replace != "" {
-			lm.ReplacedBy = bp.Replace
-			if bp.ReplaceVersion != "" {
-				lm.ReplacedBy += "@" + bp.ReplaceVersion
-			}
-		}
+		lm := LockModule{ModuleID: bp.ModuleID, Package: bp.Package, Version: bp.Version, Sum: bp.Sum, Source: src,
+			ReplacedBy: replacedBy(bp.Replace, bp.ReplaceVersion)}
 		lf.Plugins = append(lf.Plugins, lm)
 	}
 	if p.SourcePath != "" {

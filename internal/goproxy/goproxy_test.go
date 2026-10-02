@@ -26,6 +26,7 @@ func TestSplitMajor(t *testing.T) {
 		{"example.com/m/v10", "example.com/m", 10},
 		{"gopkg.in/yaml.v3", "gopkg.in/yaml", 3},
 		{"gopkg.in/yaml.v1", "gopkg.in/yaml", 1},
+		{"gopkg.in/yaml.v0", "gopkg.in/yaml", 0}, // an explicit .v0 is major 0, not 1
 	}
 	for _, c := range cases {
 		b, m := SplitMajor(c.in)
@@ -413,6 +414,15 @@ func TestNewerMajors(t *testing.T) {
 	got, err = c.NewerMajors(ctx, "gopkg.in/yaml.v2", "v2.4.0")
 	if err != nil || len(got) != 1 || got[0].Path != "gopkg.in/yaml.v3" {
 		t.Errorf("gopkg.in: %+v err=%v", got, err)
+	}
+	// An explicit .v0 path is major 0, so a published .v1 is a newer major.
+	srv0 := newServer(t, map[string]string{
+		"/gopkg.in/zero.v0/@latest": "v0.3.0",
+		"/gopkg.in/zero.v1/@latest": "v1.0.0",
+	})
+	got, err = client(srv0.URL, "").NewerMajors(ctx, "gopkg.in/zero.v0", "v0.3.0")
+	if err != nil || len(got) != 1 || got[0].Path != "gopkg.in/zero.v1" {
+		t.Errorf("gopkg.in .v0 must see .v1 as newer: %+v err=%v", got, err)
 	}
 	// One skipped major number is tolerated; two consecutive misses end the walk.
 	got, err = c.NewerMajors(ctx, "example.com/skip", "v1.0.0")

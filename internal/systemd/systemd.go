@@ -98,12 +98,15 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 	var units []Unit
 	var defaultPath []string // systemd's own search path, asked for only when a bare name needs it
 	for _, u := range parseShow(string(out)) {
-		search := u.ExecSearchPath
-		if len(search) == 0 && hasBareName(u.Commands) {
-			if defaultPath == nil {
-				defaultPath = defaultSearchPath(ctx)
+		var search []string
+		if hasBareName(u.Commands) {
+			search = searchPathFor(ctx, &u, execSearchPathFromBus)
+			if len(search) == 0 {
+				if defaultPath == nil {
+					defaultPath = defaultSearchPath(ctx)
+				}
+				search = defaultPath
 			}
-			search = defaultPath
 		}
 		matched := false
 		for _, c := range u.Commands {
@@ -117,16 +120,9 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		}
 		// systemctl show flattens argv with spaces, so an argument that
 		// contains one cannot be recovered from it. The D-Bus property keeps
-		// the array; take the commands from there when it can be read. The
-		// search path is rendered the same way, so for a unit that sets one
-		// it is re-read over D-Bus too.
+		// the array; take the commands from there when it can be read.
 		if cmds, err := execStartFromBus(ctx, u.Name); err == nil && len(cmds) > 0 {
 			u.Commands = cmds
-		}
-		if len(u.ExecSearchPath) > 0 {
-			if dirs, err := execSearchPathFromBus(ctx, u.Name); err == nil && len(dirs) > 0 {
-				u.ExecSearchPath, search = dirs, dirs
-			}
 		}
 		for _, c := range u.Commands {
 			if resolves(c.Path, want, search) {
@@ -137,6 +133,24 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		units = append(units, u)
 	}
 	return units, nil
+}
+
+// searchPathFor returns the directories a unit's bare executable name is
+// looked up in: its ExecSearchPath=, read over D-Bus when the unit sets
+// one, because the systemctl rendering splits on spaces and a directory
+// containing one would otherwise be looked for under two wrong names. The
+// flattened rendering is only the fallback when the bus cannot be read.
+// It is read before the first match, so a unit is never missed because
+// of that split. nil means the unit sets none and systemd's default
+// applies.
+func searchPathFor(ctx context.Context, u *Unit, fromBus func(context.Context, string) ([]string, error)) []string {
+	if len(u.ExecSearchPath) == 0 {
+		return nil
+	}
+	if dirs, err := fromBus(ctx, u.Name); err == nil && len(dirs) > 0 {
+		u.ExecSearchPath = dirs
+	}
+	return u.ExecSearchPath
 }
 
 // hasBareName reports whether any command names its executable without a

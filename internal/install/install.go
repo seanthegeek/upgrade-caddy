@@ -8,6 +8,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -67,7 +68,30 @@ type Plan struct {
 	RootReasons      []string `json:"root_reasons,omitempty"`
 
 	caps      []byte // raw security.capability value to carry over, nil when none
+	targetID  fileID // the file Resolve inspected, so Run can tell if it was replaced meanwhile
 	buildOpts build.Options
+}
+
+// fileID identifies one file on disk closely enough to notice it being
+// replaced: a package upgrade or a rebuild lands a new inode, and an
+// in-place rewrite changes size or modification time.
+type fileID struct {
+	dev, ino uint64
+	size     int64
+	mtime    time.Time
+}
+
+// identify reads a file's identity.
+func identify(path string) (fileID, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileID{}, err
+	}
+	id := fileID{size: fi.Size(), mtime: fi.ModTime()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		id.dev, id.ino = uint64(st.Dev), uint64(st.Ino) // Dev's width differs by platform
+	}
+	return id, nil
 }
 
 // Validation is one config the new binary must accept before the swap:
@@ -147,6 +171,13 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	if err := attest(newLock, newInfo); err != nil {
 		cleanup()
 		return plan, nil, fmt.Errorf("the staged lockfile does not describe the staged binary: %w", err)
+	}
+	// The plan's safety checks are minutes old by now if a build ran.
+	// Confirm the world still matches it before anything is validated or
+	// replaced.
+	if err := recheck(ctx, plan); err != nil {
+		cleanup()
+		return plan, nil, err
 	}
 	result := &Result{Target: plan.Target, Built: newInfo}
 
@@ -231,8 +262,16 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 				}
 			}
 			cancel()
+			if len(stopErrs) > 0 {
+				// A unit that could not be stopped may still be running;
+				// removing its binary now would leave it on an unlinked
+				// executable that can never restart, the very state this
+				// cleanup exists to prevent. The files stay for the
+				// operator to deal with.
+				return restarted, errors.Join(fmt.Errorf("%s did not come up with the new binary: %w; and a unit could not be stopped, so the new binary and lockfile were left at %s rather than removed from under a running service: stop the unit, then remove them (there was nothing installed before)", u, rerr, target), errors.Join(stopErrs...))
+			}
 			fmt.Fprintf(logw, "==> removing %s again\n", target)
-			rbErr := errors.Join(errors.Join(stopErrs...), removeIfPresent(target), rollbackLockfile(target))
+			rbErr := errors.Join(removeIfPresent(target), rollbackLockfile(target))
 			if rbErr != nil {
 				return restarted, errors.Join(fmt.Errorf("%s did not come up with the new binary: %w; and restoring the pre-install state of %s was incomplete", u, rerr, target), rbErr)
 			}
@@ -374,6 +413,9 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		p.caps = caps
 		if caps != nil {
 			p.FileCapabilities = describeCaps(ctx, p.Target)
+		}
+		if p.targetID, err = identify(p.Target); err != nil {
+			return nil, err
 		}
 	}
 
@@ -629,6 +671,79 @@ func unitNames(units []systemd.Unit) string {
 	return strings.Join(names, ", ")
 }
 
+// recheck repeats the plan's safety checks right before the install acts
+// on it. Resolve ran before the build, possibly minutes ago; in between a
+// package could have put its own Caddy at the target, the file could have
+// been replaced, its capabilities changed, or a unit added. Any difference
+// from the plan is a refusal: the user re-runs install with a fresh plan.
+func recheck(ctx context.Context, plan *Plan) error {
+	requested := plan.Requested
+	if requested == "" {
+		requested = plan.Target
+	}
+	real, exists, err := resolveTarget(requested)
+	if err != nil {
+		return fmt.Errorf("rechecking the target: %w", err)
+	}
+	changed := func(what string) error {
+		return fmt.Errorf("%s changed while the plan was being carried out; nothing was changed, re-run install", what)
+	}
+	if real != plan.Target || exists != plan.TargetExists {
+		return changed(fmt.Sprintf("the target %s", requested))
+	}
+	if exists {
+		owner, err := pkgmgr.Find(ctx, plan.Target)
+		if err != nil {
+			return fmt.Errorf("refusing to continue: %w; install must know whether %s belongs to a system package before replacing it", err, plan.Target)
+		}
+		if owner != nil {
+			return refuseSystemPackage(plan.Target, owner)
+		}
+		id, err := identify(plan.Target)
+		if err != nil {
+			return fmt.Errorf("rechecking the target: %w", err)
+		}
+		if id != plan.targetID {
+			return changed(fmt.Sprintf("the file at %s", plan.Target))
+		}
+		caps, err := readCaps(plan.Target)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(caps, plan.caps) {
+			return changed(fmt.Sprintf("the file capabilities of %s", plan.Target))
+		}
+	}
+	units, err := systemd.UnitsUsing(ctx, plan.Target)
+	if err != nil {
+		return fmt.Errorf("querying systemd: %w", err)
+	}
+	if !sameUnits(plan.Units, units) {
+		return changed(fmt.Sprintf("the set of units running %s (planned: %s; now: %s)", plan.Target, unitNamesOrNone(plan.Units), unitNamesOrNone(units)))
+	}
+	return nil
+}
+
+// sameUnits reports whether two unit lists name the same units in order.
+func sameUnits(a, b []systemd.Unit) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
+func unitNamesOrNone(units []systemd.Unit) string {
+	if len(units) == 0 {
+		return "none"
+	}
+	return unitNames(units)
+}
+
 // attest checks that the lockfile at lockPath describes the inspected
 // binary, so the attestation installed beside the target is for the file
 // actually installed.
@@ -715,17 +830,25 @@ func swapLockfile(target, newLock string) error {
 	// Only "not there" means there is nothing to keep; any other failure
 	// to look would let the rename below overwrite a lockfile with no
 	// previous copy, so it stops the install instead.
+	hadOld := false
 	switch _, err := os.Stat(lock); {
 	case err == nil:
 		if err := os.Rename(lock, prev); err != nil {
 			return fmt.Errorf("keeping previous lockfile: %w", err)
 		}
+		hadOld = true
 	case errors.Is(err, os.ErrNotExist):
 	default:
 		return fmt.Errorf("checking %s before replacing it: %w", lock, err)
 	}
 	if err := os.Rename(newLock, lock); err != nil {
-		os.Rename(prev, lock) // best effort: put the old one back
+		if hadOld {
+			// Put the old one back, and say so if that fails too: the
+			// live lockfile would then be stranded at .previous.
+			if rbErr := os.Rename(prev, lock); rbErr != nil {
+				return errors.Join(fmt.Errorf("installing the new lockfile: %w; and the previous one could not be put back, it is at %s", err, prev), rbErr)
+			}
+		}
 		return err
 	}
 	return nil
@@ -774,8 +897,13 @@ func swap(target, newPath string, caps []byte) (previous string, err error) {
 		// Owner first: chown clears set-ID bits, so the mode goes on
 		// afterwards, and with every bit os.Chmod accepts, not just rwx,
 		// so setuid, setgid and sticky survive the swap.
+		// Root must succeed: a failure there (a root-squashed export, a
+		// restricted user namespace) would install a binary with a
+		// different owner while reporting success. An unprivileged user
+		// cannot hand a file to another owner at all, so for them a
+		// permission error is the expected outcome, not a failure.
 		if st, ok := old.Sys().(*syscall.Stat_t); ok {
-			if err := os.Chown(newPath, int(st.Uid), int(st.Gid)); err != nil && !errors.Is(err, os.ErrPermission) {
+			if err := os.Chown(newPath, int(st.Uid), int(st.Gid)); err != nil && (os.Geteuid() == 0 || !errors.Is(err, os.ErrPermission)) {
 				return "", fmt.Errorf("setting owner of new binary: %w", err)
 			}
 		}

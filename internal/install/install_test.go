@@ -135,6 +135,83 @@ func TestRestartUnitsFirstInstallStopsAlreadyRestartedUnits(t *testing.T) {
 	}
 }
 
+func TestRestartUnitsFirstInstallKeepsFilesWhenStopFails(t *testing.T) {
+	settleDelay = 10 * time.Millisecond
+	t.Cleanup(func() { settleDelay = time.Second })
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("new"), 0o755)
+	os.WriteFile(target+".lock.json", []byte("newlock"), 0o644)
+	// The unit never comes up and cannot be stopped either: it may still
+	// be running, so the binary must not be removed from under it.
+	ctl := &fakeCtl{stopErr: errors.New("stop refused")}
+	var log strings.Builder
+	_, err := restartUnits(context.Background(), ctl, []string{"a.service"}, target, "", 50*time.Millisecond, &log)
+	if err == nil || !strings.Contains(err.Error(), "left at") || !strings.Contains(err.Error(), "stop refused") {
+		t.Errorf("a failed stop must be reported and the files kept: %v", err)
+	}
+	for _, f := range []string{target, target + ".lock.json"} {
+		if _, statErr := os.Stat(f); statErr != nil {
+			t.Errorf("%s must be left in place when a unit could not be stopped", f)
+		}
+	}
+}
+
+func TestIdentifyNoticesReplacement(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	os.WriteFile(target, []byte("installed"), 0o755)
+	before, err := identify(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, _ := identify(target)
+	if again != before {
+		t.Error("an untouched file must keep its identity")
+	}
+	// A package upgrade or a rebuild puts a new inode at the path.
+	other := filepath.Join(dir, "other")
+	os.WriteFile(other, []byte("installed"), 0o755)
+	os.Rename(other, target)
+	if after, _ := identify(target); after == before {
+		t.Error("a replaced file must get a new identity")
+	}
+	// An in-place rewrite changes size (or mtime).
+	before, _ = identify(target)
+	os.WriteFile(target, []byte("rewritten in place"), 0o755)
+	if after, _ := identify(target); after == before {
+		t.Error("a rewritten file must get a new identity")
+	}
+	if _, err := identify(filepath.Join(dir, "missing")); err == nil {
+		t.Error("a missing file is an error")
+	}
+	if !sameUnits([]systemd.Unit{{Name: "a"}, {Name: "b"}}, []systemd.Unit{{Name: "a"}, {Name: "b"}}) ||
+		sameUnits([]systemd.Unit{{Name: "a"}}, []systemd.Unit{{Name: "a"}, {Name: "b"}}) ||
+		sameUnits([]systemd.Unit{{Name: "a"}}, []systemd.Unit{{Name: "c"}}) {
+		t.Error("sameUnits must compare the unit names in order")
+	}
+}
+
+func TestLockfileSwapRestoresOnFailedInstall(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	lock := target + ".lock.json"
+	os.WriteFile(lock, []byte("old"), 0o644)
+	// The staged lockfile is missing, so the final rename fails after the
+	// old one was moved aside: it must come back, and the error must not
+	// claim it is stranded.
+	err := swapLockfile(target, filepath.Join(dir, "missing.lock.json"))
+	if err == nil || strings.Contains(err.Error(), "could not be put back") {
+		t.Errorf("a successful restore must not be reported as stranded: %v", err)
+	}
+	if got, _ := os.ReadFile(lock); string(got) != "old" {
+		t.Errorf("the previous lockfile must be back in place, got %q", got)
+	}
+	if _, err := os.Stat(lock + ".previous"); !errors.Is(err, os.ErrNotExist) {
+		t.Error("nothing should be left at .previous after the restore")
+	}
+}
+
 func inode(t *testing.T, path string) uint64 {
 	t.Helper()
 	fi, err := os.Stat(path)
@@ -447,6 +524,7 @@ type fakeCtl struct {
 	defaultActive bool
 	pid           int
 	restartErr    error
+	stopErr       error
 	activeErr     error
 	pidErr        error
 }
@@ -458,7 +536,7 @@ func (f *fakeCtl) Restart(_ context.Context, unit string) error {
 
 func (f *fakeCtl) Stop(_ context.Context, unit string) error {
 	f.stops = append(f.stops, unit)
-	return nil
+	return f.stopErr
 }
 
 func (f *fakeCtl) IsActive(_ context.Context, _ string) (bool, error) {

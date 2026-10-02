@@ -430,14 +430,16 @@ func (c *Client) NewerMajors(ctx context.Context, modPath, installed string) ([]
 // the go command's rules: "example.com/m/v3" gives ("example.com/m", 3),
 // "gopkg.in/yaml.v3" gives ("gopkg.in/yaml", 3), and a path with no suffix
 // is major 1 (which also covers v0 modules, since both live on the bare
-// path). "/v1", "/v0" and suffixes with leading zeros are not suffixes.
+// path). "/v1", "/v0" and suffixes with leading zeros are not suffixes,
+// but gopkg.in's ".v0" is one (module.SplitPathVersion accepts it) and
+// means major 0, so that ".v1" still counts as a newer major.
 func SplitMajor(modPath string) (base string, major int) {
 	prefix, pathMajor, ok := module.SplitPathVersion(modPath)
 	if !ok || pathMajor == "" {
 		return modPath, 1
 	}
 	n, err := strconv.Atoi(pathMajor[2:]) // after "/v" or ".v"
-	if err != nil || n < 1 {
+	if err != nil || n < 0 {
 		return prefix, 1
 	}
 	return prefix, n

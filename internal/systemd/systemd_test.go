@@ -1,6 +1,8 @@
 package systemd
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -242,6 +244,37 @@ func TestResolvesBareName(t *testing.T) {
 	os.Symlink(bin, link)
 	if !resolves("caddy", want, []string{link}) {
 		t.Error("a symlinked search directory must resolve to the real file")
+	}
+}
+
+func TestSearchPathForReadsBusBeforeMatching(t *testing.T) {
+	// A search directory with a space: the flattened rendering splits
+	// it, the bus keeps it. The bus value must be used before matching.
+	u := Unit{Name: "x.service", ExecSearchPath: []string{"/opt/my", "caddy", "/usr/bin"}}
+	bus := func(_ context.Context, name string) ([]string, error) {
+		if name != "x.service" {
+			t.Errorf("asked for %q", name)
+		}
+		return []string{"/opt/my caddy", "/usr/bin"}, nil
+	}
+	if got := searchPathFor(context.Background(), &u, bus); !reflect.DeepEqual(got, []string{"/opt/my caddy", "/usr/bin"}) {
+		t.Errorf("bus search path must win: %v", got)
+	}
+	if !reflect.DeepEqual(u.ExecSearchPath, []string{"/opt/my caddy", "/usr/bin"}) {
+		t.Errorf("the unit must carry the exact value: %v", u.ExecSearchPath)
+	}
+	// Bus unavailable: the flattened value is the fallback.
+	u = Unit{Name: "y.service", ExecSearchPath: []string{"/opt/probe", "/usr/bin"}}
+	broken := func(context.Context, string) ([]string, error) { return nil, errors.New("no bus") }
+	if got := searchPathFor(context.Background(), &u, broken); !reflect.DeepEqual(got, []string{"/opt/probe", "/usr/bin"}) {
+		t.Errorf("fallback: %v", got)
+	}
+	// No ExecSearchPath= at all: nil, and the bus is not asked.
+	u = Unit{Name: "z.service"}
+	asked := false
+	spy := func(context.Context, string) ([]string, error) { asked = true; return nil, nil }
+	if got := searchPathFor(context.Background(), &u, spy); got != nil || asked {
+		t.Errorf("no search path set: got %v asked=%v", got, asked)
 	}
 }
 

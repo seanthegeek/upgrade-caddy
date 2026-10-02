@@ -99,7 +99,8 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    Reporting and acting are deliberately separate. A bare path holds v0,
    v1 and `vN+incompatible` alike, so the installed version's major, not
    the path's, decides what counts as "newer major" and where probing
-   starts.
+   starts. A gopkg.in path spells its major out, `.v0` included, and
+   `.v0` is major 0, so that `.v1` counts as newer.
 4. **Never use Caddy's download/build server.** Builds go through the xcaddy
    library on the local machine. The build server is the thing upstream is
    removing.
@@ -171,7 +172,9 @@ These are implemented in `internal/install`; keep them true.
   the install, since going on would replace a file with no rollback copy
   or delete the live lockfile. Owner is applied first (chown clears set-ID bits), then every
   mode bit `os.Chmod` accepts, so setuid, setgid and sticky survive; owner
-  applies only when running as root. Capabilities are read and written as the raw
+  applies only when running as root, and as root any chown failure (a
+  root-squashed export, a restricted user namespace) fails the swap rather
+  than installing a binary with the wrong owner. Capabilities are read and written as the raw
   `security.capability` extended attribute (Linux only; a no-op elsewhere):
   no `getcap`/`setcap` dependency, and an unreadable attribute is an error
   in `Resolve`, never "no capabilities", because a rename drops them.
@@ -212,10 +215,22 @@ These are implemented in `internal/install`; keep them true.
   (`Lockfile.Describes`: Caddy path, version and checksum, exactly equal
   and empty included, and the exact plugin set with versions and
   checksums), since the lockfile is installed beside the target as its
-  attestation. `Resolve` checks the source pair, and `Run` checks the
-  staged copies again before validating, because the source directory is
-  typically writable by a less privileged user and either file could have
-  been replaced between the two.
+  attestation. The identity compared is the full one the lockfile
+  records: for Caddy, path, version, checksum and replacement; for
+  plugins, module ID, package, version, checksum and replacement, with
+  each registration counted (a Go module registering two Caddy modules
+  must be listed twice). The replacement matters because a module
+  replaced by a local directory has no checksum, so the directory is all
+  that tells two such builds apart. `Resolve` checks the source pair, and
+  `Run` checks the staged copies again before validating, because the
+  source directory is typically writable by a less privileged user and
+  either file could have been replaced between the two.
+- `Resolve`'s checks are repeated by `recheck` right before validation
+  and the swap, because a build can take minutes: the target must resolve
+  to the same file (same device, inode, size and modification time), still
+  belong to no package, carry the same capabilities, and be run by the
+  same units. Any difference is a refusal that asks for a re-run, never a
+  silent re-plan.
 - After a restart, a main process whose `/proc/<pid>/exe` is missing has
   vanished and fails verification; only a permission error falls back to
   the active state.
@@ -229,7 +244,12 @@ These are implemented in `internal/install`; keep them true.
   state to restore is "nothing there": a failed restart stops every unit
   that was restarted, the one that failed verification included (it was
   restarted too and may still be active), then removes the new binary and
-  lockfile again. A `MainPID` query failure fails verification;
+  lockfile again; if any stop fails, the files are left in place and the
+  error says so, because removing a binary from under a service that may
+  still run leaves it on an unlinked executable. When installing the
+  lockfile fails after the old one was moved aside, the old one is put
+  back and a failure to do that is reported too, naming
+  `.lock.json.previous`. A `MainPID` query failure fails verification;
   only a PID of 0 falls back to the active state.
 - `main` cancels the context on SIGINT and SIGTERM, so a service manager,
   CI cancellation or `timeout(1)` lets install roll back instead of dying
