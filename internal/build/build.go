@@ -688,8 +688,10 @@ func replacementMatches(pkg, want, got string) error {
 }
 
 // Lockfile records exactly what went into a build, with checksums, so an
-// installed binary can be traced to its inputs. Nothing reads it back yet;
-// install only requires that one exists beside a --from binary.
+// installed binary can be traced to its inputs. install reads it back: a
+// --from binary is accepted only when the lockfile beside it describes that
+// exact binary (Describes), and the lockfile is then installed beside the
+// target as its attestation.
 type Lockfile struct {
 	Schema       int          `json:"schema"`
 	BuiltAt      time.Time    `json:"built_at"`

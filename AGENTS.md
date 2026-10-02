@@ -264,7 +264,12 @@ These are implemented in `internal/install`; keep them true.
   the forward ones under a fresh deadline per unit, because the caller's
   context is often already cancelled. Error messages say "rolled back" only
   when the restore succeeded, and add "did not come back up" when the
-  verified restart on the restored binary failed. On a first install the
+  verified restart on the restored binary failed. When the binary itself
+  could not be restored, the target still holds the failed binary, so its
+  lockfile is left with it and no unit is restarted again: restarting them
+  all on the failed binary would take down the ones that came up before
+  the failure, and the lockfile beside the target must always describe
+  the binary beside it. On a first install the
   state to restore is "nothing there": a failed restart stops every unit
   that was restarted, the one that failed verification included (it was
   restarted too and may still be active), then removes the new binary and
@@ -273,7 +278,9 @@ These are implemented in `internal/install`; keep them true.
   still run leaves it on an unlinked executable. When installing the
   lockfile fails after the old one was moved aside, the old one is put
   back and a failure to do that is reported too, naming
-  `.lock.json.previous`. A `MainPID` query failure fails verification;
+  `.lock.json.previous`. A stale `.lock.json.previous` that cannot be
+  removed stops the install before the live lockfile moves, since a later
+  rollback would take it for the previous lockfile. A `MainPID` query failure fails verification;
   only a PID of 0 falls back to the active state.
 - `main` cancels the context on SIGINT and SIGTERM, so a service manager,
   CI cancellation or `timeout(1)` lets install roll back instead of dying
@@ -296,17 +303,23 @@ These are implemented in `internal/install`; keep them true.
   like anyone else); a `DynamicUser=` unit, whose account exists only
   while it runs, is validated as the inspection account; a unit user or
   group that cannot be looked up is a refusal. `Account.Apply` treats a
-  different supplementary group list as a different identity. A Go
-  module that registers several Caddy modules is named to `--upgrade`
-  and `--drop-replace` by any of its IDs.
+  different supplementary group list as a different identity, and
+  `LookupAccount` seeds the supplementary list with `Group=` in place of
+  the user's own primary group when one is set, as systemd's
+  `initgroups(user, gid)` does. Without root nothing can be switched, so
+  a validation whose unit runs as another account (root included) is a
+  reason to need root, reported by `Resolve` before any build; a normal
+  user's `install --no-restart` can no longer validate a service's config
+  as themselves. A Go module that registers several Caddy modules is
+  named to `--upgrade` and `--drop-replace` by any of its IDs.
   The staged copy and the build output are made executable before they
   are inspected so another account can run them, and a unit whose user
   changed between `Resolve` and the swap fails `recheck`.
 
 ## Lessons from review
 
-Eight rounds of Copilot review plus a layered cross-check review found
-about fifty real defects in this codebase. Almost all of them fell into a
+Thirteen rounds of Copilot review plus a layered cross-check review found
+about eighty real defects in this codebase. Almost all of them fell into a
 handful of patterns. Check new code against this list before calling it
 done; each item names where the pattern bit before.
 

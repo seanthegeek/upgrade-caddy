@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -58,9 +59,18 @@ func LookupAccount(name, group string, extra []string) (*Account, error) {
 	}
 	// os/user's pure-Go fallback (CGO_ENABLED=0 release builds) reads
 	// /etc/group directly, which is where a system user's groups are.
+	// Either way the list starts with the user's primary group from the
+	// user database; systemd instead seeds getgrouplist with the group the
+	// service actually gets (initgroups(user, gid) in
+	// src/core/exec-invoke.c), so when Group= overrides it the original
+	// primary group is dropped and the override takes its place.
 	ids, err := u.GroupIds()
 	if err != nil {
 		return nil, fmt.Errorf("listing groups of user %q: %w", name, err)
+	}
+	if group != "" {
+		ids = slices.DeleteFunc(ids, func(id string) bool { return id == u.Gid })
+		ids = append(ids, strconv.FormatUint(uint64(a.GID), 10))
 	}
 	for _, g := range extra {
 		gid, err := lookupGroup(g)

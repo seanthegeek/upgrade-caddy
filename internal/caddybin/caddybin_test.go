@@ -2,6 +2,7 @@ package caddybin
 
 import (
 	"context"
+	"runtime/debug"
 	"strings"
 	"testing"
 )
@@ -108,5 +109,30 @@ func TestParseModuleLineEdgeCases(t *testing.T) {
 	}
 	if p := parseModuleLine("a.b v1.0.0+incompatible github.com/x/y"); p.Version != "v1.0.0+incompatible" || p.Package != "github.com/x/y" {
 		t.Errorf("incompatible version: %+v", p)
+	}
+}
+
+func TestApplyBuildInfoPrefersItsReplacementPath(t *testing.T) {
+	// list-modules prints the replacement on a space-separated line, so a
+	// directory with a space comes out of the parser truncated; build info
+	// records it whole and wins, as it does for versions and checksums.
+	plugins := []Plugin{
+		{ModuleID: "a", Package: "github.com/example/a", Version: "v0.0.0-20240101000000-abcdefabcdef", Replace: "../my"},
+		{ModuleID: "b", Package: "github.com/example/b", Version: "v1.2.3"},
+		{ModuleID: "c", Package: "github.com/example/c"},
+	}
+	deps := map[string]*debug.Module{
+		"github.com/example/a": {Path: "github.com/example/a", Version: "v0.0.0-20240101000000-abcdefabcdef", Replace: &debug.Module{Path: "../my plugin", Sum: "h1:dir"}},
+		"github.com/example/b": {Path: "github.com/example/b", Version: "v1.2.4", Sum: "h1:b", Replace: &debug.Module{Path: "github.com/fork/b", Version: "v1.2.4-fork", Sum: "h1:fork"}},
+	}
+	applyBuildInfo(plugins, deps)
+	if plugins[0].Replace != "../my plugin" || plugins[0].Sum != "h1:dir" || plugins[0].ReplaceVersion != "" {
+		t.Errorf("directory replacement from build info: %+v", plugins[0])
+	}
+	if plugins[1].Replace != "github.com/fork/b" || plugins[1].ReplaceVersion != "v1.2.4-fork" || plugins[1].Sum != "h1:fork" || plugins[1].Version != "v1.2.4" {
+		t.Errorf("module replacement and version from build info: %+v", plugins[1])
+	}
+	if plugins[2].Replace != "" || plugins[2].Sum != "" {
+		t.Errorf("a module build info does not know is left alone: %+v", plugins[2])
 	}
 }

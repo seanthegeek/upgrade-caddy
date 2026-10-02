@@ -3,7 +3,9 @@ package caddybin
 import (
 	"os"
 	"os/exec"
+	"os/user"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -43,6 +45,19 @@ func TestLookupAccount(t *testing.T) {
 	}
 	if _, err := LookupAccount("root", "", []string{"no-such-group-upgrade-caddy"}); err == nil {
 		t.Error("unknown supplementary group must be an error")
+	}
+	// Group= replaces the primary group in the supplementary list too, as
+	// systemd seeds getgrouplist with the overridden group: root's own
+	// group 0 is gone unless the group file lists root as a member, which
+	// Debian-family systems do not.
+	if _, err := user.LookupGroupId("65534"); err == nil {
+		a, err := LookupAccount("root", "65534", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.GID != 65534 || !slices.Contains(a.Groups, uint32(65534)) || slices.Contains(a.Groups, 0) {
+			t.Errorf("Group= override must replace the primary group in the list: %+v", a)
+		}
 	}
 	if gid, err := LookupGroup("0"); err != nil || gid != 0 {
 		t.Errorf("LookupGroup by ID: %d %v", gid, err)

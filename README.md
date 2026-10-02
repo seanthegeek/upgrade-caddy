@@ -148,9 +148,9 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    apk, Homebrew, or FreeBSD `pkg`), or if ownership cannot be established,
    which on macOS and FreeBSD includes finding no package manager at all,
    and checks up front
-   whether root is needed (to write the directory, restart the unit, or
-   re-apply file capabilities) so a long build never ends in "permission
-   denied". These checks are repeated right before step 4: if the target,
+   whether root is needed (to write the directory, restart the unit,
+   re-apply file capabilities, or validate as the account the service
+   runs as) so a long build never ends in "permission denied". These checks are repeated right before step 4: if the target,
    its package ownership, its capabilities, the set of units running it,
    or those units' config flags, working directory or user changed while
    the build ran, nothing is touched and `install` asks to be re-run.
@@ -199,7 +199,9 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    lockfile are restored, the units are restarted and verified again on
    the restored binary, the failed binary is kept as `<target>.failed`, and
    `install` exits 1 with a message that says whether the rollback itself
-   succeeded and whether the service came back up on it. On a first
+   succeeded and whether the service came back up on it. If the previous
+   binary could not be put back, the new lockfile stays with the new
+   binary and no unit is restarted again. On a first
    install the pre-install state is restored instead: every unit that was
    restarted, the failing one included, is stopped and the new binary and
    lockfile removed. SIGTERM,

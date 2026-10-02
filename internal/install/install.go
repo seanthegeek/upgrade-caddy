@@ -285,26 +285,39 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 		}
 		fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
 		restoreErr, keepErr := rollback(target, previous)
-		restoreErr = errors.Join(restoreErr, rollbackLockfile(target))
-		// The restored binary is restarted and verified the same way the
-		// new one was, under a fresh deadline per unit: a restart that is
-		// accepted and then fails is exactly the case being recovered from.
-		var recoveryErrs []error
-		for _, again := range units {
-			rbCtx, cancel := context.WithTimeout(context.Background(), wait+settleDelay+15*time.Second)
-			if e := restartAndVerify(rbCtx, ctl, again, target, wait); e != nil {
-				recoveryErrs = append(recoveryErrs, fmt.Errorf("after rollback, %w", e))
-			}
-			cancel()
-		}
-		recovery := errors.Join(recoveryErrs...)
 		summary := rolledBack(restoreErr)
-		if restoreErr == nil && recovery != nil {
-			summary += ", but the service did not come back up on it"
+		var lockErr, recovery error
+		if restoreErr != nil {
+			// The target still holds the failed binary. Its lockfile stays
+			// with it, so the pair still describes itself, and no unit is
+			// restarted again: restarting them all on the failed binary
+			// would take down the ones that came up before the failure.
+			summary += "; the new lockfile was left beside it and no unit was restarted again"
+		} else {
+			// The lockfile follows the binary, and the restored binary is
+			// restarted and verified the same way the new one was, under
+			// a fresh deadline per unit: a restart that is accepted and
+			// then fails is exactly the case being recovered from.
+			lockErr = rollbackLockfile(target)
+			var recoveryErrs []error
+			for _, again := range units {
+				rbCtx, cancel := context.WithTimeout(context.Background(), wait+settleDelay+15*time.Second)
+				if e := restartAndVerify(rbCtx, ctl, again, target, wait); e != nil {
+					recoveryErrs = append(recoveryErrs, fmt.Errorf("after rollback, %w", e))
+				}
+				cancel()
+			}
+			recovery = errors.Join(recoveryErrs...)
+			if lockErr != nil {
+				summary += ", but its lockfile could not be restored"
+			}
+			if recovery != nil {
+				summary += ", but the service did not come back up on it"
+			}
 		}
 		return restarted, errors.Join(
 			fmt.Errorf("%s did not come up with the new binary: %w; %s", u, rerr, summary),
-			restoreErr, keepErr, recovery)
+			restoreErr, lockErr, keepErr, recovery)
 	}
 	return restarted, nil
 }
@@ -412,8 +425,10 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		}
 	}
 	// Who runs the new binary before it is installed. Decided here, once,
-	// so the plan shows it and Run cannot drift from it.
-	if err := p.chooseAccounts(os.Geteuid(), os.Getenv, realLookups); err != nil {
+	// so the plan shows it and Run cannot drift from it. Without root, a
+	// validation that would have to switch accounts is a reason to need it.
+	switchReasons, err := p.chooseAccounts(os.Geteuid(), os.Getenv, realLookups)
+	if err != nil {
 		return nil, err
 	}
 
@@ -438,7 +453,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	if opts.NoRestart {
 		restartCount = 0
 	}
-	p.NeedsRoot, p.RootReasons = needsRoot(os.Geteuid(), dirWritable(filepath.Dir(p.Target)), filepath.Dir(p.Target), restartCount, unitNames(units), p.caps != nil)
+	p.NeedsRoot, p.RootReasons = needsRoot(os.Geteuid(), dirWritable(filepath.Dir(p.Target)), filepath.Dir(p.Target), restartCount, unitNames(units), p.caps != nil, switchReasons)
 
 	// Source of the new binary.
 	if opts.From != "" {
@@ -582,9 +597,41 @@ var realLookups = lookups{account: caddybin.LookupAccount, group: caddybin.Looku
 //
 // A unit user that cannot be looked up is a refusal, not a fall back to
 // root: validating as the wrong account answers a different question.
-func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lk lookups) error {
+//
+// Without root nothing can be switched, so a validation whose unit runs as
+// another account (root included) is returned as a reason to need root,
+// which Resolve reports before any build starts. `install --no-restart` by
+// a normal user would otherwise validate a service's config as that user
+// and install a binary whose config was never checked with the service's
+// permissions. A --config with no unit behind it, and a DynamicUser= unit,
+// are validated as the caller, which is what root would do too.
+func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lk lookups) (rootReasons []string, err error) {
 	if euid != 0 {
-		return nil // only root can switch accounts, and only root has anything to drop
+		for i := range p.Validations {
+			v := &p.Validations[i]
+			u, ok := unitNamed(p.Units, v.From)
+			if !ok || u.DynamicUser {
+				continue
+			}
+			a, err := unitAccount(u, lk)
+			if err != nil {
+				return nil, fmt.Errorf("%s runs as an account that could not be looked up, so the new binary cannot be validated the way the service would run it: %w", u.Name, err)
+			}
+			if a == nil {
+				if a, err = lk.account("0", "", nil); err != nil {
+					return nil, err
+				}
+			}
+			if a.UID == uint32(euid) {
+				continue // the caller already is that user
+			}
+			v.account, v.User = a, a.Name
+			if a.UID == 0 {
+				v.User = "root"
+			}
+			rootReasons = append(rootReasons, fmt.Sprintf("validate %s as %s, the account %s runs as", v.Config, v.User, v.From))
+		}
+		return rootReasons, nil
 	}
 	byUnit := map[string]*caddybin.Account{}
 	dynamic := map[string]bool{}
@@ -596,7 +643,7 @@ func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lk lookups) 
 		}
 		a, err := unitAccount(u, lk)
 		if err != nil {
-			return fmt.Errorf("%s runs as an account that could not be looked up, so the new binary cannot be validated the way the service would run it: %w", u.Name, err)
+			return nil, fmt.Errorf("%s runs as an account that could not be looked up, so the new binary cannot be validated the way the service would run it: %w", u.Name, err)
 		}
 		if a == nil {
 			continue // plain root: the identity install already has
@@ -633,7 +680,16 @@ func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lk lookups) 
 			v.User = "root" // the unit runs as root
 		}
 	}
-	return nil
+	return nil, nil
+}
+
+func unitNamed(units []systemd.Unit, name string) (systemd.Unit, bool) {
+	for _, u := range units {
+		if u.Name == name {
+			return u, true
+		}
+	}
+	return systemd.Unit{}, false
 }
 
 // unitAccount resolves the account a unit's processes run as, the way
@@ -782,7 +838,7 @@ func removeCommand(o *pkgmgr.Owner) string {
 // needsRoot decides whether the install must run as root, and why.
 // restartCount is how many units will be restarted and unitNames their
 // comma-joined names for the message.
-func needsRoot(euid int, canWriteDir bool, dir string, restartCount int, unitNames string, hasCaps bool) (bool, []string) {
+func needsRoot(euid int, canWriteDir bool, dir string, restartCount int, unitNames string, hasCaps bool, extra []string) (bool, []string) {
 	var reasons []string
 	if !canWriteDir {
 		reasons = append(reasons, "write to "+dir)
@@ -793,6 +849,7 @@ func needsRoot(euid int, canWriteDir bool, dir string, restartCount int, unitNam
 	if hasCaps {
 		reasons = append(reasons, "re-apply file capabilities")
 	}
+	reasons = append(reasons, extra...)
 	return euid != 0 && len(reasons) > 0, reasons
 }
 
@@ -1014,7 +1071,12 @@ func validate(ctx context.Context, bin string, v Validation, logw io.Writer, ver
 func swapLockfile(target, newLock string) error {
 	lock := target + ".lock.json"
 	prev := lock + ".previous"
-	os.Remove(prev)
+	// A stale rollback copy that cannot be cleared would be taken for the
+	// previous lockfile by a later rollback, so the install stops here,
+	// before the live lockfile moves.
+	if err := os.Remove(prev); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing stale %s: %w", prev, err)
+	}
 	// Only "not there" means there is nothing to keep; any other failure
 	// to look would let the rename below overwrite a lockfile with no
 	// previous copy, so it stops the install instead.

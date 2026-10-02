@@ -168,23 +168,7 @@ func InspectAs(ctx context.Context, path string, as *Account) (*Info, error) {
 	}
 	std, nonstd, unknown := ParseListModules(listOut)
 	info.StandardCount = std
-	// Build info is the source of truth for versions and checksums; the
-	// version list-modules printed is only kept when build info has none.
-	for i := range nonstd {
-		if d, ok := deps[nonstd[i].Package]; ok {
-			nonstd[i].Sum = d.Sum
-			if d.Version != "" {
-				nonstd[i].Version = d.Version
-			}
-			if d.Replace != nil {
-				nonstd[i].Sum = d.Replace.Sum
-				nonstd[i].ReplaceVersion = d.Replace.Version
-				if nonstd[i].Replace == "" {
-					nonstd[i].Replace = d.Replace.Path
-				}
-			}
-		}
-	}
+	applyBuildInfo(nonstd, deps)
 	info.Plugins = nonstd
 	info.UnknownModules = unknown
 	owner, err := pkgmgr.Find(ctx, info.ResolvedPath)
@@ -193,6 +177,31 @@ func InspectAs(ctx context.Context, path string, as *Account) (*Info, error) {
 	}
 	info.Owner = owner
 	return info, nil
+}
+
+// applyBuildInfo overlays what build info records on the plugins parsed
+// from list-modules. Build info is the source of truth for versions,
+// checksums and replacements; the text output is only kept where build info
+// has nothing (a version it does not carry). A replacement path in
+// particular is always taken from build info: list-modules prints it on a
+// space-separated line, so a directory with a space in its name comes out
+// of the parser truncated, while build info has it whole.
+func applyBuildInfo(plugins []Plugin, deps map[string]*debug.Module) {
+	for i := range plugins {
+		d, ok := deps[plugins[i].Package]
+		if !ok {
+			continue
+		}
+		plugins[i].Sum = d.Sum
+		if d.Version != "" {
+			plugins[i].Version = d.Version
+		}
+		if d.Replace != nil {
+			plugins[i].Sum = d.Replace.Sum
+			plugins[i].Replace = d.Replace.Path
+			plugins[i].ReplaceVersion = d.Replace.Version
+		}
+	}
 }
 
 func listModules(ctx context.Context, bin string, as *Account) (string, error) {
