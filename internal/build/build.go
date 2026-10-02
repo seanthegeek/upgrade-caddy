@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -67,12 +68,13 @@ const (
 
 // Plugin is one module the new binary will carry.
 type Plugin struct {
-	ModuleID  string `json:"module_id,omitempty"`
-	Package   string `json:"package"`
-	Version   string `json:"version"`
-	Installed string `json:"installed,omitempty"` // version in the source binary, if it was there
-	Source    Source `json:"source"`
-	Note      string `json:"note,omitempty"`
+	ModuleID  string   `json:"module_id,omitempty"`  // the first Caddy module ID the Go module registers
+	ModuleIDs []string `json:"module_ids,omitempty"` // every Caddy module ID it registers; any of them names it to --upgrade and --drop-replace
+	Package   string   `json:"package"`
+	Version   string   `json:"version"`
+	Installed string   `json:"installed,omitempty"` // version in the source binary, if it was there
+	Source    Source   `json:"source"`
+	Note      string   `json:"note,omitempty"`
 
 	replacedBy string // replacement recorded in the source binary; must be covered by --replace
 }
@@ -84,7 +86,8 @@ type Plan struct {
 	CaddyVersion   string           `json:"caddy_version"`
 	Plugins        []Plugin         `json:"plugins"`
 	Replacements   []xcaddy.Replace `json:"replacements,omitempty"`
-	CaddyNote      string           `json:"caddy_note,omitempty"` // for example, that an installed replacement of Caddy is dropped
+	CaddyNote      string           `json:"caddy_note,omitempty"`  // for example, that an installed replacement of Caddy is dropped
+	AllowMajor     bool             `json:"allow_major,omitempty"` // --allow-major was given, so verify lets a branch or commit resolve to another major
 	Output         string           `json:"output"`
 	HostGoVersion  string           `json:"host_go_version,omitempty"` // the go on PATH; the build may auto-fetch a newer one
 }
@@ -215,12 +218,15 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 			if ip.Package == "" || ip.Version == "" {
 				return nil, fmt.Errorf("plugin %s in %s has no module path or version in build info; cannot pin it", ip.ModuleID, src.Path)
 			}
-			if _, dup := index[ip.Package]; dup {
-				continue // several Caddy modules from one Go module
+			if i, dup := index[ip.Package]; dup {
+				// Several Caddy modules from one Go module: pinned once,
+				// but every ID still names it.
+				p.Plugins[i].ModuleIDs = append(p.Plugins[i].ModuleIDs, ip.ModuleID)
+				continue
 			}
 			index[ip.Package] = len(p.Plugins)
 			p.Plugins = append(p.Plugins, Plugin{
-				ModuleID: ip.ModuleID, Package: ip.Package, Version: ip.Version,
+				ModuleID: ip.ModuleID, ModuleIDs: []string{ip.ModuleID}, Package: ip.Package, Version: ip.Version,
 				Installed: ip.Version, Source: Pinned, replacedBy: ip.Replace,
 			})
 		}
@@ -366,6 +372,8 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		return nil, fmt.Errorf("%s was built with Caddy itself replaced (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version> to keep one, --drop-replace %s to build upstream Caddy instead, or --fresh to build without the installed binary", src.Path, replacedBy(src.MainReplace, src.MainReplaceVer), src.MainPath, src.MainPath)
 	}
 
+	p.AllowMajor = opts.AllowMajor
+
 	// Output path. Never the binary we are reproducing.
 	out := opts.Output
 	if out == "" {
@@ -392,9 +400,11 @@ func crossesMajor(installed, candidate string) bool {
 	return a >= 0 && b >= 0 && a != b
 }
 
+// find names a plugin by its Go module path or by any Caddy module ID it
+// registers.
 func find(plugins []Plugin, name string) (int, bool) {
 	for i, pl := range plugins {
-		if pl.Package == name || pl.ModuleID == name {
+		if pl.Package == name || pl.ModuleID == name || slices.Contains(pl.ModuleIDs, name) {
 			return i, true
 		}
 	}
@@ -453,7 +463,9 @@ func (p *Plan) WriteText(w io.Writer) {
 				ver = pl.Installed + " -> " + pl.Version
 			}
 			line := fmt.Sprintf("  %-40s %s (%s)", pl.Package, ver, pl.Source)
-			if pl.ModuleID != "" {
+			if ids := pl.ModuleIDs; len(ids) > 0 {
+				line = fmt.Sprintf("  %-40s %s (%s, %s)", pl.Package, ver, pl.Source, strings.Join(ids, ", "))
+			} else if pl.ModuleID != "" {
 				line = fmt.Sprintf("  %-40s %s (%s, %s)", pl.Package, ver, pl.Source, pl.ModuleID)
 			}
 			if pl.Note != "" {
@@ -598,24 +610,59 @@ func (p *Plan) verify(built *caddybin.Info) error {
 		if semver.Major(pl.Version) >= 0 && got != pl.Version {
 			return fmt.Errorf("plugin %s is %s, wanted %s", pl.Package, got, pl.Version)
 		}
+		// A branch or commit is resolved by go get, and on a bare module
+		// path (v0, v1, +incompatible) it can resolve to another major,
+		// which Resolve could not see. The same --allow-major rule applies
+		// to the resolved version.
+		if semver.Major(pl.Version) < 0 && pl.Installed != "" && !p.AllowMajor && crossesMajor(pl.Installed, got) {
+			return fmt.Errorf("plugin %s: %s resolved to %s, a different major from the installed %s; pass --allow-major to do this deliberately", pl.Package, pl.Version, got, pl.Installed)
+		}
 	}
 	// Replacements: every one requested must be in effect, and nothing may
 	// be replaced that was not requested. Only this build's go.mod can
 	// introduce a replacement (Go ignores replace directives in
-	// dependencies), so the two lists must agree exactly.
+	// dependencies), so the two lists must agree exactly, across every
+	// module in the output: a --replace for a module that registers no
+	// Caddy module, or for a mistyped path, is checked like any other.
 	want := map[string]string{}
 	for _, r := range p.Replacements {
 		want[string(r.Old)] = string(r.New)
 	}
-	if err := replacementMatches(built.MainPath, want[built.MainPath], replacedBy(built.MainReplace, built.MainReplaceVer)); err != nil {
+	checked := map[string]bool{}
+	check := func(pkg, got string) error {
+		checked[pkg] = true
+		return replacementMatches(pkg, want[pkg], got)
+	}
+	if err := check(built.MainPath, replacedBy(built.MainReplace, built.MainReplaceVer)); err != nil {
 		return err
 	}
 	for _, bp := range built.Plugins {
-		if err := replacementMatches(bp.Package, want[bp.Package], replacedBy(bp.Replace, bp.ReplaceVersion)); err != nil {
+		if err := check(bp.Package, replacedBy(bp.Replace, bp.ReplaceVersion)); err != nil {
 			return err
 		}
 	}
+	for _, path := range sortedKeys(built.Replacements) {
+		if !checked[path] {
+			if err := check(path, built.Replacements[path]); err != nil {
+				return err
+			}
+		}
+	}
+	for _, old := range sortedKeys(want) {
+		if !checked[old] {
+			return fmt.Errorf("%s is not replaced in the output; --replace %s=%s did not take effect (no module by that path is in this build; check the spelling)", old, old, want[old])
+		}
+	}
 	return nil
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // replacementMatches compares the replacement asked for (as passed to

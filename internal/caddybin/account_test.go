@@ -44,6 +44,12 @@ func TestLookupAccount(t *testing.T) {
 	if _, err := LookupAccount("root", "", []string{"no-such-group-upgrade-caddy"}); err == nil {
 		t.Error("unknown supplementary group must be an error")
 	}
+	if gid, err := LookupGroup("0"); err != nil || gid != 0 {
+		t.Errorf("LookupGroup by ID: %d %v", gid, err)
+	}
+	if _, err := LookupGroup("no-such-group-upgrade-caddy"); err == nil {
+		t.Error("LookupGroup of an unknown group must be an error")
+	}
 }
 
 func TestApply(t *testing.T) {
@@ -55,6 +61,20 @@ func TestApply(t *testing.T) {
 	self := &Account{Name: "self", UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
 	if err := self.Apply(cmd); err != nil || cmd.SysProcAttr != nil {
 		t.Errorf("the current account must leave the command alone: %v %+v", err, cmd)
+	}
+	// The same user and group with the process's own supplementary groups
+	// is still the current identity; with different ones it is not.
+	groups, _ := os.Getgroups()
+	for _, g := range groups {
+		self.Groups = append(self.Groups, uint32(g))
+	}
+	if err := self.Apply(cmd); err != nil || cmd.SysProcAttr != nil {
+		t.Errorf("the current groups must leave the command alone: %v %+v", err, cmd)
+	}
+	withGroup := *self
+	withGroup.Groups = append([]uint32{1 << 20}, withGroup.Groups...)
+	if err := withGroup.Apply(cmd); os.Geteuid() != 0 && (err == nil || !strings.Contains(err.Error(), "requires root")) {
+		t.Errorf("a different group list is a different identity: %v", err)
 	}
 	other := &Account{Name: "other", UID: self.UID + 1, GID: self.GID, Home: "/srv/other"}
 	err := other.Apply(cmd)

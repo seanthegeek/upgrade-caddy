@@ -100,7 +100,10 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    `--with` naming a different major's module path, which is a new source
    outright; the old path's replacement cannot apply and is dropped with a
    note. `verify` checks the output carries exactly the replacements asked
-   for, no more and no fewer.
+   for, no more and no fewer, across every module in the build (the
+   binary's full replacement list, read from build info), not just Caddy
+   and the plugins that register Caddy modules, so a `--replace` for a
+   plain dependency or a mistyped path is caught too.
 3. **A newer major version always counts as an update, but is never
    crossed automatically.** Caddy has never backported security fixes to a
    previous major, so `check` treats a newer major as "outdated" and exits
@@ -111,7 +114,12 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    v1 and `vN+incompatible` alike, so the installed version's major, not
    the path's, decides what counts as "newer major" and where probing
    starts. A gopkg.in path spells its major out, `.v0` included, and
-   `.v0` is major 0, so that `.v1` counts as newer.
+   `.v0` is major 0, so that `.v1` counts as newer. A branch or commit
+   given to `--with` is resolved by `go get` after `Resolve` has run, so
+   `verify` applies the same rule to the resolved version: on a bare path
+   it may not land in another major than the installed one without
+   `--allow-major`. A `vN+incompatible` release on the bare path and a
+   `/vN` module path are one major, counted once by `check`.
 4. **Never use Caddy's download/build server.** Builds go through the xcaddy
    library on the local machine. The build server is the thing upstream is
    removing.
@@ -280,9 +288,17 @@ These are implemented in `internal/install`; keep them true.
   plainly; `validate` runs as the unit's `User=`, `Group=` and
   `SupplementaryGroups=` (a `caddybin.Account`, resolved through
   `os/user`), because that is who opens the config at runtime. A unit
-  without `User=` runs as root and is validated as root; a `DynamicUser=`
-  unit, whose account exists only while it runs, is validated as the
-  inspection account; a unit user that cannot be looked up is a refusal.
+  without `User=` runs as root and is validated as root, with its
+  `Group=` and exactly its `SupplementaryGroups=` when it sets them and
+  nothing from the group database, which is what systemd does
+  (`get_supplementary_groups` in `src/core/exec-invoke.c`, v255; a root
+  service with a restricted capability set reads files by its groups
+  like anyone else); a `DynamicUser=` unit, whose account exists only
+  while it runs, is validated as the inspection account; a unit user or
+  group that cannot be looked up is a refusal. `Account.Apply` treats a
+  different supplementary group list as a different identity. A Go
+  module that registers several Caddy modules is named to `--upgrade`
+  and `--drop-replace` by any of its IDs.
   The staged copy and the build output are made executable before they
   are inspected so another account can run them, and a unit whose user
   changed between `Resolve` and the swap fails `recheck`.

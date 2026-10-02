@@ -56,6 +56,7 @@ type Info struct {
 	MainReplace    string            `json:"main_replace,omitempty"`         // replacement path when Caddy itself was replaced
 	MainReplaceVer string            `json:"main_replace_version,omitempty"` // version of that replacement, if it is a module
 	HasModuleInfo  bool              `json:"has_module_info"`                // false for distro-style builds
+	Replacements   map[string]string `json:"replacements,omitempty"`         // every replace directive in effect: module path -> replacement path, "@version" appended when it is a module
 	Plugins        []Plugin          `json:"plugins"`                        // non-standard modules
 	UnknownModules []Plugin          `json:"unknown_modules,omitempty"`
 	StandardCount  int               `json:"standard_count"`
@@ -123,6 +124,16 @@ func InspectAs(ctx context.Context, path string, as *Account) (*Info, error) {
 	deps := map[string]*debug.Module{}
 	for _, d := range bi.Deps {
 		deps[d.Path] = d
+		if d.Replace != nil {
+			if info.Replacements == nil {
+				info.Replacements = map[string]string{}
+			}
+			repl := d.Replace.Path
+			if d.Replace.Version != "" {
+				repl += "@" + d.Replace.Version
+			}
+			info.Replacements[d.Path] = repl
+		}
 		if IsCaddyModule(d.Path) {
 			info.HasModuleInfo = true
 			info.MainPath = d.Path

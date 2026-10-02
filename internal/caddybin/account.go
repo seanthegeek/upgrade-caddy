@@ -83,16 +83,16 @@ func LookupAccount(name, group string, extra []string) (*Account, error) {
 	return a, nil
 }
 
-// Apply makes cmd run as the account. When the account is the current user
-// nothing changes. Otherwise the process must be root, and the child then
-// gets the account's user, group and supplementary groups, with HOME, USER
-// and LOGNAME naming the account the way systemd sets them for a User=
-// service; the rest of the environment is inherited. A nil account means
-// the current user.
+// Apply makes cmd run as the account. When the account is the current
+// identity, supplementary groups included, nothing changes. Otherwise the
+// process must be root, and the child then gets the account's user, group
+// and supplementary groups (an empty group list is left as inherited, which
+// is what systemd does for a service that sets none), with HOME, USER and
+// LOGNAME naming the account the way systemd sets them for a User= service;
+// the rest of the environment is inherited. A nil account means the current
+// user.
 func (a *Account) Apply(cmd *exec.Cmd) error {
-	// Compared as uint32: an ID never exceeds 32 bits, while int is 32 bits
-	// on some targets, so widening the process's IDs is the safe direction.
-	if a == nil || (a.UID == uint32(os.Geteuid()) && a.GID == uint32(os.Getegid())) {
+	if a == nil || a.isCurrent() {
 		return nil
 	}
 	if os.Geteuid() != 0 {
@@ -101,7 +101,7 @@ func (a *Account) Apply(cmd *exec.Cmd) error {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: a.UID, Gid: a.GID, Groups: a.Groups}
+	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: a.UID, Gid: a.GID, Groups: a.Groups, NoSetGroups: len(a.Groups) == 0}
 	env := cmd.Env
 	if env == nil {
 		env = os.Environ()
@@ -128,6 +128,40 @@ func (a *Account) environ(env []string) []string {
 	return kept
 }
 
+// isCurrent reports whether the account is the identity the process already
+// has: user, group and, when the account lists any, supplementary groups.
+// IDs are compared as uint32, since an ID never exceeds 32 bits while int
+// is 32 bits on some targets.
+func (a *Account) isCurrent() bool {
+	if a.UID != uint32(os.Geteuid()) || a.GID != uint32(os.Getegid()) {
+		return false
+	}
+	if len(a.Groups) == 0 {
+		return true
+	}
+	have, err := os.Getgroups()
+	if err != nil {
+		return false
+	}
+	return sameSet(a.Groups, have)
+}
+
+// sameSet reports whether two group lists hold the same IDs, in any order.
+func sameSet(want []uint32, have []int) bool {
+	set := map[uint32]bool{}
+	for _, g := range want {
+		set[g] = true
+	}
+	seen := map[uint32]bool{}
+	for _, g := range have {
+		if g < 0 || !set[uint32(g)] {
+			return false
+		}
+		seen[uint32(g)] = true
+	}
+	return len(seen) == len(set)
+}
+
 // String names the account for a plan: "caddy (uid 999)".
 func (a *Account) String() string {
 	if a == nil {
@@ -135,6 +169,9 @@ func (a *Account) String() string {
 	}
 	return fmt.Sprintf("%s (uid %d)", a.Name, a.UID)
 }
+
+// LookupGroup resolves a group name or numeric ID to its ID.
+func LookupGroup(name string) (uint32, error) { return lookupGroup(name) }
 
 func lookupGroup(name string) (uint32, error) {
 	var (

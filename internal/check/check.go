@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -151,11 +152,19 @@ func resolveStatus(ctx context.Context, proxy *goproxy.Client, s *Status) {
 	}
 	if len(majors) > 0 {
 		newest := majors[len(majors)-1]
-		behind := len(majors)
+		s.MajorAvailable = &Major{Package: newest.Path, Version: newest.Version, Behind: len(majors)}
 		if samePathMajor {
-			behind++
+			// A vN+incompatible release on the bare path and a /vN module
+			// path are the same major; count it once, and report whichever
+			// path holds the highest major.
+			m := semver.Major(s.Latest)
+			if !slices.ContainsFunc(majors, func(x goproxy.MajorVersion) bool { return x.Major == m }) {
+				s.MajorAvailable.Behind++
+			}
+			if m > newest.Major {
+				s.MajorAvailable.Package, s.MajorAvailable.Version = s.Package, s.Latest
+			}
 		}
-		s.MajorAvailable = &Major{Package: newest.Path, Version: newest.Version, Behind: behind}
 		s.Outdated = true
 	}
 }

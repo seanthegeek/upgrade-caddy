@@ -346,6 +346,24 @@ func TestVerifyReplacements(t *testing.T) {
 	if err := p.verify(&forkedCaddy); err == nil {
 		t.Error("a replacement by a different module must fail")
 	}
+	// Replacements of modules that register no Caddy module are checked
+	// through the output's full replacement list: a requested one must be
+	// in effect, an unrequested one is refused, and a path that is in no
+	// module of the build at all did not take effect.
+	dep := "github.com/example/dep"
+	p.Replacements = []xcaddy.Replace{xcaddy.NewReplace(dep, "/srv/dep")}
+	withDep := *plain
+	withDep.Replacements = map[string]string{dep: "/srv/dep"}
+	if err := p.verify(&withDep); err != nil {
+		t.Errorf("replacement of a non-registering dependency in effect: %v", err)
+	}
+	if err := p.verify(plain); err == nil || !strings.Contains(err.Error(), "did not take effect") || !strings.Contains(err.Error(), "check the spelling") {
+		t.Errorf("a replacement for a module not in the build must fail: %v", err)
+	}
+	p.Replacements = nil
+	if err := p.verify(&withDep); err == nil || !strings.Contains(err.Error(), "not asked for") {
+		t.Errorf("an unrequested replacement of a dependency must fail: %v", err)
+	}
 }
 
 func TestResolveRefusesOutputOverInstalled(t *testing.T) {
@@ -380,6 +398,25 @@ func TestVerify(t *testing.T) {
 	p.Plugins[0].Version = "main"
 	if err := p.verify(good); err != nil {
 		t.Errorf("non-semver version should only check presence: %v", err)
+	}
+	// Unless the branch resolved to another major on the same bare path,
+	// which Resolve could not see: that still needs --allow-major.
+	p.Plugins[0].Installed = "v0.2.1"
+	if err := p.verify(good); err != nil {
+		t.Errorf("branch resolved within the installed major: %v", err)
+	}
+	crossed := &caddybin.Info{HasModuleInfo: true, MainVersion: "v2.11.6", Plugins: []caddybin.Plugin{{Package: "github.com/caddy-dns/cloudflare", Version: "v1.0.0-0.20260101000000-abcdefabcdef"}}}
+	if err := p.verify(crossed); err == nil || !strings.Contains(err.Error(), "--allow-major") {
+		t.Errorf("branch resolved to another major must fail without --allow-major: %v", err)
+	}
+	p.AllowMajor = true
+	if err := p.verify(crossed); err != nil {
+		t.Errorf("--allow-major lets the branch cross: %v", err)
+	}
+	p.AllowMajor = false
+	p.Plugins[0].Installed = "" // a fresh addition has no major to keep
+	if err := p.verify(crossed); err != nil {
+		t.Errorf("no installed version, nothing to compare: %v", err)
 	}
 }
 
@@ -427,8 +464,24 @@ func TestResolveOneGoModuleSeveralCaddyModules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Plugins) != 1 || p.Plugins[0].ModuleID != "layer4" {
-		t.Errorf("want one pinned Go module keeping the first module ID, got %+v", p.Plugins)
+	if len(p.Plugins) != 1 || p.Plugins[0].ModuleID != "layer4" || len(p.Plugins[0].ModuleIDs) != 3 {
+		t.Errorf("want one pinned Go module keeping every module ID, got %+v", p.Plugins)
+	}
+	// Any of the IDs names the module to --upgrade and --drop-replace, not
+	// just the first one list-modules printed.
+	p, err = resolve(t, src, Options{Upgrade: []string{"layer4.handlers.proxy"}})
+	if err != nil || p.Plugins[0].Note != "already at latest" {
+		t.Errorf("--upgrade by a later module ID: %v %+v", err, p.Plugins)
+	}
+	src.Plugins[0].Replace, src.Plugins[1].Replace, src.Plugins[2].Replace = "/srv/l4", "/srv/l4", "/srv/l4"
+	p, err = resolve(t, src, Options{DropReplace: []string{"layer4.matchers.tls"}})
+	if err != nil || len(p.Replacements) != 0 || !strings.Contains(p.Plugins[0].Note, "dropped") {
+		t.Errorf("--drop-replace by a later module ID: %v %+v", err, p.Plugins)
+	}
+	var text strings.Builder
+	p.WriteText(&text)
+	if !strings.Contains(text.String(), "layer4, layer4.handlers.proxy, layer4.matchers.tls") {
+		t.Errorf("the plan should list every module ID:\n%s", text.String())
 	}
 }
 

@@ -90,7 +90,8 @@ changes unless you say so:
 
 - `--upgrade MODULE` bumps one plugin to its latest version within its
   major. `MODULE` is a Go module path or a Caddy module ID such as
-  `dns.providers.cloudflare`. Repeatable.
+  `dns.providers.cloudflare` (any of the IDs a Go module registers names
+  it). Repeatable.
 - `--upgrade-all` bumps every plugin.
 - `--with MODULE[@VERSION]` adds a plugin, or overrides the version of one
   already present. Without a version the latest is used.
@@ -102,7 +103,9 @@ changes unless you say so:
   for the module proxy's code is a change nobody reviewed.
 - `--allow-major` is required for `--caddy-version` or `--with` to move
   anything to a different major version. Plugins built for one major do not
-  compile against the next, so this is always a deliberate step.
+  compile against the next, so this is always a deliberate step. A branch
+  or commit given to `--with` is resolved by `go get` during the build,
+  so the resolved version is checked against the same rule afterwards.
 - `--fresh` ignores the installed binary. The plugin set is then only what
   `--with` gives, which is how you build a first custom binary on a machine
   running a distribution package.
@@ -175,8 +178,9 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    `User=`, `Group=` and `SupplementaryGroups=`), so the config is read
    exactly as the service will read it. A unit without `User=` runs as
    root and is validated as root, which is no more than the service itself
-   does; a `--config` given on the command line is validated as the user
-   who invoked `sudo`. A rejected config stops everything before anything
+   does, with its `Group=` and `SupplementaryGroups=` still applied when
+   it sets them; a `--config` given on the command line is validated as
+   the user who invoked `sudo`. A rejected config stops everything before anything
    changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the

@@ -111,6 +111,22 @@ func TestResolveStatus(t *testing.T) {
 	if s.Outdated || s.MajorAvailable != nil {
 		t.Errorf("v2+incompatible must not see /v2 as a newer major: %+v", s)
 	}
+	// v2+incompatible on the bare path and a /v2 module path are the same
+	// major: one newer major, reported at its module path.
+	p = fakeProxy(t, map[string]string{"/example.com/m/@latest": "v2.0.0+incompatible", "/example.com/m/v2/@latest": "v2.3.0"})
+	s = Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}
+	resolveStatus(ctx, p, &s)
+	if !s.Outdated || s.MajorAvailable == nil || s.MajorAvailable.Behind != 1 || s.MajorAvailable.Package != "example.com/m/v2" || s.MajorAvailable.Version != "v2.3.0" {
+		t.Errorf("v2+incompatible and /v2 are one major: %+v", s.MajorAvailable)
+	}
+	// A v3+incompatible on the bare path beyond a /v2 module path is a
+	// second major, and the newest one.
+	p = fakeProxy(t, map[string]string{"/example.com/m/@latest": "v3.0.0+incompatible", "/example.com/m/v2/@latest": "v2.3.0"})
+	s = Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}
+	resolveStatus(ctx, p, &s)
+	if s.MajorAvailable == nil || s.MajorAvailable.Behind != 2 || s.MajorAvailable.Package != "example.com/m" || s.MajorAvailable.Version != "v3.0.0+incompatible" {
+		t.Errorf("v3+incompatible beyond /v2: %+v", s.MajorAvailable)
+	}
 	// Current within the major, newer major available: outdated.
 	p = fakeProxy(t, map[string]string{"/example.com/m/@latest": "v1.0.0", "/example.com/m/v2/@latest": "v2.0.0"})
 	s = Status{Name: "m", Package: "example.com/m", Installed: "v1.0.0"}

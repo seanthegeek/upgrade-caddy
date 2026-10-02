@@ -413,7 +413,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	}
 	// Who runs the new binary before it is installed. Decided here, once,
 	// so the plan shows it and Run cannot drift from it.
-	if err := p.chooseAccounts(os.Geteuid(), os.Getenv, caddybin.LookupAccount); err != nil {
+	if err := p.chooseAccounts(os.Geteuid(), os.Getenv, realLookups); err != nil {
 		return nil, err
 	}
 
@@ -554,6 +554,15 @@ func validationsFromUnits(units []systemd.Unit) []Validation {
 	return out
 }
 
+// lookups are the account and group lookups chooseAccounts uses, injected
+// so the decision can be tested without the host's user database.
+type lookups struct {
+	account func(name, group string, extra []string) (*caddybin.Account, error)
+	group   func(name string) (uint32, error)
+}
+
+var realLookups = lookups{account: caddybin.LookupAccount, group: caddybin.LookupGroup}
+
 // chooseAccounts decides who runs the new binary for inspection and
 // validation. Only root can switch accounts, and when install runs as root
 // a binary it has not installed yet should run as anyone else who is known
@@ -562,16 +571,18 @@ func validationsFromUnits(units []systemd.Unit) []Validation {
 //   - a unit's config is validated as the unit's User=, with its Group= and
 //     SupplementaryGroups=, which is exactly who opens the config when the
 //     service runs. A unit without User= runs as root, so validating as
-//     root is no more than the service itself does. A DynamicUser= account
-//     exists only while its unit runs, so that unit is validated as the
-//     inspection account instead.
+//     root is no more than the service itself does; if it sets Group= or
+//     SupplementaryGroups= those still apply, since a root service with a
+//     restricted capability set reads files by its groups like anyone
+//     else. A DynamicUser= account exists only while its unit runs, so
+//     that unit is validated as the inspection account instead.
 //   - inspection (`version`, `list-modules`), and a --config validation
 //     with no unit behind it, run as the user who invoked sudo, else as the
-//     first unit's user, else as root; the plan says which.
+//     first unit's non-root user, else as root; the plan says which.
 //
 // A unit user that cannot be looked up is a refusal, not a fall back to
 // root: validating as the wrong account answers a different question.
-func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lookup func(name, group string, extra []string) (*caddybin.Account, error)) error {
+func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lk lookups) error {
 	if euid != 0 {
 		return nil // only root can switch accounts, and only root has anything to drop
 	}
@@ -583,22 +594,19 @@ func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lookup func(
 			dynamic[u.Name] = true
 			continue
 		}
-		if u.User == "" {
-			continue // runs as root
-		}
-		a, err := lookup(u.User, u.Group, u.SupplementaryGroups)
+		a, err := unitAccount(u, lk)
 		if err != nil {
 			return fmt.Errorf("%s runs as an account that could not be looked up, so the new binary cannot be validated the way the service would run it: %w", u.Name, err)
 		}
-		if a.UID == 0 {
-			continue // User=root, under whatever name
+		if a == nil {
+			continue // plain root: the identity install already has
 		}
 		byUnit[u.Name] = a
-		if firstUser == nil {
+		if a.UID != 0 && firstUser == nil {
 			firstUser = a
 		}
 	}
-	inspect, how := invoker(getenv, lookup)
+	inspect, how := invoker(getenv, lk.account)
 	if inspect == nil && firstUser != nil {
 		inspect, how = firstUser, "the service user"
 	}
@@ -613,6 +621,9 @@ func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lookup func(
 		switch a, ok := byUnit[v.From]; {
 		case ok:
 			v.account, v.User = a, a.Name
+			if a.UID == 0 {
+				v.User = "root"
+			}
 		case v.From == "--config" || dynamic[v.From]:
 			v.account, v.User = inspect, "root"
 			if inspect != nil {
@@ -623,6 +634,42 @@ func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lookup func(
 		}
 	}
 	return nil
+}
+
+// unitAccount resolves the account a unit's processes run as, the way
+// systemd does (src/core/exec-invoke.c, get_supplementary_groups, v255):
+// with User= set, the user's primary group (or Group=), the user's groups
+// from the group database and SupplementaryGroups=; without User=, root
+// with Group= when set and exactly SupplementaryGroups= as the
+// supplementary groups, nothing from the group database. nil means plain
+// root with nothing set, which needs no switching. A User= naming an
+// account with uid 0 is root under another name and is treated the same.
+func unitAccount(u systemd.Unit, lk lookups) (*caddybin.Account, error) {
+	if u.User != "" {
+		a, err := lk.account(u.User, u.Group, u.SupplementaryGroups)
+		if err != nil {
+			return nil, err
+		}
+		if a.UID != 0 {
+			return a, nil
+		}
+	}
+	if u.Group == "" && len(u.SupplementaryGroups) == 0 {
+		return nil, nil
+	}
+	a, err := lk.account("0", u.Group, nil)
+	if err != nil {
+		return nil, err
+	}
+	a.Groups = nil
+	for _, g := range u.SupplementaryGroups {
+		gid, err := lk.group(g)
+		if err != nil {
+			return nil, err
+		}
+		a.Groups = append(a.Groups, gid)
+	}
+	return a, nil
 }
 
 // invoker is the user who ran sudo, from the SUDO_UID, SUDO_GID and
