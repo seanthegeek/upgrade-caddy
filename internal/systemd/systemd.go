@@ -28,16 +28,19 @@ type Command struct {
 
 // Unit is a systemd service that runs the binary of interest.
 type Unit struct {
-	Name             string    `json:"name"`
-	ExecStart        string    `json:"exec_start"`                  // every ExecStart= line, newline-joined
-	Commands         []Command `json:"commands,omitempty"`          // every ExecStart= command, in order
-	Args             []string  `json:"args,omitempty"`              // argv of the command that runs the binary of interest (the first, until matched)
-	WorkingDirectory string    `json:"working_directory,omitempty"` // resolved by UnitsUsing: "/" when unset, the user's home for "~"
-	User             string    `json:"user,omitempty"`              // User=, as given (name or numeric ID)
-	ExecSearchPath   []string  `json:"exec_search_path,omitempty"`  // ExecSearchPath=, the directories a bare executable name is looked up in
-	MainPID          int       `json:"main_pid,omitempty"`
-	ActiveState      string    `json:"active_state"`
-	SubState         string    `json:"sub_state"`
+	Name                string    `json:"name"`
+	ExecStart           string    `json:"exec_start"`                     // every ExecStart= line, newline-joined
+	Commands            []Command `json:"commands,omitempty"`             // every ExecStart= command, in order
+	Args                []string  `json:"args,omitempty"`                 // argv of the command that runs the binary of interest (the first, until matched)
+	WorkingDirectory    string    `json:"working_directory,omitempty"`    // resolved by UnitsUsing: "/" when unset, the user's home for "~"
+	User                string    `json:"user,omitempty"`                 // User=, as given (name or numeric ID); "" is root
+	Group               string    `json:"group,omitempty"`                // Group=, as given; "" is the user's primary group
+	SupplementaryGroups []string  `json:"supplementary_groups,omitempty"` // SupplementaryGroups=
+	DynamicUser         bool      `json:"dynamic_user,omitempty"`         // DynamicUser=yes: the account exists only while the unit runs
+	ExecSearchPath      []string  `json:"exec_search_path,omitempty"`     // ExecSearchPath=, the directories a bare executable name is looked up in
+	MainPID             int       `json:"main_pid,omitempty"`
+	ActiveState         string    `json:"active_state"`
+	SubState            string    `json:"sub_state"`
 }
 
 // ConfigArgs reads the Caddy config flags out of the unit's command line:
@@ -71,7 +74,7 @@ func (u Unit) ConfigArgs() (config, adapter string, envfiles []string) {
 	return config, adapter, envfiles
 }
 
-const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p User -p ExecSearchPath -p MainPID"
+const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p User -p Group -p SupplementaryGroups -p DynamicUser -p ExecSearchPath -p MainPID"
 
 // defaultSearchPathCompat is systemd's compiled-in executable search path
 // on a split-/usr system (DEFAULT_PATH_COMPAT in src/basic/path-util.h);
@@ -389,6 +392,12 @@ func parseShow(out string) []Unit {
 				u.WorkingDirectory = strings.TrimPrefix(v, "!")
 			case "User":
 				u.User = v
+			case "Group":
+				u.Group = v
+			case "SupplementaryGroups":
+				u.SupplementaryGroups = strings.Fields(v)
+			case "DynamicUser":
+				u.DynamicUser = v == "yes"
 			case "ExecSearchPath":
 				// Rendered space-separated; UnitsUsing re-reads it over
 				// D-Bus for a matched unit, where a directory with a space

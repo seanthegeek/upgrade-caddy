@@ -212,34 +212,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	}
 	r.Warnings = append(r.Warnings, ownershipWarnings(bin)...)
 
-	// Caddy itself.
-	installed := bin.MainVersion
-	if installed == "" {
-		installed = semver.Canonical(bin.Version)
-	}
-	caddyPath := bin.MainPath
-	if caddyPath == "" {
-		caddyPath = caddybin.CaddyModulePath
-	}
-	r.Caddy = Status{Name: "caddy", Package: caddyPath, Installed: installed, PseudoVersion: semver.IsPseudo(installed)}
-
-	// Latest lookups: Caddy plus every plugin with a known package.
-	r.Plugins = make([]Status, len(bin.Plugins))
-	rows := []*Status{&r.Caddy}
-	for i, p := range bin.Plugins {
-		r.Plugins[i] = Status{Name: p.ModuleID, Package: p.Package, Installed: p.Version, PseudoVersion: semver.IsPseudo(p.Version)}
-		switch {
-		case p.Error != "":
-			r.Plugins[i].Error = p.Error
-		case p.Replace != "":
-			r.Plugins[i].Note = "replaced by " + p.Replace + "; not checked"
-		case p.Package == "" || p.Version == "":
-			r.Plugins[i].Note = "no module info; not checked"
-		default:
-			rows = append(rows, &r.Plugins[i])
-		}
-	}
-	lookupAll(ctx, proxy, rows)
+	lookupAll(ctx, proxy, statusRows(r, bin))
 	r.UpdatesAvailable = r.anyOutdated()
 	r.HasErrors = r.anyErrors()
 
@@ -254,6 +227,56 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 			behind, m.Version, m.Package))
 	}
 	return r, nil
+}
+
+// statusRows fills in the report's Caddy and plugin rows from the binary
+// and returns the rows whose latest version can be looked up. A module
+// replaced at build time (a fork, a local checkout) is not the code that
+// the original module's version names, so it is reported as "not checked"
+// instead of being compared with upstream releases. That goes for Caddy
+// itself as much as for a plugin: an xcaddy build can replace Caddy too.
+func statusRows(r *Report, bin *caddybin.Info) []*Status {
+	installed := bin.MainVersion
+	if installed == "" {
+		installed = semver.Canonical(bin.Version)
+	}
+	caddyPath := bin.MainPath
+	if caddyPath == "" {
+		caddyPath = caddybin.CaddyModulePath
+	}
+	r.Caddy = Status{Name: "caddy", Package: caddyPath, Installed: installed, PseudoVersion: semver.IsPseudo(installed)}
+	var rows []*Status
+	if bin.MainReplace != "" {
+		r.Caddy.Note = replacedNote(bin.MainReplace, bin.MainReplaceVer)
+	} else {
+		rows = append(rows, &r.Caddy)
+	}
+
+	r.Plugins = make([]Status, len(bin.Plugins))
+	for i, p := range bin.Plugins {
+		r.Plugins[i] = Status{Name: p.ModuleID, Package: p.Package, Installed: p.Version, PseudoVersion: semver.IsPseudo(p.Version)}
+		switch {
+		case p.Error != "":
+			r.Plugins[i].Error = p.Error
+		case p.Replace != "":
+			r.Plugins[i].Note = replacedNote(p.Replace, p.ReplaceVersion)
+		case p.Package == "" || p.Version == "":
+			r.Plugins[i].Note = "no module info; not checked"
+		default:
+			rows = append(rows, &r.Plugins[i])
+		}
+	}
+	return rows
+}
+
+// replacedNote words the "not checked" note for a replaced module, naming
+// the replacement and its version when the replacement is a module rather
+// than a directory.
+func replacedNote(path, version string) string {
+	if version != "" {
+		path += "@" + version
+	}
+	return "replaced by " + path + "; not checked"
 }
 
 // WriteJSON prints the report as indented JSON.

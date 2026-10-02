@@ -85,6 +85,14 @@ func Find(explicit string) (string, error) {
 // Inspect reads build info from the file and runs the binary to list its
 // modules.
 func Inspect(ctx context.Context, path string) (*Info, error) {
+	return InspectAs(ctx, path, nil)
+}
+
+// InspectAs is Inspect with the binary's `version` and `list-modules`
+// subprocesses run as the given account; nil means the current user. See
+// Account for why a binary that is not installed yet should not run as
+// root.
+func InspectAs(ctx context.Context, path string, as *Account) (*Info, error) {
 	info := &Info{Path: path, ResolvedPath: path}
 	if r, err := filepath.EvalSymlinks(path); err == nil {
 		info.ResolvedPath = r
@@ -131,7 +139,11 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 		}
 	}
 
-	out, err := exec.CommandContext(ctx, info.ResolvedPath, "version").Output()
+	cmd := exec.CommandContext(ctx, info.ResolvedPath, "version")
+	if err := as.Apply(cmd); err != nil {
+		return nil, err
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("running %s version: %w", path, err)
 	}
@@ -139,7 +151,7 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 		info.Version = f[0]
 	}
 
-	listOut, err := listModules(ctx, info.ResolvedPath)
+	listOut, err := listModules(ctx, info.ResolvedPath, as)
 	if err != nil {
 		return nil, err
 	}
@@ -172,8 +184,12 @@ func Inspect(ctx context.Context, path string) (*Info, error) {
 	return info, nil
 }
 
-func listModules(ctx context.Context, bin string) (string, error) {
-	out, err := exec.CommandContext(ctx, bin, "list-modules", "--packages", "--versions").Output()
+func listModules(ctx context.Context, bin string, as *Account) (string, error) {
+	cmd := exec.CommandContext(ctx, bin, "list-modules", "--packages", "--versions")
+	if err := as.Apply(cmd); err != nil {
+		return "", err
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {

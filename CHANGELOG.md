@@ -18,12 +18,16 @@ and this project adheres to
 - `build` command: rebuilds the installed binary's plugin set at the same
   pinned versions with the latest Caddy, through the xcaddy library. Plugin
   versions change only with `--upgrade`, `--upgrade-all` or `--with`, and a
-  major version is never crossed without `--allow-major`. Writes a lockfile
-  with the version and checksum of Caddy and every plugin.
+  major version is never crossed without `--allow-major`. A module
+  replacement recorded in the installed binary is kept with `--replace`
+  or dropped with `--drop-replace`, never by a version flag. Writes a
+  lockfile with the version and checksum of Caddy and every plugin.
 - `install` command: builds or takes a prior build, validates it against
   the live config, swaps it over the installed binary with no gap and a
   rollback copy kept, restarts the service and rolls back if it does not
-  come up. Never installs over a system package.
+  come up. Never installs over a system package, and never runs the new
+  binary as root before it is installed: inspection runs as the user who
+  invoked sudo and validation as the service's own user.
 - `version` command.
 - GitHub Actions workflows: unit tests and lint, a privileged integration
   test on throwaway runners, CodeQL, and a release workflow that builds

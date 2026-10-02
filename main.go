@@ -161,7 +161,7 @@ func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 func runBuild(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("build", flag.ContinueOnError)
 	var opts build.Options
-	var upgrade, with, replace multiFlag
+	var upgrade, with, replace, dropReplace multiFlag
 	fs.StringVar(&opts.Binary, "binary", "", "installed caddy binary to reproduce (default: first caddy on PATH)")
 	fs.BoolVar(&opts.Fresh, "fresh", false, "ignore any installed binary; the plugin set is only what --with gives")
 	fs.StringVar(&opts.Output, "output", "caddy", "where to write the new binary")
@@ -170,6 +170,7 @@ func runBuild(ctx context.Context, args []string) int {
 	fs.BoolVar(&opts.UpgradeAll, "upgrade-all", false, "bump every plugin to its latest version within its major")
 	fs.Var(&with, "with", "module[@version] to add, or whose version to override (repeatable)")
 	fs.Var(&replace, "replace", "old=new module replacement passed to xcaddy (repeatable)")
+	fs.Var(&dropReplace, "drop-replace", "module whose replacement in the installed binary is dropped, so it is built from the module proxy (repeatable)")
 	fs.BoolVar(&opts.AllowMajor, "allow-major", false, "permit --caddy-version or --with to change a major version")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "resolve and print the plan without building")
 	fs.BoolVar(&opts.Verbose, "verbose", false, "stream all xcaddy and go output")
@@ -184,7 +185,7 @@ func runBuild(ctx context.Context, args []string) int {
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
-	opts.Upgrade, opts.With, opts.Replace = upgrade, with, replace
+	opts.Upgrade, opts.With, opts.Replace, opts.DropReplace = upgrade, with, replace, dropReplace
 	opts.Log = os.Stderr
 	opts.TimeoutBuild = *timeout
 	opts.OnPlan = func(p *build.Plan) {
@@ -211,7 +212,7 @@ func runBuild(ctx context.Context, args []string) int {
 func runInstall(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	var opts install.Options
-	var upgrade, with, replace multiFlag
+	var upgrade, with, replace, dropReplace multiFlag
 	fs.StringVar(&opts.Target, "target", "", "binary to reproduce and replace (default: first caddy on PATH)")
 	fs.StringVar(&opts.From, "from", "", "install this binary, produced by 'upgrade-caddy build', instead of building")
 	fs.BoolVar(&opts.Fresh, "fresh", false, "nothing is installed yet; build from --with only (requires --target)")
@@ -222,6 +223,7 @@ func runInstall(ctx context.Context, args []string) int {
 	fs.BoolVar(&opts.Build.UpgradeAll, "upgrade-all", false, "bump every plugin to its latest version within its major")
 	fs.Var(&with, "with", "module[@version] to add, or whose version to override (repeatable)")
 	fs.Var(&replace, "replace", "old=new module replacement passed to xcaddy (repeatable)")
+	fs.Var(&dropReplace, "drop-replace", "module whose replacement in the installed binary is dropped, so it is built from the module proxy (repeatable)")
 	fs.BoolVar(&opts.Build.AllowMajor, "allow-major", false, "permit --caddy-version or --with to change a major version")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "resolve and print the plan without changing anything")
 	fs.BoolVar(&opts.Verbose, "verbose", false, "stream all build and validation output")
@@ -237,7 +239,7 @@ func runInstall(ctx context.Context, args []string) int {
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
-	opts.Build.Upgrade, opts.Build.With, opts.Build.Replace = upgrade, with, replace
+	opts.Build.Upgrade, opts.Build.With, opts.Build.Replace, opts.Build.DropReplace = upgrade, with, replace, dropReplace
 	opts.Build.TimeoutBuild = *timeout
 	opts.Log = os.Stderr
 	opts.OnPlan = func(p *install.Plan) {

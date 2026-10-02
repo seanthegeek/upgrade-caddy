@@ -14,11 +14,20 @@ import (
 // -p WorkingDirectory -p MainPID` on Ubuntu 24.04 (systemd 255): Caddy's
 // packaged unit, a unit with no ExecStart, and a Type=oneshot unit with two
 // ExecStart= commands, which systemd prints as two ExecStart= lines.
+// sample is `systemctl show` output for three units. The caddy.service
+// block, User= to SupplementaryGroups= included, was captured from Ubuntu's
+// caddy package under systemd 255; custom.service's DynamicUser=yes and
+// SupplementaryGroups= lines use the same boolean and list rendering as
+// the captured DynamicUser=no and ExecSearchPath= lines.
 const sample = `ExecStart={ path=/usr/bin/caddy ; argv[]=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
 Id=caddy.service
 ActiveState=active
 SubState=running
 WorkingDirectory=
+User=caddy
+Group=caddy
+DynamicUser=no
+SupplementaryGroups=
 MainPID=315
 
 Id=systemd-tmpfiles-clean.service
@@ -31,6 +40,8 @@ Id=custom.service
 ActiveState=failed
 SubState=failed
 WorkingDirectory=/srv
+DynamicUser=yes
+SupplementaryGroups=adm www-data
 MainPID=0
 `
 
@@ -42,6 +53,12 @@ func TestParseShow(t *testing.T) {
 	c := units[0]
 	if c.Name != "caddy.service" || c.ActiveState != "active" || c.SubState != "running" || c.MainPID != 315 || c.WorkingDirectory != "" {
 		t.Errorf("caddy unit: %+v", c)
+	}
+	if c.User != "caddy" || c.Group != "caddy" || c.DynamicUser || len(c.SupplementaryGroups) != 0 {
+		t.Errorf("caddy unit account: %+v", c)
+	}
+	if u := units[1]; !u.DynamicUser || !reflect.DeepEqual(u.SupplementaryGroups, []string{"adm", "www-data"}) || u.User != "" {
+		t.Errorf("custom unit account: %+v", u)
 	}
 	wantArgs := []string{"/usr/bin/caddy", "run", "--environ", "--config", "/etc/caddy/Caddyfile"}
 	if !reflect.DeepEqual(c.Args, wantArgs) {

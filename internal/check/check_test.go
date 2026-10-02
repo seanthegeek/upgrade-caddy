@@ -176,3 +176,38 @@ func TestLookupAllOncePerPackage(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusRowsSkipReplacedModules(t *testing.T) {
+	// Caddy replaced by a fork: the fork is the code that runs, so the
+	// original module's version says nothing about it, exactly as for a
+	// replaced plugin.
+	bin := &caddybin.Info{
+		HasModuleInfo: true, MainPath: caddybin.CaddyModulePath, MainVersion: "v2.11.6",
+		MainReplace: "github.com/fork/caddy/v2", MainReplaceVer: "v2.11.6-fork",
+		Plugins: []caddybin.Plugin{
+			{ModuleID: "a", Package: "github.com/example/a", Version: "v1.0.0", Replace: "/srv/a"},
+			{ModuleID: "b", Package: "github.com/example/b", Version: "v1.0.0"},
+		},
+	}
+	r := &Report{Binary: bin}
+	rows := statusRows(r, bin)
+	if len(rows) != 1 || rows[0] != &r.Plugins[1] {
+		t.Errorf("only the unreplaced plugin is looked up, got %d rows", len(rows))
+	}
+	if r.Caddy.Note != "replaced by github.com/fork/caddy/v2@v2.11.6-fork; not checked" {
+		t.Errorf("Caddy note: %q", r.Caddy.Note)
+	}
+	if r.Plugins[0].Note != "replaced by /srv/a; not checked" {
+		t.Errorf("plugin note: %q", r.Plugins[0].Note)
+	}
+	if r.anyErrors() {
+		t.Error("not checked is a note, not an error")
+	}
+	// Unreplaced Caddy is looked up as before, and a distribution build
+	// without module info still gets a Caddy row from its version output.
+	plain := &caddybin.Info{Version: "v2.11.6"}
+	r = &Report{Binary: plain}
+	if rows := statusRows(r, plain); len(rows) != 1 || rows[0] != &r.Caddy || r.Caddy.Package != caddybin.CaddyModulePath || r.Caddy.Installed != "v2.11.6" {
+		t.Errorf("plain Caddy row: %d rows, %+v", len(rows), r.Caddy)
+	}
+}

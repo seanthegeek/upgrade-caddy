@@ -79,8 +79,8 @@ flagged as "newer commit on default branch" rather than as a release.
 ```text
 upgrade-caddy build [--binary PATH] [--output caddy] [--caddy-version vX.Y.Z]
                     [--upgrade MODULE]... [--upgrade-all] [--with MODULE[@VERSION]]...
-                    [--replace OLD=NEW]... [--allow-major] [--fresh]
-                    [--dry-run] [--verbose] [--timeout 20m]
+                    [--replace OLD=NEW]... [--drop-replace MODULE]... [--allow-major]
+                    [--fresh] [--dry-run] [--verbose] [--timeout 20m]
 ```
 
 By default `build` reads the plugin set and pinned versions from the
@@ -94,6 +94,12 @@ changes unless you say so:
 - `--upgrade-all` bumps every plugin.
 - `--with MODULE[@VERSION]` adds a plugin, or overrides the version of one
   already present. Without a version the latest is used.
+- `--replace OLD=NEW` passes a module replacement (a fork, a local checkout)
+  to xcaddy. A replacement recorded in the installed binary, for a plugin
+  or for Caddy itself, must be kept with `--replace` or dropped with
+  `--drop-replace MODULE`, whatever `--upgrade` or `--with` say about
+  versions; otherwise the build refuses, because quietly swapping a fork
+  for the module proxy's code is a change nobody reviewed.
 - `--allow-major` is required for `--caddy-version` or `--with` to move
   anything to a different major version. Plugins built for one major do not
   compile against the next, so this is always a deliberate step.
@@ -107,7 +113,9 @@ with the default `GOTOOLCHAIN=auto` a Go release new enough for the Caddy
 being built is downloaded automatically.
 
 The new binary is written to `--output` and never over the installed
-binary or one a service runs; that is `install`'s job. Before it is moved
+binary or one a service runs; that is `install`'s job, and the check is
+made before the build and again right before the finished binary is moved
+into place, since a build takes minutes. Before it is moved
 into place the binary is inspected to confirm it carries exactly the planned
 Caddy and plugin versions. A plugin can depend on another module that
 registers Caddy modules of its own; such modules are reported after the
@@ -140,9 +148,9 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    whether root is needed (to write the directory, restart the unit, or
    re-apply file capabilities) so a long build never ends in "permission
    denied". These checks are repeated right before step 4: if the target,
-   its package ownership, its capabilities or the set of units running it
-   changed while the build ran, nothing is touched and `install` asks to
-   be re-run.
+   its package ownership, its capabilities, the set of units running it,
+   or those units' config flags, working directory or user changed while
+   the build ran, nothing is touched and `install` asks to be re-run.
 3. Builds the new binary into the target's directory with the same rules
    and flags as `build`, or stages one from `--from PATH` (a binary that
    `build` produced, with its lockfile beside it; the lockfile must
@@ -156,10 +164,20 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    sudo upgrade-caddy install --from /tmp/caddy
    ```
 
+   Running as root, `install` never executes the new binary as root
+   before it is installed: a plugin's initialisation code runs the moment
+   the binary starts, before the service's own user and sandbox would
+   apply. Its `version` and `list-modules` run as the user who invoked
+   `sudo`, or failing that as the service's user, and the plan says which.
 4. Runs `validate` with the new binary against each real config, in the
    directory the service runs in (`/` when the unit sets none, the unit
-   user's home for `~`). A rejected config stops everything before
-   anything changes.
+   user's home for `~`) and as the account the service runs as (its
+   `User=`, `Group=` and `SupplementaryGroups=`), so the config is read
+   exactly as the service will read it. A unit without `User=` runs as
+   root and is validated as root, which is no more than the service itself
+   does; a `--config` given on the command line is validated as the user
+   who invoked `sudo`. A rejected config stops everything before anything
+   changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the
    path. Mode (including setuid, setgid and sticky bits) and file

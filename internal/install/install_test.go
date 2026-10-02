@@ -214,6 +214,19 @@ func TestIdentifyNoticesReplacement(t *testing.T) {
 	if sameUnits([]systemd.Unit{base}, []systemd.Unit{moved}) {
 		t.Error("a changed working directory must count as a changed unit")
 	}
+	// The account the unit runs as decides who validate runs as.
+	for name, change := range map[string]func(*systemd.Unit){
+		"user":    func(u *systemd.Unit) { u.User = "caddy" },
+		"group":   func(u *systemd.Unit) { u.Group = "www-data" },
+		"groups":  func(u *systemd.Unit) { u.SupplementaryGroups = []string{"adm"} },
+		"dynamic": func(u *systemd.Unit) { u.DynamicUser = true },
+	} {
+		changed := base
+		change(&changed)
+		if sameUnits([]systemd.Unit{base}, []systemd.Unit{changed}) {
+			t.Errorf("a changed %s must count as a changed unit", name)
+		}
+	}
 }
 
 func TestCheckWorkDirsRefusesUnresolvedHome(t *testing.T) {
@@ -451,6 +464,12 @@ func TestValidationsFromUnits(t *testing.T) {
 	if len(got) != 2 || got[0].From != "a.service" || got[1].Config != "/etc/b.json" || got[1].Adapter != "json" {
 		t.Errorf("want two distinct validations, got %+v", got)
 	}
+	// The same config read by a different account is a different
+	// validation: what the file looks like depends on who opens it.
+	units[2].User = "caddy"
+	if got := validationsFromUnits(units); len(got) != 3 || got[2].From != "c.service" {
+		t.Errorf("one config under two users must be validated twice, got %+v", got)
+	}
 }
 
 func TestSwapPreservesSetIDAndStickyBits(t *testing.T) {
@@ -647,6 +666,14 @@ func TestValidateArgs(t *testing.T) {
 	t.Setenv("FAKE_EXIT", "1")
 	if err := validate(context.Background(), script, p, &log, false); err == nil || !strings.Contains(err.Error(), "rejected") {
 		t.Errorf("non-zero exit should fail: %v", err)
+	}
+	// Asked to run as another account without being root, validate refuses
+	// rather than running as whoever it is.
+	if os.Geteuid() != 0 {
+		p.account = &caddybin.Account{Name: "caddy", UID: uint32(os.Geteuid()) + 1}
+		if err := validate(context.Background(), script, p, &log, false); err == nil || !strings.Contains(err.Error(), "requires root") {
+			t.Errorf("switching accounts without root must fail: %v", err)
+		}
 	}
 }
 
@@ -855,5 +882,139 @@ func TestCommitLockfileUndoesTheSwapOnFailure(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "staged.lock.json"), []byte("{}"), 0o644)
 	if err := commitLockfile(target, filepath.Join(dir, "staged.lock.json"), ""); err != nil {
 		t.Errorf("success: %v", err)
+	}
+}
+
+func fakeEnv(vars map[string]string) func(string) string {
+	return func(k string) string { return vars[k] }
+}
+
+func fakeLookup(name, group string, extra []string) (*caddybin.Account, error) {
+	switch name {
+	case "caddy":
+		return &caddybin.Account{Name: "caddy", UID: 999, GID: 999}, nil
+	case "1000":
+		return &caddybin.Account{Name: "sean", UID: 1000, GID: 1000, Home: "/home/sean"}, nil
+	case "admin":
+		return &caddybin.Account{Name: "admin", UID: 0, GID: 0}, nil
+	}
+	return nil, errors.New("unknown user " + name)
+}
+
+func TestChooseAccounts(t *testing.T) {
+	sudo := fakeEnv(map[string]string{"SUDO_UID": "1000", "SUDO_GID": "1000", "SUDO_USER": "sean"})
+	noSudo := fakeEnv(nil)
+	units := []systemd.Unit{
+		{Name: "caddy.service", User: "caddy", Group: "caddy", Args: []string{"caddy", "run", "--config", "/etc/caddy/Caddyfile"}},
+		{Name: "root.service", Args: []string{"caddy", "run", "--config", "/etc/root/Caddyfile"}},
+		{Name: "dyn.service", User: "dyn", DynamicUser: true, Args: []string{"caddy", "run", "--config", "/etc/dyn/Caddyfile"}},
+	}
+	newPlan := func() *Plan {
+		return &Plan{Units: units, Validations: validationsFromUnits(units)}
+	}
+
+	// Not root: nothing to drop and no way to switch, so nothing is decided
+	// or claimed.
+	p := newPlan()
+	if err := p.chooseAccounts(1000, sudo, fakeLookup); err != nil || p.RunAs != "" || p.runAs != nil || p.Validations[0].User != "" || p.Validations[0].account != nil {
+		t.Errorf("as a normal user nothing should be chosen: %v %+v", err, p)
+	}
+
+	// Root through sudo: the new binary is inspected as the invoker, each
+	// unit's config is validated as that unit's own account, a root unit as
+	// root, and a DynamicUser= unit (whose account does not exist yet) as
+	// the invoker.
+	p = newPlan()
+	if err := p.chooseAccounts(0, sudo, fakeLookup); err != nil {
+		t.Fatal(err)
+	}
+	if p.runAs == nil || p.runAs.UID != 1000 || !strings.Contains(p.RunAs, "sean (uid 1000)") || !strings.Contains(p.RunAs, "sudo") {
+		t.Errorf("inspection account: %+v %q", p.runAs, p.RunAs)
+	}
+	want := map[string]string{"caddy.service": "caddy", "root.service": "root", "dyn.service": "sean"}
+	for _, v := range p.Validations {
+		if v.User != want[v.From] {
+			t.Errorf("%s validated as %q, want %q", v.From, v.User, want[v.From])
+		}
+	}
+	if a := p.Validations[0].account; a == nil || a.UID != 999 {
+		t.Errorf("caddy.service must be validated as caddy: %+v", a)
+	}
+	if p.Validations[1].account != nil {
+		t.Errorf("a unit without User= runs as root and is validated as root: %+v", p.Validations[1].account)
+	}
+	if p.Validations[2].account != p.runAs {
+		t.Errorf("a DynamicUser= unit is validated as the inspection account: %+v", p.Validations[2].account)
+	}
+	var text strings.Builder
+	p.From, p.FromInfo = "/tmp/caddy", &caddybin.Info{}
+	p.WriteText(&text)
+	if s := text.String(); !strings.Contains(s, "Run as:   sean (uid 1000), the user who ran sudo") || !strings.Contains(s, "(from caddy.service, as caddy)") || !strings.Contains(s, "(from root.service, as root)") {
+		t.Errorf("plan text must say who runs what:\n%s", s)
+	}
+
+	// Root without sudo: the first unit's user stands in for inspection.
+	p = newPlan()
+	if err := p.chooseAccounts(0, noSudo, fakeLookup); err != nil || p.runAs == nil || p.runAs.UID != 999 || !strings.Contains(p.RunAs, "service user") {
+		t.Errorf("without sudo the service user is used: %v %+v %q", err, p.runAs, p.RunAs)
+	}
+	// Root through sudo from root is no invoker either.
+	p = newPlan()
+	if err := p.chooseAccounts(0, fakeEnv(map[string]string{"SUDO_UID": "0", "SUDO_GID": "0", "SUDO_USER": "root"}), fakeLookup); err != nil || p.runAs == nil || p.runAs.UID != 999 {
+		t.Errorf("sudo from root is not an invoker to drop to: %v %+v", err, p.runAs)
+	}
+	// Root, no sudo, no units: root, said plainly, for a --config
+	// validation too.
+	p = &Plan{Validations: []Validation{{Config: "/etc/x", From: "--config"}}}
+	if err := p.chooseAccounts(0, noSudo, fakeLookup); err != nil || p.runAs != nil || !strings.HasPrefix(p.RunAs, "root (") || p.Validations[0].User != "root" || p.Validations[0].account != nil {
+		t.Errorf("nothing to drop to must be said, not hidden: %v %+v", err, p)
+	}
+	// With sudo, a --config validation runs as the invoker.
+	p = &Plan{Validations: []Validation{{Config: "/etc/x", From: "--config"}}}
+	if err := p.chooseAccounts(0, sudo, fakeLookup); err != nil || p.Validations[0].User != "sean" || p.Validations[0].account != p.runAs {
+		t.Errorf("--config validation runs as the invoker: %v %+v", err, p.Validations[0])
+	}
+	// A unit user that cannot be looked up is a refusal, not a fall back
+	// to root.
+	ghost := []systemd.Unit{{Name: "x.service", User: "ghost", Args: []string{"caddy", "run", "--config", "/etc/x"}}}
+	p = &Plan{Units: ghost, Validations: validationsFromUnits(ghost)}
+	if err := p.chooseAccounts(0, sudo, fakeLookup); err == nil || !strings.Contains(err.Error(), "x.service") || !strings.Contains(err.Error(), "could not be looked up") {
+		t.Errorf("unknown unit user must refuse: %v", err)
+	}
+	// User= naming an account with uid 0 is root under another name.
+	admin := []systemd.Unit{{Name: "a.service", User: "admin", Args: []string{"caddy", "run", "--config", "/etc/a"}}}
+	p = &Plan{Units: admin, Validations: validationsFromUnits(admin)}
+	if err := p.chooseAccounts(0, noSudo, fakeLookup); err != nil || p.Validations[0].User != "root" || p.Validations[0].account != nil || p.runAs != nil {
+		t.Errorf("uid 0 under another name is root: %v %+v", err, p)
+	}
+}
+
+func TestInvoker(t *testing.T) {
+	failing := func(string, string, []string) (*caddybin.Account, error) { return nil, errors.New("nss unavailable") }
+	// The invoker is looked up for groups and home, and when that fails
+	// the IDs sudo gave are used on their own.
+	a, how := invoker(fakeEnv(map[string]string{"SUDO_UID": "1000", "SUDO_GID": "1000", "SUDO_USER": "sean"}), fakeLookup)
+	if a == nil || a.Home != "/home/sean" || !strings.Contains(how, "sudo") {
+		t.Errorf("looked-up invoker: %+v %q", a, how)
+	}
+	a, _ = invoker(fakeEnv(map[string]string{"SUDO_UID": "1000", "SUDO_GID": "1001", "SUDO_USER": "sean"}), failing)
+	if a == nil || a.UID != 1000 || a.GID != 1001 || a.Name != "sean" || a.Home != "" {
+		t.Errorf("fallback to sudo's IDs: %+v", a)
+	}
+	a, _ = invoker(fakeEnv(map[string]string{"SUDO_UID": "1000", "SUDO_GID": "1001"}), failing)
+	if a == nil || a.Name != "1000" {
+		t.Errorf("without SUDO_USER the name is the ID: %+v", a)
+	}
+	// Missing or malformed variables mean no invoker.
+	for name, vars := range map[string]map[string]string{
+		"none":      nil,
+		"garbage":   {"SUDO_UID": "abc", "SUDO_GID": "1000"},
+		"no gid":    {"SUDO_UID": "1000"},
+		"root":      {"SUDO_UID": "0", "SUDO_GID": "0"},
+		"too large": {"SUDO_UID": "99999999999", "SUDO_GID": "0"},
+	} {
+		if a, _ := invoker(fakeEnv(vars), fakeLookup); a != nil {
+			t.Errorf("%s: want no invoker, got %+v", name, a)
+		}
 	}
 }

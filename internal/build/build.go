@@ -42,13 +42,15 @@ type Options struct {
 	UpgradeAll   bool     // bump every plugin
 	With         []string // module[@version] to add, or to override the version of
 	Replace      []string // old=new module replacements passed through to xcaddy
+	DropReplace  []string // installed modules (Go module path or Caddy module ID) whose replacement is dropped, so they come from the module proxy
 	AllowMajor   bool     // permit CaddyVersion or With to change a major version
 	DryRun       bool     // resolve and print the plan, do not build
 	Verbose      bool     // stream all build output instead of just step names
 	Proxy        *goproxy.Client
-	Log          io.Writer     // progress output; nil discards
-	OnPlan       func(*Plan)   // called with the resolved plan before building, if set
-	TimeoutBuild time.Duration // xcaddy's timeout for the compile step; the overall limit is the context's
+	Log          io.Writer         // progress output; nil discards
+	OnPlan       func(*Plan)       // called with the resolved plan before building, if set
+	TimeoutBuild time.Duration     // xcaddy's timeout for the compile step; the overall limit is the context's
+	RunAs        *caddybin.Account // account the finished binary is executed as when it is inspected; nil means the current user
 }
 
 // Source says how a plugin ended up in the plan.
@@ -82,6 +84,7 @@ type Plan struct {
 	CaddyVersion   string           `json:"caddy_version"`
 	Plugins        []Plugin         `json:"plugins"`
 	Replacements   []xcaddy.Replace `json:"replacements,omitempty"`
+	CaddyNote      string           `json:"caddy_note,omitempty"` // for example, that an installed replacement of Caddy is dropped
 	Output         string           `json:"output"`
 	HostGoVersion  string           `json:"host_go_version,omitempty"` // the go on PATH; the build may auto-fetch a newer one
 }
@@ -118,14 +121,8 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	if out, err := exec.CommandContext(ctx, "go", "version").Output(); err == nil {
 		plan.HostGoVersion = strings.TrimPrefix(strings.TrimSpace(string(out)), "go version ")
 	}
-	// build never replaces a binary a service is running; that is install's
-	// job. If systemd cannot be asked, the guarantee cannot be kept, so stop.
-	units, err := systemd.UnitsUsing(ctx, plan.Output)
-	if err != nil {
-		return plan, nil, fmt.Errorf("cannot confirm that no service runs %s: %w", plan.Output, err)
-	}
-	if len(units) > 0 {
-		return plan, nil, fmt.Errorf("%s is run by %s; 'build' never replaces a live binary, use 'install'", plan.Output, units[0].Name)
+	if err := refuseLive(ctx, plan.Output, systemd.UnitsUsing); err != nil {
+		return plan, nil, err
 	}
 	if opts.OnPlan != nil {
 		opts.OnPlan(plan)
@@ -135,6 +132,23 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	}
 	res, err := plan.Build(ctx, opts)
 	return plan, res, err
+}
+
+// refuseLive stops a build whose output path is run by a service: build
+// never replaces a live binary, that is install's job. If systemd cannot be
+// asked, the guarantee cannot be kept, and that stops the build too. Run
+// checks before the build, and Build again right before the output is
+// moved into place, because a unit can start using the path during a build
+// that takes minutes.
+func refuseLive(ctx context.Context, output string, unitsUsing func(context.Context, string) ([]systemd.Unit, error)) error {
+	units, err := unitsUsing(ctx, output)
+	if err != nil {
+		return fmt.Errorf("cannot confirm that no service runs %s: %w", output, err)
+	}
+	if len(units) > 0 {
+		return fmt.Errorf("%s is run by %s; 'build' never replaces a live binary, use 'install'", output, units[0].Name)
+	}
+	return nil
 }
 
 // Resolve decides every version in the build from the source binary (nil
@@ -292,6 +306,12 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 			}
 			delete(index, pl.Package)
 			pl.Note = join(pl.Note, "major version change from "+pl.Package+"@"+pl.Installed)
+			if pl.replacedBy != "" {
+				// The user named a new module path, which is a new source;
+				// the old path's replacement cannot apply to it.
+				pl.Note = join(pl.Note, "the replacement of "+pl.Package+" by "+pl.replacedBy+" does not carry over")
+				pl.replacedBy = ""
+			}
 			pl.Package, pl.Version, pl.Source = path, version, Overridden
 			index[path] = i
 			continue
@@ -300,7 +320,12 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		p.Plugins = append(p.Plugins, Plugin{Package: path, Version: version, Source: Added})
 	}
 
-	// Replacements, and installed replacements that must be covered.
+	// Replacements, and installed replacements that must be covered: kept
+	// with --replace or dropped with --drop-replace, whatever happens to the
+	// module's version. --upgrade and --with choose a version, not a
+	// source, so neither drops a replacement on its own; a fork or local
+	// checkout would otherwise be swapped for the module proxy's code
+	// without anyone having asked for that.
 	covered := map[string]bool{}
 	for _, r := range opts.Replace {
 		old, repl, ok := strings.Cut(r, "=")
@@ -310,15 +335,35 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		covered[old] = true
 		p.Replacements = append(p.Replacements, xcaddy.NewReplace(old, repl))
 	}
+	dropped := map[string]bool{}
+	for _, name := range opts.DropReplace {
+		if src == nil {
+			return nil, fmt.Errorf("--drop-replace %s: there is no installed binary to drop a replacement from", name)
+		}
+		var pkg string
+		if i, ok := find(p.Plugins, name); ok && p.Plugins[i].replacedBy != "" {
+			pkg = p.Plugins[i].Package
+			p.Plugins[i].Note = join(p.Plugins[i].Note, "replacement by "+p.Plugins[i].replacedBy+" dropped; built from the module proxy")
+		} else if name == src.MainPath && src.MainReplace != "" {
+			pkg = src.MainPath
+			p.CaddyNote = "replacement by " + replacedBy(src.MainReplace, src.MainReplaceVer) + " dropped; built from the module proxy"
+		} else {
+			return nil, fmt.Errorf("--drop-replace %s: %s was not built with a replacement for it", name, src.Path)
+		}
+		if covered[pkg] {
+			return nil, fmt.Errorf("--drop-replace %s contradicts --replace %s=...", name, pkg)
+		}
+		dropped[pkg] = true
+	}
 	for _, pl := range p.Plugins {
-		if pl.replacedBy != "" && !covered[pl.Package] && pl.Source == Pinned {
-			return nil, fmt.Errorf("%s was built with a module replacement (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version>", pl.Package, pl.replacedBy, pl.Package)
+		if pl.replacedBy != "" && !covered[pl.Package] && !dropped[pl.Package] {
+			return nil, fmt.Errorf("%s was built with a module replacement (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version> to keep one, or --drop-replace %s to build it from the module proxy instead", pl.Package, pl.replacedBy, pl.Package, pl.Package)
 		}
 	}
 	// Caddy itself can be replaced too (a fork, a local checkout), and a
 	// default rebuild would otherwise quietly swap it for upstream Caddy.
-	if src != nil && src.MainReplace != "" && !covered[src.MainPath] {
-		return nil, fmt.Errorf("%s was built with Caddy itself replaced (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version>, or --fresh to build upstream Caddy deliberately", src.Path, replacedBy(src.MainReplace, src.MainReplaceVer), src.MainPath)
+	if src != nil && src.MainReplace != "" && !covered[src.MainPath] && !dropped[src.MainPath] {
+		return nil, fmt.Errorf("%s was built with Caddy itself replaced (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version> to keep one, --drop-replace %s to build upstream Caddy instead, or --fresh to build without the installed binary", src.Path, replacedBy(src.MainReplace, src.MainReplaceVer), src.MainPath, src.MainPath)
 	}
 
 	// Output path. Never the binary we are reproducing.
@@ -390,6 +435,9 @@ func (p *Plan) WriteText(w io.Writer) {
 		fmt.Fprintf(w, "Caddy:    %s -> %s\n", p.CaddyInstalled, p.CaddyVersion)
 	} else {
 		fmt.Fprintf(w, "Caddy:    %s\n", p.CaddyVersion)
+	}
+	if p.CaddyNote != "" {
+		fmt.Fprintf(w, "          %s\n", p.CaddyNote)
 	}
 	if p.HostGoVersion != "" {
 		fmt.Fprintf(w, "Host Go:  %s (with GOTOOLCHAIN=auto a newer toolchain is fetched if Caddy requires it)\n", p.HostGoVersion)
@@ -467,7 +515,13 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 		return nil, fmt.Errorf("xcaddy: %w%s", err, hint)
 	}
 
-	built, err := caddybin.Inspect(ctx, tmpPath)
+	// Executable before it is inspected, since the inspection may run it
+	// as another account (see Options.RunAs).
+	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		lockf.Close()
+		return nil, err
+	}
+	built, err := caddybin.InspectAs(ctx, tmpPath, opts.RunAs)
 	if err != nil {
 		lockf.Close()
 		return nil, fmt.Errorf("inspecting the new binary: %w", err)
@@ -479,14 +533,15 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 	if extra := p.Unplanned(built); len(extra) > 0 {
 		fmt.Fprintf(logw, "==> also compiled in, pulled in by the plugins above: %s\n", strings.Join(extra, ", "))
 	}
-	if err := os.Chmod(tmpPath, 0o755); err != nil {
-		lockf.Close()
-		return nil, err
-	}
 	// Write the lockfile through the reserved handle first, so a lockfile
 	// failure leaves the requested output untouched; then move both.
 	built.Path, built.ResolvedPath = p.Output, p.Output
 	if err := writeLockfile(lockf, p, built); err != nil {
+		return nil, err
+	}
+	// The check Run made before the build, repeated now that the build is
+	// done: a unit may have started using the output path since.
+	if err := refuseLive(ctx, p.Output, systemd.UnitsUsing); err != nil {
 		return nil, err
 	}
 	if err := os.Rename(tmpPath, p.Output); err != nil {
@@ -691,9 +746,10 @@ type LockSource struct {
 }
 
 // writeLockfile writes the lockfile through an already-open, exclusively
-// created file and closes it.
-func writeLockfile(f *os.File, p *Plan, built *caddybin.Info) error {
-	defer f.Close()
+// created file and closes it. Close can report a write failure of its own,
+// so its error is returned too.
+func writeLockfile(f *os.File, p *Plan, built *caddybin.Info) (err error) {
+	defer func() { err = errors.Join(err, f.Close()) }()
 	lf := Lockfile{
 		Schema:    1,
 		BuiltAt:   time.Now().UTC().Truncate(time.Second),

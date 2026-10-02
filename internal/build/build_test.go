@@ -3,6 +3,7 @@ package build
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/caddyserver/xcaddy"
 	"github.com/seanthegeek/upgrade-caddy/internal/caddybin"
 	"github.com/seanthegeek/upgrade-caddy/internal/goproxy"
+	"github.com/seanthegeek/upgrade-caddy/internal/systemd"
 )
 
 // fakeProxy serves @latest for the module paths in versions and 404 for
@@ -609,5 +611,101 @@ func TestLockfileDescribes(t *testing.T) {
 	os.WriteFile(f.Name(), []byte("{}"), 0o644)
 	if _, err := ReadLockfile(f.Name()); err == nil {
 		t.Error("{} has no schema and must be rejected")
+	}
+}
+
+func TestRefuseLive(t *testing.T) {
+	ctx := context.Background()
+	none := func(context.Context, string) ([]systemd.Unit, error) { return nil, nil }
+	if err := refuseLive(ctx, "/opt/caddy", none); err != nil {
+		t.Errorf("no unit, no refusal: %v", err)
+	}
+	// Not being able to ask is a refusal, never "no unit".
+	failing := func(context.Context, string) ([]systemd.Unit, error) { return nil, errors.New("boom") }
+	if err := refuseLive(ctx, "/opt/caddy", failing); err == nil || !strings.Contains(err.Error(), "cannot confirm") {
+		t.Errorf("systemd failure must refuse: %v", err)
+	}
+	live := func(context.Context, string) ([]systemd.Unit, error) {
+		return []systemd.Unit{{Name: "caddy.service"}}, nil
+	}
+	err := refuseLive(ctx, "/opt/caddy", live)
+	if err == nil || !strings.Contains(err.Error(), "caddy.service") || !strings.Contains(err.Error(), "'install'") {
+		t.Errorf("a live binary must refuse and point at install: %v", err)
+	}
+}
+
+func TestReplacementSurvivesUpgradeAndWith(t *testing.T) {
+	cf := "github.com/caddy-dns/cloudflare"
+	replaced := func() *caddybin.Info {
+		src := installed()
+		src.Plugins[0].Replace = "../cloudflare"
+		return src
+	}
+	// Choosing a version is not choosing a source: none of these may drop
+	// the installed replacement on its own.
+	for name, opts := range map[string]Options{
+		"--upgrade":     {Upgrade: []string{cf}},
+		"--upgrade-all": {UpgradeAll: true},
+		"--with":        {With: []string{cf + "@v0.2.4"}},
+	} {
+		_, err := resolve(t, replaced(), opts)
+		if err == nil || !strings.Contains(err.Error(), "--drop-replace "+cf) || !strings.Contains(err.Error(), "--replace "+cf+"=") {
+			t.Errorf("%s must not drop the replacement silently, and the error must offer both ways out: %v", name, err)
+		}
+	}
+	// Covered, the upgrade goes ahead with the replacement kept.
+	p, err := resolve(t, replaced(), Options{Upgrade: []string{cf}, Replace: []string{cf + "=/srv/cloudflare"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Replacements) != 1 || plugin(p, cf).Source != Upgraded || plugin(p, cf).Version != "v0.2.4" {
+		t.Errorf("upgrade with the replacement kept: %+v %+v", p.Replacements, plugin(p, cf))
+	}
+	// Dropped explicitly, by Caddy module ID: no replacement, and the plan
+	// says so.
+	p, err = resolve(t, replaced(), Options{DropReplace: []string{"dns.providers.cloudflare"}, UpgradeAll: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Replacements) != 0 || !strings.Contains(plugin(p, cf).Note, "replacement by ../cloudflare dropped") {
+		t.Errorf("dropped replacement: %+v %+v", p.Replacements, plugin(p, cf))
+	}
+	// Dropping what is not replaced, dropping and keeping at once, and
+	// dropping with nothing installed are all mistakes to report.
+	if _, err := resolve(t, installed(), Options{DropReplace: []string{cf}}); err == nil || !strings.Contains(err.Error(), "was not built with a replacement") {
+		t.Errorf("drop of an unreplaced module: %v", err)
+	}
+	if _, err := resolve(t, replaced(), Options{DropReplace: []string{cf}, Replace: []string{cf + "=/srv/cloudflare"}}); err == nil || !strings.Contains(err.Error(), "contradicts") {
+		t.Errorf("drop and keep together: %v", err)
+	}
+	if _, err := resolve(t, nil, Options{Fresh: true, DropReplace: []string{cf}}); err == nil || !strings.Contains(err.Error(), "no installed binary") {
+		t.Errorf("drop with --fresh: %v", err)
+	}
+	// Caddy itself can be dropped back to upstream the same way.
+	forked := installed()
+	forked.MainPath, forked.MainReplace, forked.MainReplaceVer = caddybin.CaddyModulePath, "github.com/fork/caddy/v2", "v2.11.6-fork"
+	p, err = resolve(t, forked, Options{DropReplace: []string{caddybin.CaddyModulePath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Replacements) != 0 || !strings.Contains(p.CaddyNote, "github.com/fork/caddy/v2@v2.11.6-fork dropped") {
+		t.Errorf("dropped Caddy replacement: %+v %q", p.Replacements, p.CaddyNote)
+	}
+	var text strings.Builder
+	p.WriteText(&text)
+	if !strings.Contains(text.String(), p.CaddyNote) {
+		t.Errorf("the plan text must show the Caddy note:\n%s", text.String())
+	}
+	// A --with that moves a replaced plugin to another major's module path
+	// names a new source outright; the old path's replacement cannot apply
+	// to it, and the plan says so instead of demanding --drop-replace.
+	moved := installed()
+	moved.Plugins[0] = caddybin.Plugin{ModuleID: "x", Package: "github.com/example/plugin", Version: "v1.3.0", Replace: "/srv/plugin"}
+	p, err = resolve(t, moved, Options{With: []string{"github.com/example/plugin/v2@v2.0.1"}, AllowMajor: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl := plugin(p, "github.com/example/plugin/v2"); pl == nil || !strings.Contains(pl.Note, "does not carry over") || len(p.Replacements) != 0 {
+		t.Errorf("major move of a replaced plugin: %+v %+v", pl, p.Replacements)
 	}
 }

@@ -45,8 +45,10 @@ only state that matters, and the tool is built around that.
 - `internal/build` the build command. `Resolve` turns the installed binary
   and flags into a `Plan` with every version decided and talks only to the
   module proxy, so it is tested with a fake one. `Plan.Build` runs xcaddy,
-  inspects the result to confirm it matches the plan, moves it into place
-  and writes `<output>.lock.json`.
+  inspects the result to confirm it matches the plan, checks again that no
+  unit runs the output path (the check `Run` made before the build is
+  minutes old by then), moves it into place and writes
+  `<output>.lock.json`.
 - `internal/caddybin` inspects a Caddy binary: Go build info read straight
   from the file, plus `caddy version` and `caddy list-modules` run as
   subprocesses.
@@ -91,9 +93,14 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    (`--upgrade <module>`, `--upgrade-all`, `--with <module@version>`). A
    silent bump is a supply-chain risk the user has not reviewed. The same
    goes for module replacements: one recorded in the installed binary,
-   for a plugin or for Caddy itself, must be covered by `--replace` (or
-   `--fresh`), and `verify` checks the output carries exactly the
-   replacements asked for, no more and no fewer.
+   for a plugin or for Caddy itself, must be kept with `--replace` or
+   dropped with `--drop-replace` (or the whole binary ignored with
+   `--fresh`), whatever `--upgrade` or `--with` say about versions, since
+   choosing a version is not choosing a source. The one exception is
+   `--with` naming a different major's module path, which is a new source
+   outright; the old path's replacement cannot apply and is dropped with a
+   note. `verify` checks the output carries exactly the replacements asked
+   for, no more and no fewer.
 3. **A newer major version always counts as an update, but is never
    crossed automatically.** Caddy has never backported security fixes to a
    previous major, so `check` treats a newer major as "outdated" and exits
@@ -263,6 +270,22 @@ These are implemented in `internal/install`; keep them true.
 - `main` cancels the context on SIGINT and SIGTERM, so a service manager,
   CI cancellation or `timeout(1)` lets install roll back instead of dying
   mid-swap.
+- The new binary never runs as root before it is installed: a plugin's
+  initialisation code runs the moment the binary starts, before the
+  service's user and sandbox would apply, and the lockfile beside a
+  `--from` binary describes it without authenticating it. When `install`
+  runs as root, `Resolve` picks the accounts once (`chooseAccounts`) and
+  the plan prints them: `version` and `list-modules` run as the user who
+  invoked sudo (`SUDO_UID`), else the first unit's user, else root, said
+  plainly; `validate` runs as the unit's `User=`, `Group=` and
+  `SupplementaryGroups=` (a `caddybin.Account`, resolved through
+  `os/user`), because that is who opens the config at runtime. A unit
+  without `User=` runs as root and is validated as root; a `DynamicUser=`
+  unit, whose account exists only while it runs, is validated as the
+  inspection account; a unit user that cannot be looked up is a refusal.
+  The staged copy and the build output are made executable before they
+  are inspected so another account can run them, and a unit whose user
+  changed between `Resolve` and the swap fails `recheck`.
 
 ## Lessons from review
 
@@ -320,7 +343,10 @@ done; each item names where the pattern bit before.
   module registering several Caddy modules; v0, v1, `+incompatible` and
   `gopkg.in` paths; a first install versus an upgrade; a cancelled
   context; set-ID and sticky mode bits; macOS and FreeBSD, which have none
-  of the Linux package managers; a stray positional argument.
+  of the Linux package managers; a stray positional argument; a unit with
+  `User=` or `DynamicUser=`; a replaced module under `--upgrade` or
+  `--with`; a check made before a build that takes minutes and acted on
+  after it.
 
 ## Conventions
 

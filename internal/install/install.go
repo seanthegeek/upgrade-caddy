@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -62,13 +63,15 @@ type Plan struct {
 	BuildPlan    *build.Plan    `json:"build,omitempty"`
 
 	Validations []Validation `json:"validations,omitempty"` // every distinct config the new binary is checked against
+	RunAs       string       `json:"run_as,omitempty"`      // who the new binary is inspected as, and why; set only when running as root
 
 	FileCapabilities string   `json:"file_capabilities,omitempty"` // human-readable, from getcap when available, else "present"
 	NeedsRoot        bool     `json:"needs_root"`
 	RootReasons      []string `json:"root_reasons,omitempty"`
 
-	caps      []byte // raw security.capability value to carry over, nil when none
-	targetID  fileID // the file Resolve inspected, so Run can tell if it was replaced meanwhile
+	caps      []byte            // raw security.capability value to carry over, nil when none
+	runAs     *caddybin.Account // account the new binary is inspected as; nil means the current user
+	targetID  fileID            // the file Resolve inspected, so Run can tell if it was replaced meanwhile
 	buildOpts build.Options
 }
 
@@ -102,7 +105,10 @@ type Validation struct {
 	Adapter  string   `json:"adapter,omitempty"`
 	EnvFiles []string `json:"env_files,omitempty"`
 	WorkDir  string   `json:"work_dir,omitempty"`
-	From     string   `json:"from"` // "--config" or the unit name
+	From     string   `json:"from"`           // "--config" or the unit name
+	User     string   `json:"user,omitempty"` // who validate runs as; set only when running as root
+
+	account *caddybin.Account // nil means the current user
 }
 
 // Result is what Run did.
@@ -159,7 +165,7 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		os.Remove(newPath)
 		os.Remove(newLock)
 	}
-	newInfo, err := caddybin.Inspect(ctx, newPath)
+	newInfo, err := caddybin.InspectAs(ctx, newPath, plan.runAs)
 	if err != nil {
 		cleanup()
 		return plan, nil, fmt.Errorf("inspecting the new binary: %w", err)
@@ -405,6 +411,11 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 			return nil, err
 		}
 	}
+	// Who runs the new binary before it is installed. Decided here, once,
+	// so the plan shows it and Run cannot drift from it.
+	if err := p.chooseAccounts(os.Geteuid(), os.Getenv, caddybin.LookupAccount); err != nil {
+		return nil, err
+	}
 
 	// File capabilities to carry over. Not being able to read them is an
 	// error, not "none": a rename silently drops them.
@@ -439,7 +450,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		if err != nil {
 			return nil, fmt.Errorf("--from %s: no usable lockfile beside it (%v); install only takes binaries produced by `upgrade-caddy build`", abs, err)
 		}
-		info, err := caddybin.Inspect(ctx, abs)
+		info, err := caddybin.InspectAs(ctx, abs, p.runAs)
 		if err != nil {
 			return nil, fmt.Errorf("--from: %w", err)
 		}
@@ -464,6 +475,7 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	bopts.Log = opts.Log
 	bopts.Verbose = opts.Verbose
 	bopts.OnPlan = nil
+	bopts.RunAs = p.runAs
 	bplan, _, err := build.Run(ctx, bopts)
 	if err != nil {
 		return nil, err
@@ -530,7 +542,9 @@ func validationsFromUnits(units []systemd.Unit) []Validation {
 		if cfg == "" {
 			continue
 		}
-		key := strings.Join(append([]string{cfg, adapter, u.WorkingDirectory}, env...), "\x00")
+		// Two units reading one config as different users are two
+		// validations: what the file looks like depends on who opens it.
+		key := strings.Join(append([]string{cfg, adapter, u.WorkingDirectory, u.User, u.Group, strings.Join(u.SupplementaryGroups, " ")}, env...), "\x00")
 		if seen[key] {
 			continue
 		}
@@ -538,6 +552,100 @@ func validationsFromUnits(units []systemd.Unit) []Validation {
 		out = append(out, Validation{Config: cfg, Adapter: adapter, EnvFiles: env, WorkDir: u.WorkingDirectory, From: u.Name})
 	}
 	return out
+}
+
+// chooseAccounts decides who runs the new binary for inspection and
+// validation. Only root can switch accounts, and when install runs as root
+// a binary it has not installed yet should run as anyone else who is known
+// (see caddybin.Account for why):
+//
+//   - a unit's config is validated as the unit's User=, with its Group= and
+//     SupplementaryGroups=, which is exactly who opens the config when the
+//     service runs. A unit without User= runs as root, so validating as
+//     root is no more than the service itself does. A DynamicUser= account
+//     exists only while its unit runs, so that unit is validated as the
+//     inspection account instead.
+//   - inspection (`version`, `list-modules`), and a --config validation
+//     with no unit behind it, run as the user who invoked sudo, else as the
+//     first unit's user, else as root; the plan says which.
+//
+// A unit user that cannot be looked up is a refusal, not a fall back to
+// root: validating as the wrong account answers a different question.
+func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lookup func(name, group string, extra []string) (*caddybin.Account, error)) error {
+	if euid != 0 {
+		return nil // only root can switch accounts, and only root has anything to drop
+	}
+	byUnit := map[string]*caddybin.Account{}
+	dynamic := map[string]bool{}
+	var firstUser *caddybin.Account
+	for _, u := range p.Units {
+		if u.DynamicUser {
+			dynamic[u.Name] = true
+			continue
+		}
+		if u.User == "" {
+			continue // runs as root
+		}
+		a, err := lookup(u.User, u.Group, u.SupplementaryGroups)
+		if err != nil {
+			return fmt.Errorf("%s runs as an account that could not be looked up, so the new binary cannot be validated the way the service would run it: %w", u.Name, err)
+		}
+		if a.UID == 0 {
+			continue // User=root, under whatever name
+		}
+		byUnit[u.Name] = a
+		if firstUser == nil {
+			firstUser = a
+		}
+	}
+	inspect, how := invoker(getenv, lookup)
+	if inspect == nil && firstUser != nil {
+		inspect, how = firstUser, "the service user"
+	}
+	p.runAs = inspect
+	if inspect == nil {
+		p.RunAs = "root (install was not run through sudo and no service user is known)"
+	} else {
+		p.RunAs = inspect.String() + ", " + how
+	}
+	for i := range p.Validations {
+		v := &p.Validations[i]
+		switch a, ok := byUnit[v.From]; {
+		case ok:
+			v.account, v.User = a, a.Name
+		case v.From == "--config" || dynamic[v.From]:
+			v.account, v.User = inspect, "root"
+			if inspect != nil {
+				v.User = inspect.Name
+			}
+		default:
+			v.User = "root" // the unit runs as root
+		}
+	}
+	return nil
+}
+
+// invoker is the user who ran sudo, from the SUDO_UID, SUDO_GID and
+// SUDO_USER variables sudo sets, or nil when install was not run through
+// sudo, or was run through sudo by root. The account is looked up for its
+// groups and home; when that fails (a user known only to a directory
+// service, which os/user built without cgo cannot ask) the IDs sudo gave
+// are used on their own.
+func invoker(getenv func(string) string, lookup func(name, group string, extra []string) (*caddybin.Account, error)) (*caddybin.Account, string) {
+	uid, err := strconv.ParseUint(getenv("SUDO_UID"), 10, 32)
+	gid, gerr := strconv.ParseUint(getenv("SUDO_GID"), 10, 32)
+	if err != nil || gerr != nil || uid == 0 {
+		return nil, ""
+	}
+	a, err := lookup(strconv.FormatUint(uid, 10), "", nil)
+	if err != nil {
+		name := getenv("SUDO_USER")
+		if name == "" {
+			name = strconv.FormatUint(uid, 10)
+		}
+		a = &caddybin.Account{Name: name, UID: uint32(uid), GID: uint32(gid)}
+	}
+	return a, "the user who ran sudo"
 }
 
 // checkWorkDirs refuses a validation whose working directory is the unit
@@ -572,6 +680,9 @@ func buildSelectionFlags(b build.Options) string {
 	}
 	if len(b.Replace) > 0 {
 		set = append(set, "--replace")
+	}
+	if len(b.DropReplace) > 0 {
+		set = append(set, "--drop-replace")
 	}
 	if b.AllowMajor {
 		set = append(set, "--allow-major")
@@ -736,16 +847,17 @@ func recheck(ctx context.Context, plan *Plan) error {
 		return fmt.Errorf("querying systemd: %w", err)
 	}
 	if !sameUnits(plan.Units, units) {
-		return changed(fmt.Sprintf("the units running %s, or their config flags or working directory (planned: %s; now: %s)", plan.Target, unitNamesOrNone(plan.Units), unitNamesOrNone(units)))
+		return changed(fmt.Sprintf("the units running %s, or their config flags, working directory or user (planned: %s; now: %s)", plan.Target, unitNamesOrNone(plan.Units), unitNamesOrNone(units)))
 	}
 	return nil
 }
 
 // sameUnits reports whether two unit lists name the same units in order
-// with the same validation inputs: working directory and the --config,
-// --adapter and --envfile flags. A unit whose config moved while the build
-// ran would otherwise be validated against the old one and restarted on
-// the new one unvalidated.
+// with the same validation inputs: working directory, the account the unit
+// runs as, and the --config, --adapter and --envfile flags. A unit whose
+// config moved while the build ran would otherwise be validated against the
+// old one and restarted on the new one unvalidated, and one whose User=
+// changed would be validated as the wrong account.
 func sameUnits(a, b []systemd.Unit) bool {
 	if len(a) != len(b) {
 		return false
@@ -754,6 +866,8 @@ func sameUnits(a, b []systemd.Unit) bool {
 		ca, aa, ea := a[i].ConfigArgs()
 		cb, ab, eb := b[i].ConfigArgs()
 		if a[i].Name != b[i].Name || a[i].WorkingDirectory != b[i].WorkingDirectory ||
+			a[i].User != b[i].User || a[i].Group != b[i].Group || a[i].DynamicUser != b[i].DynamicUser ||
+			!slices.Equal(a[i].SupplementaryGroups, b[i].SupplementaryGroups) ||
 			ca != cb || aa != ab || !slices.Equal(ea, eb) {
 			return false
 		}
@@ -833,6 +947,9 @@ func validate(ctx context.Context, bin string, v Validation, logw io.Writer, ver
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = v.WorkDir
+	if err := v.account.Apply(cmd); err != nil {
+		return err
+	}
 	out, err := cmd.CombinedOutput()
 	if verbose || err != nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -1066,7 +1183,14 @@ func (p *Plan) WriteText(w io.Writer) {
 		fmt.Fprintln(w, "Validate: skipped, no config known; pass --config to validate")
 	}
 	for _, v := range p.Validations {
-		fmt.Fprintf(w, "Validate: %s (from %s)\n", v.Config, v.From)
+		if v.User != "" {
+			fmt.Fprintf(w, "Validate: %s (from %s, as %s)\n", v.Config, v.From, v.User)
+		} else {
+			fmt.Fprintf(w, "Validate: %s (from %s)\n", v.Config, v.From)
+		}
+	}
+	if p.RunAs != "" {
+		fmt.Fprintf(w, "Run as:   %s, to inspect the new binary\n", p.RunAs)
 	}
 	if p.FileCapabilities != "" {
 		fmt.Fprintf(w, "Caps:     %s (will be re-applied)\n", p.FileCapabilities)

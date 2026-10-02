@@ -84,7 +84,8 @@ getcap "$TARGET"
 OLD_INODE=$(stat -c %i "$TARGET")
 OUT=$("${SUDO[@]}" "$TOOL" install --from "$WORK/caddy-new" --target "$TARGET" 2>&1) || { echo "$OUT"; fail "install exited non-zero"; }
 echo "$OUT"
-assert_contains "$OUT" "Validate: $CONF/Caddyfile (from $UNIT)" "config taken from the unit"
+assert_contains "$OUT" "Validate: $CONF/Caddyfile (from $UNIT, as root)" "config taken from the unit, validated as the unit's user"
+assert_contains "$OUT" "Run as:   $(id -un) (uid $(id -u)), the user who ran sudo" "new binary inspected as the sudo invoker, not root"
 assert_contains "$OUT" "Restarted $UNIT" "unit restarted"
 assert_eq "$(version_of "$TARGET")" "$NEW_VERSION" "target version after upgrade"
 assert_eq "$(stat -c %i "$TARGET.previous")" "$OLD_INODE" ".previous is the old inode"
