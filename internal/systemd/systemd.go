@@ -39,6 +39,8 @@ type Unit struct {
 	Group               string    `json:"group,omitempty"`                // Group=, as given; "" is the user's primary group
 	SupplementaryGroups []string  `json:"supplementary_groups,omitempty"` // SupplementaryGroups=
 	DynamicUser         bool      `json:"dynamic_user,omitempty"`         // DynamicUser=yes: the account exists only while the unit runs
+	Environment         []string  `json:"environment,omitempty"`          // Environment=, KEY=VALUE each
+	EnvironmentFiles    []EnvFile `json:"environment_files,omitempty"`    // EnvironmentFile=, in order
 	ExecSearchPath      []string  `json:"exec_search_path,omitempty"`     // ExecSearchPath=, the directories a bare executable name is looked up in
 	MainPID             int       `json:"main_pid,omitempty"`
 	ActiveState         string    `json:"active_state"`
@@ -76,7 +78,7 @@ func (u Unit) ConfigArgs() (config, adapter string, envfiles []string) {
 	return config, adapter, envfiles
 }
 
-const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p User -p Group -p SupplementaryGroups -p DynamicUser -p ExecSearchPath -p MainPID"
+const showProps = "-p Id -p ExecStart -p ActiveState -p SubState -p WorkingDirectory -p User -p Group -p SupplementaryGroups -p DynamicUser -p Environment -p EnvironmentFiles -p ExecSearchPath -p MainPID"
 
 // defaultSearchPathCompat is systemd's compiled-in executable search path
 // on a split-/usr system (DEFAULT_PATH_COMPAT in src/basic/path-util.h);
@@ -138,6 +140,15 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		// the array; take the commands from there when it can be read.
 		if cmds, err := execStartFromBus(ctx, u.Name); err == nil && len(cmds) > 0 {
 			u.Commands = cmds
+		}
+		// The same goes for Environment= (a value with a space) and
+		// EnvironmentFiles= (a path with one): the D-Bus properties keep
+		// them whole.
+		if env, err := environmentFromBus(ctx, u.Name); err == nil {
+			u.Environment = env
+		}
+		if files, err := environmentFilesFromBus(ctx, u.Name); err == nil {
+			u.EnvironmentFiles = files
 		}
 		for _, c := range u.Commands {
 			if resolves(c.Path, want, search) {
@@ -255,10 +266,15 @@ func resolves(path, want string, search []string) bool {
 	return path == want
 }
 
-// defaultSearchPath asks systemd for its compiled-in executable search path,
+// DefaultSearchPath asks systemd for its compiled-in executable search path,
 // which is what a bare ExecStart= name is looked up in when the unit sets
-// no ExecSearchPath=. Older systemd without that query, or no systemd-path
-// at all, falls back to the compiled-in default of a split-/usr build.
+// no ExecSearchPath=, and what PATH is set to for a service that sets none.
+// Older systemd without that query, or no systemd-path at all, falls back
+// to the compiled-in default of a split-/usr build.
+func DefaultSearchPath(ctx context.Context) []string {
+	return defaultSearchPath(ctx)
+}
+
 func defaultSearchPath(ctx context.Context) []string {
 	out, err := exec.CommandContext(ctx, "systemd-path", "search-binaries-default").Output()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
@@ -403,6 +419,15 @@ func parseShow(out string) []Unit {
 				u.SupplementaryGroups = strings.Fields(v)
 			case "DynamicUser":
 				u.DynamicUser = v == "yes"
+			case "Environment":
+				// Space-joined; UnitsUsing re-reads it over D-Bus for a
+				// matched unit, where an assignment with a space survives.
+				u.Environment = strings.Fields(v)
+			case "EnvironmentFiles":
+				// One line per file, "path (ignore_errors=yes|no)".
+				if f, ok := parseEnvFileShow(v); ok {
+					u.EnvironmentFiles = append(u.EnvironmentFiles, f)
+				}
 			case "ExecSearchPath":
 				// Rendered space-separated; UnitsUsing re-reads it over
 				// D-Bus for a matched unit, where a directory with a space

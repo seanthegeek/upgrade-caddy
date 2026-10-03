@@ -147,9 +147,11 @@ func FromEnv(goproxy, gonoproxy, goprivate string) *Client {
 		NoProxy: noProxy,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 	}
-	if strings.TrimSpace(goproxy) != "" && len(c.Sources) == 0 {
+	if goproxy != "" && len(c.Sources) == 0 {
 		// Mirrors the go command: "GOPROXY list is not the empty string,
-		// but contains no entries".
+		// but contains no entries". Only the entries are trimmed, never the
+		// whole value, so GOPROXY=" " is this error and not the default
+		// public proxy (proxyList in cmd/go/internal/modfetch/proxy.go).
 		c.ConfigErr = errors.New("GOPROXY is set but contains no entries")
 	}
 	return c
@@ -157,11 +159,11 @@ func FromEnv(goproxy, gonoproxy, goprivate string) *Client {
 
 // ParseGOPROXY splits a GOPROXY value into sources, keeping track of
 // whether each is followed by "," or "|". An empty value means the go
-// command's default, "https://proxy.golang.org,direct". As the go command
-// does, an entry that looks like a host rather than a keyword or a URL
-// ("proxy.example.com") gets "https://" prepended.
+// command's default, "https://proxy.golang.org,direct"; a value that is
+// only whitespace is not empty and yields no sources, as for the go
+// command. As the go command does, an entry that looks like a host rather
+// than a keyword or a URL ("proxy.example.com") gets "https://" prepended.
 func ParseGOPROXY(s string) []Source {
-	s = strings.TrimSpace(s)
 	if s == "" {
 		s = defaultGOPROXY
 	}

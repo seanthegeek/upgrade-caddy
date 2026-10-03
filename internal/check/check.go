@@ -251,7 +251,14 @@ func statusRows(r *Report, bin *caddybin.Info) []*Status {
 	}
 	caddyPath := bin.MainPath
 	if caddyPath == "" {
+		// No module info (a distribution build): the module path follows
+		// the major that `caddy version` reported, so a v3 package is
+		// compared with /v3, not with /v2. Anything unparsable or below
+		// v2 falls back to /v2, the only major this tool knows.
 		caddyPath = caddybin.CaddyModulePath
+		if m := semver.Major(installed); m >= 2 {
+			caddyPath = goproxy.MajorPath(caddybin.CaddyModuleBase, m)
+		}
 	}
 	r.Caddy = Status{Name: "caddy", Package: caddyPath, Installed: installed, PseudoVersion: semver.IsPseudo(installed)}
 	var rows []*Status

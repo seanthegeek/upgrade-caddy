@@ -170,7 +170,8 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    and flags as `build`, or stages one from `--from PATH` (a binary that
    `build` produced, with its lockfile beside it; the lockfile must
    describe that exact binary, versions and checksums included, or it is
-   refused, and the check is repeated on the staged copies so the pair
+   refused, and every check, the refusal of a binary without module
+   information included, is repeated on the staged copies so the pair
    that gets installed is the pair that was checked). This lets the build run
    as your own user and only the swap run as root:
 
@@ -187,12 +188,17 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
 4. Runs `validate` with the new binary against each real config, in the
    directory the service runs in (`/` when the unit sets none, the unit
    user's home for `~`) and as the account the service runs as (its
-   `User=`, `Group=` and `SupplementaryGroups=`), so the config is read
-   exactly as the service will read it. A unit without `User=` runs as
+   `User=`, `Group=` and `SupplementaryGroups=`) and with the environment
+   the service gets (`PATH` as systemd sets it, then `Environment=` and
+   every `EnvironmentFile=` in systemd's order), so the config is read
+   exactly as the service will read it and `{env.*}` placeholders expand
+   to the service's values rather than the operator's. The manager's own
+   environment, `PassEnvironment=` and `UnsetEnvironment=` are not
+   applied. A unit without `User=` runs as
    root and is validated as root, which is no more than the service itself
    does, with its `Group=` and `SupplementaryGroups=` still applied when
    it sets them; a `--config` given on the command line is validated as
-   the user who invoked `sudo`. A rejected config stops everything before anything
+   the user who invoked `sudo`, in that user's environment. A rejected config stops everything before anything
    changes.
 5. Hard-links the current binary to `<target>.previous`, then renames the
    new one over the target. There is never a moment with no binary at the

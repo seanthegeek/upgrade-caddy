@@ -866,8 +866,8 @@ func TestCommitOutputKeepsThePairTogether(t *testing.T) {
 	os.Remove(lock)
 	os.MkdirAll(filepath.Join(lock, "x"), 0o755)
 	err := commitOutput(filepath.Join(dir, "tmp-bin"), filepath.Join(dir, "tmp-lock"), out)
-	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Errorf("a directory at the lockfile path must fail before the binary moves: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") || !strings.Contains(err.Error(), "the previous output was restored") {
+		t.Errorf("a directory at the lockfile path must fail before the binary moves, and say the binary is back: %v", err)
 	}
 	if b, _ := os.ReadFile(out); string(b) != "new-bin" {
 		t.Errorf("the previous binary must be untouched, got %q", b)

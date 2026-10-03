@@ -253,6 +253,11 @@ func TestEmptyGOPROXYListIsAnError(t *testing.T) {
 	if _, err := c.Latest(context.Background(), "example.com/m"); err == nil || !strings.Contains(err.Error(), "contains no entries") {
 		t.Errorf("lookups must fail with the configuration error: %v", err)
 	}
+	// A whitespace-only value is not empty: the go command trims entries,
+	// not the whole value, and rejects the result as having no entries.
+	if c := FromEnv(" ", "", ""); c.ConfigErr == nil || len(c.Sources) != 0 {
+		t.Errorf("GOPROXY=\" \" must be a configuration error, not the default proxy: %+v", c)
+	}
 	if FromEnv("", "", "").ConfigErr != nil {
 		t.Error("an unset GOPROXY is the default, not an error")
 	}

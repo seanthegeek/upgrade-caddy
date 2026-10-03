@@ -608,8 +608,7 @@ func commitOutput(tmpBin, tmpLock, output string) (err error) {
 	}
 	oldLock, err := moveAside(lockPath)
 	if err != nil {
-		putBack(oldBin, output)
-		return fmt.Errorf("moving the previous lockfile aside: %w", err)
+		return restored(fmt.Errorf("moving the previous lockfile aside: %w", err), oldBin, output, "", lockPath)
 	}
 	if err := os.Rename(tmpBin, output); err != nil {
 		return restored(fmt.Errorf("moving the new binary into place: %w", err), oldBin, output, oldLock, lockPath)

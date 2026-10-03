@@ -220,10 +220,16 @@ func TestIdentifyNoticesReplacement(t *testing.T) {
 	}
 	// The account the unit runs as decides who validate runs as.
 	for name, change := range map[string]func(*systemd.Unit){
-		"user":    func(u *systemd.Unit) { u.User = "caddy" },
-		"group":   func(u *systemd.Unit) { u.Group = "www-data" },
-		"groups":  func(u *systemd.Unit) { u.SupplementaryGroups = []string{"adm"} },
-		"dynamic": func(u *systemd.Unit) { u.DynamicUser = true },
+		"user":        func(u *systemd.Unit) { u.User = "caddy" },
+		"group":       func(u *systemd.Unit) { u.Group = "www-data" },
+		"groups":      func(u *systemd.Unit) { u.SupplementaryGroups = []string{"adm"} },
+		"dynamic":     func(u *systemd.Unit) { u.DynamicUser = true },
+		"environment": func(u *systemd.Unit) { u.Environment = []string{"PORT=1"} },
+		"env file":    func(u *systemd.Unit) { u.EnvironmentFiles = []systemd.EnvFile{{Path: "/etc/x"}} },
+		"env file optional": func(u *systemd.Unit) {
+			u.EnvironmentFiles = []systemd.EnvFile{{Path: "/etc/x", Optional: true}}
+		},
+		"search path": func(u *systemd.Unit) { u.ExecSearchPath = []string{"/opt/bin"} },
 	} {
 		changed := base
 		change(&changed)
@@ -522,6 +528,53 @@ func TestValidationsFromUnits(t *testing.T) {
 	if got := validationsFromUnits(units); len(got) != 3 || got[2].From != "c.service" {
 		t.Errorf("a DynamicUser= unit must not fold into a static one, got %+v", got)
 	}
+	// So is a different environment: {env.*} placeholders expand
+	// differently, and the validation carries the unit's settings.
+	units[2].DynamicUser = false
+	units[2].Environment = []string{"PORT=8080"}
+	got = validationsFromUnits(units)
+	if len(got) != 3 || !reflect.DeepEqual(got[2].UnitEnvironment, []string{"PORT=8080"}) || got[2].unit == nil || got[0].unit.Name != "a.service" {
+		t.Errorf("a unit with its own environment must be its own validation: %+v", got)
+	}
+}
+
+func TestValidateUsesTheUnitEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "caddy")
+	envOut := filepath.Join(dir, "env")
+	os.WriteFile(script, []byte("#!/bin/sh\nenv > "+envOut+"\n"), 0o755)
+	os.WriteFile(filepath.Join(dir, "unit.env"), []byte("TOKEN=from-file\nPORT=9090\n"), 0o644)
+	t.Setenv("LEAKED_FROM_OPERATOR", "yes")
+	u := systemd.Unit{Name: "x.service", Environment: []string{"PORT=8080", "NAME=svc"}, EnvironmentFiles: []systemd.EnvFile{{Path: filepath.Join(dir, "unit.env")}}, ExecSearchPath: []string{"/opt/bin", "/usr/bin"}}
+	v := Validation{Config: "/etc/x", WorkDir: dir, From: u.Name, unit: &u}
+	var log strings.Builder
+	if err := validate(context.Background(), script, v, &log, false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(envOut)
+	env := string(got)
+	for _, want := range []string{"PATH=/opt/bin:/usr/bin\n", "PORT=9090\n", "NAME=svc\n", "TOKEN=from-file\n"} {
+		if !strings.Contains(env, want) {
+			t.Errorf("validate must run with the unit's environment, missing %q in:\n%s", want, env)
+		}
+	}
+	if strings.Contains(env, "LEAKED_FROM_OPERATOR") || strings.Contains(env, "PORT=8080") {
+		t.Errorf("install's own environment and overridden values must not reach validate:\n%s", env)
+	}
+	// A required EnvironmentFile= that cannot be read stops validation
+	// rather than running it with a different environment.
+	u.EnvironmentFiles = []systemd.EnvFile{{Path: filepath.Join(dir, "gone.env")}}
+	if err := validate(context.Background(), script, v, &log, false); err == nil || !strings.Contains(err.Error(), "gone.env") {
+		t.Errorf("a missing required environment file must fail validation: %v", err)
+	}
+	// A --config validation has no unit and keeps install's environment.
+	os.Remove(envOut)
+	if err := validate(context.Background(), script, Validation{Config: "/etc/x", WorkDir: dir, From: "--config"}, &log, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(envOut); !strings.Contains(string(got), "LEAKED_FROM_OPERATOR=yes") {
+		t.Error("a --config validation inherits the caller's environment")
+	}
 }
 
 func TestSwapPreservesSetIDAndStickyBits(t *testing.T) {
@@ -611,6 +664,21 @@ func TestAttestStagedPair(t *testing.T) {
 	}
 	if err := attest(filepath.Join(dir, "missing.lock.json"), info); err == nil {
 		t.Error("a missing staged lockfile must be refused")
+	}
+	// The staged pair is checked as the --from pair was: a distribution
+	// build is refused even with a lockfile whose empty identities would
+	// describe it, since both could have been swapped in after Resolve.
+	empty := filepath.Join(dir, "empty.lock.json")
+	os.WriteFile(empty, []byte(`{"schema":1,"caddy":{"package":"","version":""},"plugins":[]}`), 0o644)
+	distro := &caddybin.Info{Path: filepath.Join(dir, "caddy"), Version: "v2.6.2"}
+	if err := attest(empty, distro); err != nil {
+		t.Fatalf("precondition: Describes accepts the empty pair, got %v", err)
+	}
+	if err := checkStaged(empty, distro); err == nil || !strings.Contains(err.Error(), "no Go module information") {
+		t.Errorf("a staged distribution build must be refused: %v", err)
+	}
+	if err := checkStaged(good, info); err != nil {
+		t.Errorf("a described build output passes: %v", err)
 	}
 }
 

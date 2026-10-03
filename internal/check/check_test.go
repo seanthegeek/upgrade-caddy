@@ -226,4 +226,13 @@ func TestStatusRowsSkipReplacedModules(t *testing.T) {
 	if rows := statusRows(r, plain); len(rows) != 1 || rows[0] != &r.Caddy || r.Caddy.Package != caddybin.CaddyModulePath || r.Caddy.Installed != "v2.11.6" {
 		t.Errorf("plain Caddy row: %d rows, %+v", len(rows), r.Caddy)
 	}
+	// A distribution build's module path follows the major its version
+	// reports, so a v3 package is compared with /v3; junk stays on /v2.
+	for version, want := range map[string]string{"v3.1.0": caddybin.CaddyModuleBase + "/v3", "2.6.2": caddybin.CaddyModulePath, "v1.0.0": caddybin.CaddyModulePath, "garbage": caddybin.CaddyModulePath} {
+		r = &Report{}
+		statusRows(r, &caddybin.Info{Version: version})
+		if r.Caddy.Package != want {
+			t.Errorf("distro build at %s: path %s, want %s", version, r.Caddy.Package, want)
+		}
+	}
 }

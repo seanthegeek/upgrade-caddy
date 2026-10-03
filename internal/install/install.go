@@ -109,7 +109,17 @@ type Validation struct {
 	From     string   `json:"from"`           // "--config" or the unit name
 	User     string   `json:"user,omitempty"` // who validate runs as; set only when running as root
 
+	// The environment the unit gives its processes, applied to validate so
+	// a config that reads {env.*} placeholders is checked with the values
+	// the service sees: Environment=, EnvironmentFile= (read when validate
+	// runs) and the PATH systemd would set. Unset for a --config
+	// validation, which inherits install's own environment.
+	UnitEnvironment []string          `json:"unit_environment,omitempty"`
+	UnitEnvFiles    []systemd.EnvFile `json:"unit_environment_files,omitempty"`
+	ExecSearchPath  []string          `json:"exec_search_path,omitempty"`
+
 	account *caddybin.Account // nil means the current user
+	unit    *systemd.Unit     // the unit this validation comes from, nil for --config
 }
 
 // Result is what Run did.
@@ -175,9 +185,9 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	// pair checked is the pair that gets installed: the staged copies,
 	// not the --from files Resolve looked at, which anyone able to write
 	// the source directory could have replaced since.
-	if err := attest(newLock, newInfo); err != nil {
+	if err := checkStaged(newLock, newInfo); err != nil {
 		cleanup()
-		return plan, nil, fmt.Errorf("the staged lockfile does not describe the staged binary: %w", err)
+		return plan, nil, err
 	}
 	// The plan's safety checks are minutes old by now if a build ran.
 	// Confirm the world still matches it before anything is validated or
@@ -436,6 +446,13 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		if err := checkWorkDirs(p.Validations); err != nil {
 			return nil, err
 		}
+		// A unit whose EnvironmentFile= cannot be read now could not be
+		// validated the way it runs; better to know before the build.
+		for _, v := range p.Validations {
+			if _, err := systemd.LoadEnvironment(*v.unit); err != nil {
+				return nil, fmt.Errorf("%s: %w; its config cannot be validated with the environment the service gets", v.From, err)
+			}
+		}
 	}
 	// Who runs the new binary before it is installed. Decided here, once,
 	// so the plan shows it and Run cannot drift from it. Without root, a
@@ -565,7 +582,7 @@ func commitLockfile(target, newLock, previous string) error {
 func validationsFromUnits(units []systemd.Unit) []Validation {
 	var out []Validation
 	seen := map[string]bool{}
-	for _, u := range units {
+	for i, u := range units {
 		cfg, adapter, env := u.ConfigArgs()
 		if cfg == "" {
 			continue
@@ -573,15 +590,27 @@ func validationsFromUnits(units []systemd.Unit) []Validation {
 		// Two units reading one config as different users are two
 		// validations: what the file looks like depends on who opens it.
 		// DynamicUser= changes the account too (such a unit is validated
-		// as the inspection account), so it is part of the key.
-		key := strings.Join(append([]string{cfg, adapter, u.WorkingDirectory, u.User, u.Group, strings.Join(u.SupplementaryGroups, " "), strconv.FormatBool(u.DynamicUser)}, env...), "\x00")
+		// as the inspection account), and the unit's environment changes
+		// what {env.*} placeholders expand to, so both are in the key.
+		key := strings.Join(append([]string{cfg, adapter, u.WorkingDirectory, u.User, u.Group, strings.Join(u.SupplementaryGroups, " "), strconv.FormatBool(u.DynamicUser), envKey(u)}, env...), "\x00")
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		out = append(out, Validation{Config: cfg, Adapter: adapter, EnvFiles: env, WorkDir: u.WorkingDirectory, From: u.Name})
+		unit := units[i]
+		out = append(out, Validation{Config: cfg, Adapter: adapter, EnvFiles: env, WorkDir: u.WorkingDirectory, From: u.Name,
+			UnitEnvironment: u.Environment, UnitEnvFiles: u.EnvironmentFiles, ExecSearchPath: u.ExecSearchPath, unit: &unit})
 	}
 	return out
+}
+
+// envKey renders a unit's environment settings for comparison.
+func envKey(u systemd.Unit) string {
+	var files []string
+	for _, f := range u.EnvironmentFiles {
+		files = append(files, fmt.Sprintf("%s:%t", f.Path, f.Optional))
+	}
+	return strings.Join(u.Environment, "\x01") + "\x02" + strings.Join(files, "\x01") + "\x02" + strings.Join(u.ExecSearchPath, "\x01")
 }
 
 // lookups are the account and group lookups chooseAccounts uses, injected
@@ -975,7 +1004,8 @@ func recheck(ctx context.Context, plan *Plan) error {
 
 // sameUnits reports whether two unit lists name the same units in order
 // with the same validation inputs: working directory, the account the unit
-// runs as, and the --config, --adapter and --envfile flags. A unit whose
+// runs as, its Environment=, EnvironmentFile= and ExecSearchPath=, and the
+// --config, --adapter and --envfile flags. A unit whose
 // config moved while the build ran would otherwise be validated against the
 // old one and restarted on the new one unvalidated, and one whose User=
 // changed would be validated as the wrong account.
@@ -989,6 +1019,7 @@ func sameUnits(a, b []systemd.Unit) bool {
 		if a[i].Name != b[i].Name || a[i].WorkingDirectory != b[i].WorkingDirectory ||
 			a[i].User != b[i].User || a[i].Group != b[i].Group || a[i].DynamicUser != b[i].DynamicUser ||
 			!slices.Equal(a[i].SupplementaryGroups, b[i].SupplementaryGroups) ||
+			envKey(a[i]) != envKey(b[i]) ||
 			ca != cb || aa != ab || !slices.Equal(ea, eb) {
 			return false
 		}
@@ -1001,6 +1032,20 @@ func unitNamesOrNone(units []systemd.Unit) string {
 		return "none"
 	}
 	return unitNames(units)
+}
+
+// checkStaged repeats on the staged pair every check Resolve made on the
+// --from pair: a distribution build is refused, since a lockfile with empty
+// identities would otherwise describe a binary with no module information,
+// and the lockfile must describe the binary.
+func checkStaged(lockPath string, info *caddybin.Info) error {
+	if info.IsDistroBuild() {
+		return fmt.Errorf("the staged binary %s has no Go module information; not a build output", info.Path)
+	}
+	if err := attest(lockPath, info); err != nil {
+		return fmt.Errorf("the staged lockfile does not describe the staged binary: %w", err)
+	}
+	return nil
 }
 
 // attest checks that the lockfile at lockPath describes the inspected
@@ -1068,6 +1113,13 @@ func validate(ctx context.Context, bin string, v Validation, logw io.Writer, ver
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = v.WorkDir
+	if v.unit != nil {
+		env, err := unitEnviron(ctx, *v.unit)
+		if err != nil {
+			return fmt.Errorf("%s: %w; its config cannot be validated with the environment the service gets", v.From, err)
+		}
+		cmd.Env = env
+	}
 	if err := v.account.Apply(cmd); err != nil {
 		return err
 	}
@@ -1081,6 +1133,30 @@ func validate(ctx context.Context, bin string, v Validation, logw io.Writer, ver
 		return fmt.Errorf("the new binary rejected %s: %w; nothing was changed", v.Config, err)
 	}
 	return nil
+}
+
+// unitEnviron builds the environment validate runs in for a unit's config:
+// what systemd would give the service rather than what install inherited
+// from the operator's shell, so {env.*} placeholders expand to the values
+// the service sees. It is PATH as systemd sets it (ExecSearchPath= when set,
+// else systemd's default search path), then Environment= and every
+// EnvironmentFile= in systemd's merge order (systemd.LoadEnvironment), read
+// now rather than at Resolve so a file edited during the build is seen.
+// HOME, USER and LOGNAME follow from the account (Account.Apply), as they
+// do for a User= service. Not applied: the manager's own environment,
+// PassEnvironment= and UnsetEnvironment=, which are rare on a web server
+// unit and documented as such.
+func unitEnviron(ctx context.Context, u systemd.Unit) ([]string, error) {
+	path := u.ExecSearchPath
+	if len(path) == 0 {
+		path = systemd.DefaultSearchPath(ctx)
+	}
+	env := []string{"PATH=" + strings.Join(path, ":")}
+	vars, err := systemd.LoadEnvironment(u)
+	if err != nil {
+		return nil, err
+	}
+	return append(env, vars...), nil
 }
 
 // swapLockfile installs newLock as <target>.lock.json, keeping any existing
@@ -1309,11 +1385,14 @@ func (p *Plan) WriteText(w io.Writer) {
 		fmt.Fprintln(w, "Validate: skipped, no config known; pass --config to validate")
 	}
 	for _, v := range p.Validations {
+		from := v.From
 		if v.User != "" {
-			fmt.Fprintf(w, "Validate: %s (from %s, as %s)\n", v.Config, v.From, v.User)
-		} else {
-			fmt.Fprintf(w, "Validate: %s (from %s)\n", v.Config, v.From)
+			from += ", as " + v.User
 		}
+		if n := len(v.UnitEnvironment) + len(v.UnitEnvFiles); n > 0 {
+			from += fmt.Sprintf(", with the unit's environment (%d Environment= and %d EnvironmentFile= settings)", len(v.UnitEnvironment), len(v.UnitEnvFiles))
+		}
+		fmt.Fprintf(w, "Validate: %s (from %s)\n", v.Config, from)
 	}
 	if p.RunAs != "" {
 		fmt.Fprintf(w, "Run as:   %s, to inspect the new binary\n", p.RunAs)

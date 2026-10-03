@@ -67,8 +67,13 @@ only state that matters, and the tool is built around that.
 - `internal/pkgmgr` asks dpkg, rpm, pacman, apk, Homebrew or FreeBSD `pkg`
   which package owns a file, failing closed when none can say.
 - `internal/systemd` finds service units whose `ExecStart` runs a binary,
-  parses their config flags, and drives systemctl through a `Controller`
-  interface so install's restart sequence can be tested with a fake. A
+  parses their config flags, reads their `Environment=` and
+  `EnvironmentFile=` (over D-Bus for a matched unit, so values and paths
+  with spaces survive) and loads the files with a port of systemd's own
+  parser (`ParseEnvFile`, from `src/basic/env-file.c`, tested on
+  systemd's `test-env-file.c` cases) in systemd's merge order, and drives
+  systemctl through a `Controller` interface so install's restart
+  sequence can be tested with a fake. A
   bare executable name in `ExecStart` (`caddy run`, allowed since systemd
   239) is looked up the way systemd does before running it: in the unit's
   `ExecSearchPath=` when set, else systemd's compiled-in default path
@@ -139,8 +144,11 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    A binary with no Go module information (Ubuntu's `caddy` package is one)
    cannot have its plugin set reproduced, so `build` refuses it unless
    `--fresh` says to ignore it, and `install` refuses it outright. `check`
-   still works and says why. `IsDistroBuild()` means exactly "no module
-   info", nothing else.
+   still works and says why, comparing the version `caddy version` printed
+   with the module path of that version's major (`/v3` for a v3 package,
+   `/v2` for anything else or unparsable), since a distribution build
+   carries no module path of its own. `IsDistroBuild()` means exactly "no
+   module info", nothing else.
 6. **`install` never writes over a system package, and there is no bypass
    flag.** Package ownership is checked separately from distro build: the
    official Caddy apt repository installs a dpkg-owned `/usr/bin/caddy` that
@@ -174,7 +182,10 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    gets `https://`; the variables are read from the process environment
    and then the `GOENV` file, as `go env` resolves them, and a variable
    that is set but empty counts as unset (`cfg.Getenv` tests `val != ""`),
-   so `GOPRIVATE=` cannot hide a persisted private pattern. The file is
+   so `GOPRIVATE=` cannot hide a persisted private pattern, while a value
+   that is only whitespace is set: `proxyList` trims entries, not the
+   value, so `GOPROXY=" "` is "contains no entries", never the default
+   public proxy. The file is
    read whole and split by line as `readEnvFile` does, never with a
    scanner whose token limit would drop a long line. An `@latest` answer
    must be a canonical version for the path (`module.Check` and
@@ -205,8 +216,20 @@ These are implemented in `internal/install`; keep them true.
   is the one systemd would use: `/` when the unit sets none, the unit
   user's home for `~` (looked up through `os/user`; when that fails the
   unit is refused for validation rather than validated in the wrong
-  place). No config known means a warning and no validation, not a
-  failure.
+  place). The environment is the one systemd would give the service, not
+  the one install inherited from the operator's shell, because Caddy
+  expands `{env.*}` placeholders while adapting a config: `PATH` from
+  `ExecSearchPath=` or systemd's default search path, then `Environment=`
+  and every `EnvironmentFile=` merged as `strv_env_merge` does (later
+  wins, files after `Environment=`; a required file that is missing is a
+  refusal, an optional "-" one is skipped; files are read when `validate`
+  runs, so an edit during the build is seen), and `HOME`, `USER` and
+  `LOGNAME` from the account. Not applied, and documented as such: the
+  manager's own environment, `PassEnvironment=` and `UnsetEnvironment=`.
+  A `--config` validation has no unit and inherits install's environment.
+  A unit's environment settings are part of the validation key and of the
+  pre-swap recheck. No config known means a warning and no validation,
+  not a failure.
 - The target is resolved through symlinks first and the real file is what
   is replaced; hard-linking and renaming a symlink would leave the referent
   and every service executing it on the old binary. A link whose referent
@@ -274,8 +297,10 @@ These are implemented in `internal/install`; keep them true.
   must be listed twice). The replacement matters because a module
   replaced by a local directory has no checksum, so the directory is all
   that tells two such builds apart. `Resolve` checks the source pair, and
-  `Run` checks the staged copies again before validating, because the
-  source directory is typically writable by a less privileged user and
+  `Run` checks the staged copies again before validating (`checkStaged`:
+  the distribution-build refusal too, since a lockfile with empty
+  identities would describe a binary with no module information), because
+  the source directory is typically writable by a less privileged user and
   either file could have been replaced between the two.
 - `Resolve`'s checks are repeated by `recheck` right before validation
   and the swap, because a build can take minutes: the target must resolve

@@ -28,6 +28,7 @@ User=caddy
 Group=caddy
 DynamicUser=no
 SupplementaryGroups=
+Environment=
 MainPID=315
 
 Id=systemd-tmpfiles-clean.service
@@ -42,6 +43,9 @@ SubState=failed
 WorkingDirectory=/srv
 DynamicUser=yes
 SupplementaryGroups=adm www-data
+Environment=FOO=bar BAZ=qux
+EnvironmentFiles=/etc/caddy-ci/env (ignore_errors=no)
+EnvironmentFiles=/etc/caddy-ci/env.d/*.conf (ignore_errors=yes)
 MainPID=0
 `
 
@@ -59,6 +63,15 @@ func TestParseShow(t *testing.T) {
 	}
 	if u := units[1]; !u.DynamicUser || !reflect.DeepEqual(u.SupplementaryGroups, []string{"adm", "www-data"}) || u.User != "" {
 		t.Errorf("custom unit account: %+v", u)
+	}
+	// Environment= and EnvironmentFiles= (rendered "path (ignore_errors=..)"
+	// per line, systemctl-show.c) are kept; the first unit sets neither.
+	if u := units[1]; !reflect.DeepEqual(u.Environment, []string{"FOO=bar", "BAZ=qux"}) ||
+		!reflect.DeepEqual(u.EnvironmentFiles, []EnvFile{{Path: "/etc/caddy-ci/env"}, {Path: "/etc/caddy-ci/env.d/*.conf", Optional: true}}) {
+		t.Errorf("custom unit environment: %+v %+v", u.Environment, u.EnvironmentFiles)
+	}
+	if len(c.Environment) != 0 || len(c.EnvironmentFiles) != 0 {
+		t.Errorf("caddy unit sets no environment: %+v %+v", c.Environment, c.EnvironmentFiles)
 	}
 	wantArgs := []string{"/usr/bin/caddy", "run", "--environ", "--config", "/etc/caddy/Caddyfile"}
 	if !reflect.DeepEqual(c.Args, wantArgs) {
