@@ -73,26 +73,29 @@ func TestApply(t *testing.T) {
 	if err := none.Apply(cmd); err != nil || cmd.SysProcAttr != nil || cmd.Env != nil {
 		t.Errorf("nil account must leave the command alone: %v %+v", err, cmd)
 	}
-	self := &Account{Name: "self", UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	self, err := Current()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := self.Apply(cmd); err != nil || cmd.SysProcAttr != nil {
 		t.Errorf("the current account must leave the command alone: %v %+v", err, cmd)
 	}
-	// The same user and group with the process's own supplementary groups
-	// is still the current identity; with different ones it is not.
-	groups, _ := os.Getgroups()
-	for _, g := range groups {
-		self.Groups = append(self.Groups, uint32(g))
-	}
-	if err := self.Apply(cmd); err != nil || cmd.SysProcAttr != nil {
-		t.Errorf("the current groups must leave the command alone: %v %+v", err, cmd)
-	}
+	// A different group list is a different identity, and so is the same
+	// user and group with no supplementary groups when the process has
+	// some: an empty list now means none, not "inherit".
 	withGroup := *self
 	withGroup.Groups = append([]uint32{1 << 20}, withGroup.Groups...)
 	if err := withGroup.Apply(cmd); os.Geteuid() != 0 && (err == nil || !strings.Contains(err.Error(), "requires root")) {
 		t.Errorf("a different group list is a different identity: %v", err)
 	}
+	bare := &Account{Name: "bare", UID: self.UID, GID: self.GID}
+	if len(self.Groups) > 1 || (len(self.Groups) == 1 && self.Groups[0] != self.GID) {
+		if err := bare.Apply(cmd); os.Geteuid() != 0 && (err == nil || !strings.Contains(err.Error(), "requires root")) {
+			t.Errorf("dropping the supplementary groups is a switch: %v", err)
+		}
+	}
 	other := &Account{Name: "other", UID: self.UID + 1, GID: self.GID, Home: "/srv/other"}
-	err := other.Apply(cmd)
+	err = other.Apply(cmd)
 	if os.Geteuid() != 0 {
 		if err == nil || !strings.Contains(err.Error(), "requires root") {
 			t.Errorf("switching accounts without root must be refused, got %v", err)
@@ -101,6 +104,34 @@ func TestApply(t *testing.T) {
 	}
 	if err != nil || cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential.Uid != other.UID {
 		t.Errorf("as root the child gets the account's credentials: %v %+v", err, cmd.SysProcAttr)
+	}
+}
+
+func TestSameIdentity(t *testing.T) {
+	a := &Account{UID: 999, GID: 999, Groups: []uint32{999, 33}}
+	for name, b := range map[string]*Account{
+		"same":                       {UID: 999, GID: 999, Groups: []uint32{999, 33}},
+		"primary not repeated":       {UID: 999, GID: 999, Groups: []uint32{33}},
+		"different order":            {UID: 999, GID: 999, Groups: []uint32{33, 999}},
+		"primary duplicated in list": {UID: 999, GID: 999, Groups: []uint32{33, 999, 999}},
+	} {
+		if !a.SameIdentity(b) {
+			t.Errorf("%s: want same identity, %+v vs %+v", name, a, b)
+		}
+	}
+	for name, b := range map[string]*Account{
+		"other user":    {UID: 1000, GID: 999, Groups: []uint32{999, 33}},
+		"other group":   {UID: 999, GID: 33, Groups: []uint32{999, 33}},
+		"missing group": {UID: 999, GID: 999, Groups: []uint32{999}},
+		"extra group":   {UID: 999, GID: 999, Groups: []uint32{999, 33, 4}},
+		"nil":           nil,
+	} {
+		if a.SameIdentity(b) {
+			t.Errorf("%s: want different identity, %+v vs %+v", name, a, b)
+		}
+	}
+	if (*Account)(nil).SameIdentity(a) {
+		t.Error("nil is nobody")
 	}
 }
 

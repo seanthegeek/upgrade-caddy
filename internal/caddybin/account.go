@@ -95,14 +95,21 @@ func LookupAccount(name, group string, extra []string) (*Account, error) {
 
 // Apply makes cmd run as the account. When the account is the current
 // identity, supplementary groups included, nothing changes. Otherwise the
-// process must be root, and the child then gets the account's user, group
-// and supplementary groups (an empty group list is left as inherited, which
-// is what systemd does for a service that sets none), with HOME, USER and
-// LOGNAME naming the account the way systemd sets them for a User= service;
-// the rest of the environment is inherited. A nil account means the current
-// user.
+// process must be root, and the child then gets exactly the account's user,
+// group and supplementary groups: an empty list means none, never the
+// parent's, so a binary run as the sudo invoker or as a root service with
+// Group= alone does not keep root's extra groups. HOME, USER and LOGNAME
+// name the account the way systemd sets them for a User= service; the rest
+// of the environment is inherited. A nil account means the current user.
 func (a *Account) Apply(cmd *exec.Cmd) error {
-	if a == nil || a.isCurrent() {
+	if a == nil {
+		return nil
+	}
+	cur, err := Current()
+	if err != nil {
+		return err
+	}
+	if a.SameIdentity(cur) {
 		return nil
 	}
 	if os.Geteuid() != 0 {
@@ -111,7 +118,7 @@ func (a *Account) Apply(cmd *exec.Cmd) error {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: a.UID, Gid: a.GID, Groups: a.Groups, NoSetGroups: len(a.Groups) == 0}
+	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: a.UID, Gid: a.GID, Groups: a.Groups}
 	env := cmd.Env
 	if env == nil {
 		env = os.Environ()
@@ -138,38 +145,47 @@ func (a *Account) environ(env []string) []string {
 	return kept
 }
 
-// isCurrent reports whether the account is the identity the process already
-// has: user, group and, when the account lists any, supplementary groups.
-// IDs are compared as uint32, since an ID never exceeds 32 bits while int
-// is 32 bits on some targets.
-func (a *Account) isCurrent() bool {
-	if a.UID != uint32(os.Geteuid()) || a.GID != uint32(os.Getegid()) {
-		return false
-	}
-	if len(a.Groups) == 0 {
-		return true
-	}
-	have, err := os.Getgroups()
+// Current is the identity of this process: effective user and group and
+// the supplementary groups. IDs are converted as uint32, since an ID never
+// exceeds 32 bits while int is 32 bits on some targets.
+func Current() (*Account, error) {
+	groups, err := os.Getgroups()
 	if err != nil {
-		return false
+		return nil, fmt.Errorf("reading the process's groups: %w", err)
 	}
-	return sameSet(a.Groups, have)
+	a := &Account{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	for _, g := range groups {
+		a.Groups = append(a.Groups, uint32(g))
+	}
+	return a, nil
 }
 
-// sameSet reports whether two group lists hold the same IDs, in any order.
-func sameSet(want []uint32, have []int) bool {
-	set := map[uint32]bool{}
-	for _, g := range want {
+// SameIdentity reports whether two accounts would give a process the same
+// permissions: the same user, the same group and the same set of groups
+// overall. The primary group is counted among the groups on both sides,
+// because whether it also appears in the supplementary list varies between
+// how a login was set up and how a service is started, without changing
+// what the process may read.
+func (a *Account) SameIdentity(b *Account) bool {
+	if a == nil || b == nil || a.UID != b.UID || a.GID != b.GID {
+		return false
+	}
+	return groupSet(a) == groupSet(b)
+}
+
+// groupSet renders an account's groups, primary included, as a canonical
+// string for comparison.
+func groupSet(a *Account) string {
+	set := map[uint32]bool{a.GID: true}
+	for _, g := range a.Groups {
 		set[g] = true
 	}
-	seen := map[uint32]bool{}
-	for _, g := range have {
-		if g < 0 || !set[uint32(g)] {
-			return false
-		}
-		seen[uint32(g)] = true
+	ids := make([]string, 0, len(set))
+	for g := range set {
+		ids = append(ids, strconv.FormatUint(uint64(g), 10))
 	}
-	return len(seen) == len(set)
+	slices.Sort(ids)
+	return strings.Join(ids, ",")
 }
 
 // String names the account for a plan: "caddy (uid 999)".

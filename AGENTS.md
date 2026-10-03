@@ -119,7 +119,10 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    `verify` applies the same rule to the resolved version: on a bare path
    it may not land in another major than the installed one without
    `--allow-major`. A `vN+incompatible` release on the bare path and a
-   `/vN` module path are one major, counted once by `check`.
+   `/vN` module path are one major: `check` counts it once, and `--with`
+   may move a plugin installed at `vN+incompatible` to the `/vN` path
+   without `--allow-major`, because the installed version's major, not
+   the path's, is the one being left.
 4. **Never use Caddy's download/build server.** Builds go through the xcaddy
    library on the local machine. The build server is the thing upstream is
    removing.
@@ -160,7 +163,9 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    to a proxy. A 404 from a proxy is final; `direct` is not consulted.
    `file://` proxies are parsed as URLs and read from disk; a bare host
    gets `https://`; the variables are read from the process environment
-   and then the `GOENV` file, as `go env` resolves them. One lookup is
+   and then the `GOENV` file, as `go env` resolves them, and a variable
+   that is set but empty counts as unset (`cfg.Getenv` tests `val != ""`),
+   so `GOPRIVATE=` cannot hide a persisted private pattern. One lookup is
    made per Go module, however many Caddy modules it registers. Lookups
    use the proxy's optional
    `@latest` endpoint and do not apply retractions, and the newer-major
@@ -302,15 +307,17 @@ These are implemented in `internal/install`; keep them true.
   service with a restricted capability set reads files by its groups
   like anyone else); a `DynamicUser=` unit, whose account exists only
   while it runs, is validated as the inspection account; a unit user or
-  group that cannot be looked up is a refusal. `Account.Apply` treats a
-  different supplementary group list as a different identity, and
-  `LookupAccount` seeds the supplementary list with `Group=` in place of
-  the user's own primary group when one is set, as systemd's
-  `initgroups(user, gid)` does. Without root nothing can be switched, so
-  a validation whose unit runs as another account (root included) is a
-  reason to need root, reported by `Resolve` before any build; a normal
-  user's `install --no-restart` can no longer validate a service's config
-  as themselves. A Go module that registers several Caddy modules is
+  group that cannot be looked up is a refusal. `Account.SameIdentity`
+  compares user, group and the full group set (primary folded in), an
+  empty supplementary list means none and is set as such, never left
+  inherited from root, and `LookupAccount` seeds the supplementary list
+  with `Group=` in place of the user's own primary group when one is set,
+  as systemd's `initgroups(user, gid)` does. Without root nothing can be
+  switched, so a validation whose unit runs as another identity (another
+  user, or the same user with other groups, root included) is a reason to
+  need root, reported by `Resolve` before any build; a normal user's
+  `install --no-restart` can no longer validate a service's config as
+  themselves. A Go module that registers several Caddy modules is
   named to `--upgrade` and `--drop-replace` by any of its IDs.
   The staged copy and the build output are made executable before they
   are inspected so another account can run them, and a unit whose user

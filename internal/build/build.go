@@ -307,11 +307,22 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		base, major := goproxy.SplitMajor(path)
 		if i, ok := sameBase(p.Plugins, base, path); ok {
 			pl := &p.Plugins[i]
-			if !opts.AllowMajor {
-				return nil, fmt.Errorf("--with %s would move %s from major v%d to v%d; pass --allow-major to do this deliberately", spec, pl.Package, majorOfPath(pl.Package), major)
+			// The installed version says what major the plugin is at, not
+			// its path: a bare path holds v0, v1 and vN+incompatible alike,
+			// so moving vN+incompatible to the /vN path is the same major.
+			oldMajor := semver.Major(pl.Installed)
+			if oldMajor < 0 {
+				oldMajor = majorOfPath(pl.Package)
+			}
+			if oldMajor != major && !opts.AllowMajor {
+				return nil, fmt.Errorf("--with %s would move %s from major v%d to v%d; pass --allow-major to do this deliberately", spec, pl.Package, oldMajor, major)
 			}
 			delete(index, pl.Package)
-			pl.Note = join(pl.Note, "major version change from "+pl.Package+"@"+pl.Installed)
+			if oldMajor == major {
+				pl.Note = join(pl.Note, "module path change from "+pl.Package+"@"+pl.Installed+" within the same major")
+			} else {
+				pl.Note = join(pl.Note, "major version change from "+pl.Package+"@"+pl.Installed)
+			}
 			if pl.replacedBy != "" {
 				// The user named a new module path, which is a new source;
 				// the old path's replacement cannot apply to it.

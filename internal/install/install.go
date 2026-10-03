@@ -201,6 +201,14 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	}
 
 	// 3. Swap the binary, then the lockfile, keeping both previous copies.
+	// Validation can take a while too, so the world is checked once more
+	// right before the swap: the mode, owner and capabilities about to be
+	// applied were read from the file Resolve saw, and must not land on a
+	// file that was replaced or became a package's since.
+	if err := recheck(ctx, plan); err != nil {
+		cleanup()
+		return plan, nil, err
+	}
 	fmt.Fprintf(logw, "==> installing %s\n", plan.Target)
 	previous, err := swap(plan.Target, newPath, plan.caps)
 	if err != nil {
@@ -427,7 +435,11 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 	// Who runs the new binary before it is installed. Decided here, once,
 	// so the plan shows it and Run cannot drift from it. Without root, a
 	// validation that would have to switch accounts is a reason to need it.
-	switchReasons, err := p.chooseAccounts(os.Geteuid(), os.Getenv, realLookups)
+	self, err := caddybin.Current()
+	if err != nil {
+		return nil, err
+	}
+	switchReasons, err := p.chooseAccounts(self, os.Getenv, realLookups)
 	if err != nil {
 		return nil, err
 	}
@@ -599,14 +611,16 @@ var realLookups = lookups{account: caddybin.LookupAccount, group: caddybin.Looku
 // root: validating as the wrong account answers a different question.
 //
 // Without root nothing can be switched, so a validation whose unit runs as
-// another account (root included) is returned as a reason to need root,
-// which Resolve reports before any build starts. `install --no-restart` by
-// a normal user would otherwise validate a service's config as that user
-// and install a binary whose config was never checked with the service's
-// permissions. A --config with no unit behind it, and a DynamicUser= unit,
-// are validated as the caller, which is what root would do too.
-func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lk lookups) (rootReasons []string, err error) {
-	if euid != 0 {
+// another identity (another user, or the same user with other groups, root
+// included) is returned as a reason to need root, which Resolve reports
+// before any build starts. `install --no-restart` by a normal user would
+// otherwise validate a service's config as that user and install a binary
+// whose config was never checked with the service's permissions. A
+// --config with no unit behind it, and a DynamicUser= unit, are validated
+// as the caller, which is what root would do too. self is the caller's
+// own identity, from caddybin.Current.
+func (p *Plan) chooseAccounts(self *caddybin.Account, getenv func(string) string, lk lookups) (rootReasons []string, err error) {
+	if self.UID != 0 {
 		for i := range p.Validations {
 			v := &p.Validations[i]
 			u, ok := unitNamed(p.Units, v.From)
@@ -622,8 +636,8 @@ func (p *Plan) chooseAccounts(euid int, getenv func(string) string, lk lookups) 
 					return nil, err
 				}
 			}
-			if a.UID == uint32(euid) {
-				continue // the caller already is that user
+			if a.SameIdentity(self) {
+				continue // the caller already has exactly that identity
 			}
 			v.account, v.User = a, a.Name
 			if a.UID == 0 {

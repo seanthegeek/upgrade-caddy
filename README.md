@@ -106,6 +106,8 @@ changes unless you say so:
   compile against the next, so this is always a deliberate step. A branch
   or commit given to `--with` is resolved by `go get` during the build,
   so the resolved version is checked against the same rule afterwards.
+  Moving a plugin installed at `vN+incompatible` on a bare module path to
+  its `/vN` path is the same major and needs no flag.
 - `--fresh` ignores the installed binary. The plugin set is then only what
   `--with` gives, which is how you build a first custom binary on a machine
   running a distribution package.
@@ -150,10 +152,12 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    and checks up front
    whether root is needed (to write the directory, restart the unit,
    re-apply file capabilities, or validate as the account the service
-   runs as) so a long build never ends in "permission denied". These checks are repeated right before step 4: if the target,
-   its package ownership, its capabilities, the set of units running it,
-   or those units' config flags, working directory or user changed while
-   the build ran, nothing is touched and `install` asks to be re-run.
+   runs as) so a long build never ends in "permission denied". These
+   checks are repeated right before step 4 and again right before step 5:
+   if the target, its package ownership, its capabilities, the set of
+   units running it, or those units' config flags, working directory or
+   user changed while the build or the validation ran, nothing is touched
+   and `install` asks to be re-run.
 3. Builds the new binary into the target's directory with the same rules
    and flags as `build`, or stages one from `--from PATH` (a binary that
    `build` produced, with its lockfile beside it; the lockfile must

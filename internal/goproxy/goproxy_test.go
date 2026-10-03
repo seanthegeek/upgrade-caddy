@@ -304,6 +304,13 @@ func TestGoEnvFile(t *testing.T) {
 	if got := GoEnv("GOPRIVATE"); got != "other.example/*" {
 		t.Errorf("process env should win: %q", got)
 	}
+	// An empty process value is "unset" to the go command (cfg.Getenv
+	// tests val != ""), so it must not hide the persisted value either.
+	t.Setenv("GOPRIVATE", "")
+	reset()
+	if got := GoEnv("GOPRIVATE"); got != "corp.example/*" {
+		t.Errorf("an empty process value must fall through to the GOENV file: %q", got)
+	}
 	// GOENV=off disables the file.
 	os.Unsetenv("GOPRIVATE")
 	t.Setenv("GOENV", "off")

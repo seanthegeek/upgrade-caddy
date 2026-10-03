@@ -85,10 +85,14 @@ var (
 	envFile     map[string]string
 )
 
-// GoEnv returns the effective value of a Go environment variable: the
-// process environment wins, then the GOENV file, then "".
+// GoEnv returns the effective value of a Go environment variable: a
+// non-empty process value wins, then the GOENV file, then "". A variable
+// that is set but empty counts as unset, as in the go command's cfg.Getenv
+// (cmd/go/internal/cfg/cfg.go), so `GOPRIVATE=` on the command line does
+// not hide a private pattern persisted with `go env -w` and send those
+// modules to the public proxy.
 func GoEnv(key string) string {
-	if v, ok := os.LookupEnv(key); ok {
+	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	envFileOnce.Do(func() { envFile = readGoEnvFile() })

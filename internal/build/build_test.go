@@ -205,6 +205,22 @@ func TestResolveBarePathMajorChange(t *testing.T) {
 	if p, err := resolve(t, src, Options{With: []string{"github.com/example/plugin@v1.0.0"}, AllowMajor: true}); err != nil || plugin(p, "github.com/example/plugin").Version != "v1.0.0" {
 		t.Errorf("explicit --with with --allow-major: %v", err)
 	}
+	// v2+incompatible on the bare path and the /v2 module path are one
+	// major: moving between them is a path change, not a major change, and
+	// needs no --allow-major. The installed version decides, not the path.
+	src.Plugins[0].Version = "v2.0.0+incompatible"
+	p, err = resolve(t, src, Options{With: []string{"github.com/example/plugin/v2@v2.0.1"}})
+	if err != nil {
+		t.Fatalf("same major across the path change must not need --allow-major: %v", err)
+	}
+	if pl := plugin(p, "github.com/example/plugin/v2"); pl == nil || pl.Version != "v2.0.1" || !strings.Contains(pl.Note, "within the same major") || len(p.Plugins) != 1 {
+		t.Errorf("path move within the major: %+v", p.Plugins)
+	}
+	// A v1 on the bare path to /v2 is still a major change.
+	src.Plugins[0].Version = "v1.3.0"
+	if _, err := resolve(t, src, Options{With: []string{"github.com/example/plugin/v2@v2.0.1"}}); err == nil || !strings.Contains(err.Error(), "from major v1 to v2") {
+		t.Errorf("v1 to /v2 must need --allow-major: %v", err)
+	}
 }
 
 func TestResolveCaddyMajor(t *testing.T) {

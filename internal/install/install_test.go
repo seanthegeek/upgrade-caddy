@@ -985,13 +985,16 @@ func TestChooseAccounts(t *testing.T) {
 	newPlan := func() *Plan {
 		return &Plan{Units: units, Validations: validationsFromUnits(units)}
 	}
+	rootSelf := &caddybin.Account{Name: "root"}
+	userSelf := &caddybin.Account{Name: "sean", UID: 1000, GID: 1000, Groups: []uint32{1000, 27}}
+	caddySelf := &caddybin.Account{Name: "caddy", UID: 999, GID: 999}
 
 	// Not root: nothing can be switched, so every validation that would
 	// have to run as another account (root included) is a reason to need
 	// root, named per config; a DynamicUser= unit and a --config run as
 	// the caller, and so does a unit that runs as the caller.
 	p := newPlan()
-	reasons, err := p.chooseAccounts(1000, sudo, fakeLookups)
+	reasons, err := p.chooseAccounts(userSelf, sudo, fakeLookups)
 	if err != nil || p.RunAs != "" || p.runAs != nil {
 		t.Errorf("as a normal user no inspection account is chosen: %v %+v", err, p)
 	}
@@ -1002,16 +1005,27 @@ func TestChooseAccounts(t *testing.T) {
 		t.Errorf("accounts recorded for the plan: %+v", p.Validations)
 	}
 	p = newPlan()
-	if reasons, err := p.chooseAccounts(999, sudo, fakeLookups); err != nil || len(reasons) != 1 || !strings.Contains(reasons[0], "root.service") {
+	if reasons, err := p.chooseAccounts(caddySelf, sudo, fakeLookups); err != nil || len(reasons) != 1 || !strings.Contains(reasons[0], "root.service") {
 		t.Errorf("a caller who is the unit user needs no root for it: %v %q", err, reasons)
 	}
+	// The same user with other groups is another identity: a unit with the
+	// caller's User= but its own Group= or SupplementaryGroups= still
+	// needs root to be validated as the service would read the config.
+	grouped := []systemd.Unit{
+		{Name: "g.service", User: "caddy", Group: "www-data", Args: []string{"caddy", "run", "--config", "/etc/g"}},
+		{Name: "s.service", User: "caddy", SupplementaryGroups: []string{"adm"}, Args: []string{"caddy", "run", "--config", "/etc/s"}},
+	}
+	p = &Plan{Units: grouped, Validations: validationsFromUnits(grouped)}
+	if reasons, err := p.chooseAccounts(caddySelf, noSudo, fakeLookups); err != nil || len(reasons) != 2 || !strings.Contains(reasons[0], "/etc/g as caddy") || !strings.Contains(reasons[1], "/etc/s as caddy") {
+		t.Errorf("same user, other groups must need root: %v %q", err, reasons)
+	}
 	p = &Plan{Validations: []Validation{{Config: "/etc/x", From: "--config"}}}
-	if reasons, err := p.chooseAccounts(1000, noSudo, fakeLookups); err != nil || len(reasons) != 0 {
+	if reasons, err := p.chooseAccounts(userSelf, noSudo, fakeLookups); err != nil || len(reasons) != 0 {
 		t.Errorf("--config as a normal user: %v %q", err, reasons)
 	}
 	ghostUnits := []systemd.Unit{{Name: "x.service", User: "ghost", Args: []string{"caddy", "run", "--config", "/etc/x"}}}
 	p = &Plan{Units: ghostUnits, Validations: validationsFromUnits(ghostUnits)}
-	if _, err := p.chooseAccounts(1000, noSudo, fakeLookups); err == nil || !strings.Contains(err.Error(), "x.service") {
+	if _, err := p.chooseAccounts(userSelf, noSudo, fakeLookups); err == nil || !strings.Contains(err.Error(), "x.service") {
 		t.Errorf("an unknown unit user is a refusal for a normal user too: %v", err)
 	}
 
@@ -1020,7 +1034,7 @@ func TestChooseAccounts(t *testing.T) {
 	// root, and a DynamicUser= unit (whose account does not exist yet) as
 	// the invoker.
 	p = newPlan()
-	if _, err := p.chooseAccounts(0, sudo, fakeLookups); err != nil {
+	if _, err := p.chooseAccounts(rootSelf, sudo, fakeLookups); err != nil {
 		t.Fatal(err)
 	}
 	if p.runAs == nil || p.runAs.UID != 1000 || !strings.Contains(p.RunAs, "sean (uid 1000)") || !strings.Contains(p.RunAs, "sudo") {
@@ -1050,36 +1064,36 @@ func TestChooseAccounts(t *testing.T) {
 
 	// Root without sudo: the first unit's user stands in for inspection.
 	p = newPlan()
-	if _, err := p.chooseAccounts(0, noSudo, fakeLookups); err != nil || p.runAs == nil || p.runAs.UID != 999 || !strings.Contains(p.RunAs, "service user") {
+	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err != nil || p.runAs == nil || p.runAs.UID != 999 || !strings.Contains(p.RunAs, "service user") {
 		t.Errorf("without sudo the service user is used: %v %+v %q", err, p.runAs, p.RunAs)
 	}
 	// Root through sudo from root is no invoker either.
 	p = newPlan()
-	if _, err := p.chooseAccounts(0, fakeEnv(map[string]string{"SUDO_UID": "0", "SUDO_GID": "0", "SUDO_USER": "root"}), fakeLookups); err != nil || p.runAs == nil || p.runAs.UID != 999 {
+	if _, err := p.chooseAccounts(rootSelf, fakeEnv(map[string]string{"SUDO_UID": "0", "SUDO_GID": "0", "SUDO_USER": "root"}), fakeLookups); err != nil || p.runAs == nil || p.runAs.UID != 999 {
 		t.Errorf("sudo from root is not an invoker to drop to: %v %+v", err, p.runAs)
 	}
 	// Root, no sudo, no units: root, said plainly, for a --config
 	// validation too.
 	p = &Plan{Validations: []Validation{{Config: "/etc/x", From: "--config"}}}
-	if _, err := p.chooseAccounts(0, noSudo, fakeLookups); err != nil || p.runAs != nil || !strings.HasPrefix(p.RunAs, "root (") || p.Validations[0].User != "root" || p.Validations[0].account != nil {
+	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err != nil || p.runAs != nil || !strings.HasPrefix(p.RunAs, "root (") || p.Validations[0].User != "root" || p.Validations[0].account != nil {
 		t.Errorf("nothing to drop to must be said, not hidden: %v %+v", err, p)
 	}
 	// With sudo, a --config validation runs as the invoker.
 	p = &Plan{Validations: []Validation{{Config: "/etc/x", From: "--config"}}}
-	if _, err := p.chooseAccounts(0, sudo, fakeLookups); err != nil || p.Validations[0].User != "sean" || p.Validations[0].account != p.runAs {
+	if _, err := p.chooseAccounts(rootSelf, sudo, fakeLookups); err != nil || p.Validations[0].User != "sean" || p.Validations[0].account != p.runAs {
 		t.Errorf("--config validation runs as the invoker: %v %+v", err, p.Validations[0])
 	}
 	// A unit user that cannot be looked up is a refusal, not a fall back
 	// to root.
 	ghost := []systemd.Unit{{Name: "x.service", User: "ghost", Args: []string{"caddy", "run", "--config", "/etc/x"}}}
 	p = &Plan{Units: ghost, Validations: validationsFromUnits(ghost)}
-	if _, err := p.chooseAccounts(0, sudo, fakeLookups); err == nil || !strings.Contains(err.Error(), "x.service") || !strings.Contains(err.Error(), "could not be looked up") {
+	if _, err := p.chooseAccounts(rootSelf, sudo, fakeLookups); err == nil || !strings.Contains(err.Error(), "x.service") || !strings.Contains(err.Error(), "could not be looked up") {
 		t.Errorf("unknown unit user must refuse: %v", err)
 	}
 	// User= naming an account with uid 0 is root under another name.
 	admin := []systemd.Unit{{Name: "a.service", User: "admin", Args: []string{"caddy", "run", "--config", "/etc/a"}}}
 	p = &Plan{Units: admin, Validations: validationsFromUnits(admin)}
-	if _, err := p.chooseAccounts(0, noSudo, fakeLookups); err != nil || p.Validations[0].User != "root" || p.Validations[0].account != nil || p.runAs != nil {
+	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err != nil || p.Validations[0].User != "root" || p.Validations[0].account != nil || p.runAs != nil {
 		t.Errorf("uid 0 under another name is root: %v %+v", err, p)
 	}
 	// A root unit that sets Group= or SupplementaryGroups= still runs with
@@ -1091,7 +1105,7 @@ func TestChooseAccounts(t *testing.T) {
 		{Name: "u.service", User: "admin", Group: "www-data", Args: []string{"caddy", "run", "--config", "/etc/u"}},
 	}
 	p = &Plan{Units: grp, Validations: validationsFromUnits(grp)}
-	if _, err := p.chooseAccounts(0, noSudo, fakeLookups); err != nil {
+	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err != nil {
 		t.Fatal(err)
 	}
 	if a := p.Validations[0].account; a == nil || a.UID != 0 || a.GID != 33 || !reflect.DeepEqual(a.Groups, []uint32{4}) || p.Validations[0].User != "root" {
@@ -1108,7 +1122,7 @@ func TestChooseAccounts(t *testing.T) {
 	}
 	bad := []systemd.Unit{{Name: "b.service", Group: "nope", Args: []string{"caddy", "run", "--config", "/etc/b"}}}
 	p = &Plan{Units: bad, Validations: validationsFromUnits(bad)}
-	if _, err := p.chooseAccounts(0, noSudo, fakeLookups); err == nil || !strings.Contains(err.Error(), "b.service") {
+	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err == nil || !strings.Contains(err.Error(), "b.service") {
 		t.Errorf("an unknown group on a root unit must refuse: %v", err)
 	}
 }
