@@ -1,0 +1,38 @@
+package main
+
+import (
+	"flag"
+	"io"
+	"testing"
+)
+
+func TestParseFlags(t *testing.T) {
+	newSet := func() *flag.FlagSet {
+		fs := flag.NewFlagSet("x", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		fs.Bool("json", false, "")
+		return fs
+	}
+	if code, ok := parseFlags(newSet(), []string{"--json"}); !ok || code != exitOK {
+		t.Errorf("valid flags: code=%d ok=%v", code, ok)
+	}
+	if code, ok := parseFlags(newSet(), []string{"-h"}); ok || code != exitOK {
+		t.Errorf("-h: code=%d ok=%v, want stop with 0", code, ok)
+	}
+	// A usage error is an error (1), never 2, which check reserves for
+	// "updates available".
+	if code, ok := parseFlags(newSet(), []string{"--nope"}); ok || code != exitError {
+		t.Errorf("malformed flag: code=%d ok=%v, want stop with 1", code, ok)
+	}
+	// A stray positional argument is a usage error, not silently ignored.
+	if code, ok := parseFlags(newSet(), []string{"--json", "/usr/local/bin/caddy"}); ok || code != exitError {
+		t.Errorf("positional argument: code=%d ok=%v, want stop with 1", code, ok)
+	}
+	// The same rule for the commands that take no flags.
+	if code := rejectArgs(nil); code != exitOK {
+		t.Errorf("version with no arguments: %d", code)
+	}
+	if code := rejectArgs([]string{"extra"}); code != exitError {
+		t.Errorf("version with a trailing argument must be a usage error: %d", code)
+	}
+}

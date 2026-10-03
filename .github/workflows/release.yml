@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check the tag matches the version in main.go
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          code="$(sed -n 's/^var version = "\(.*\)"$/\1/p' main.go)"
+          if [ "$tag" != "$code" ]; then
+            echo "tag v$tag does not match version \"$code\" in main.go" >&2
+            exit 1
+          fi
+
+      - name: Hermetic checks
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -short ./...
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '
+            /^## \[/ { if (found) exit; found = ($0 ~ "^## \\[" v "\\]") ; next }
+            /^\[[^]]+\]: / { if (found) exit; next }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md has no section for [$v]; add one before tagging" >&2
+            exit 1
+          fi
+          cat notes.md
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --release-notes notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

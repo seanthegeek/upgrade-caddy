@@ -1,0 +1,61 @@
+# GoReleaser configuration. Run by .github/workflows/release.yml on a v* tag.
+# Verify locally with: goreleaser release --snapshot --clean
+version: 2
+
+project_name: upgrade-caddy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: upgrade-caddy
+    main: .
+    binary: upgrade-caddy
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+      - freebsd
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: freebsd
+        goarch: arm
+      - goos: freebsd
+        goarch: arm64
+
+archives:
+  - id: tarballs
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    files:
+      - README.md
+      - CHANGELOG.md
+      - LICENSE*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  # Release notes come from CHANGELOG.md, extracted by the workflow.
+  disable: true
+
+release:
+  # Tags carry the v prefix; release titles do not.
+  name_template: "{{ .Version }}"
+  prerelease: auto
+  mode: replace

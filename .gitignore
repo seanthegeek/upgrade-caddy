@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Build output of this project
+/upgrade-caddy
+# GoReleaser output
+/dist/

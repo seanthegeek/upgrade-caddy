@@ -1,0 +1,138 @@
+package caddybin
+
+import (
+	"context"
+	"runtime/debug"
+	"strings"
+	"testing"
+)
+
+const sample = `admin.api.load
+admin.api.metrics
+
+  Standard modules: 2
+
+dns.providers.cloudflare v0.0.0-20240814120000-0123456789ab github.com/caddy-dns/cloudflare
+http.handlers.replace_response v0.0.0-20240101000000-abcdefabcdef github.com/caddyserver/replace-response => ../replace-response
+http.handlers.broken v1.2.3 github.com/example/broken [some error text]
+
+  Non-standard modules: 3
+
+mystery.module
+
+  Unknown modules: 1
+`
+
+func TestParseListModules(t *testing.T) {
+	std, nonstd, unknown := ParseListModules(sample)
+	if std != 2 {
+		t.Errorf("standard=%d want 2", std)
+	}
+	if len(nonstd) != 3 {
+		t.Fatalf("nonstandard=%d want 3: %+v", len(nonstd), nonstd)
+	}
+	cf := nonstd[0]
+	if cf.ModuleID != "dns.providers.cloudflare" || cf.Package != "github.com/caddy-dns/cloudflare" || cf.Version != "v0.0.0-20240814120000-0123456789ab" {
+		t.Errorf("bad cloudflare entry: %+v", cf)
+	}
+	if nonstd[1].Replace != "../replace-response" {
+		t.Errorf("replace not parsed: %+v", nonstd[1])
+	}
+	if nonstd[2].Error != "some error text" || nonstd[2].Version != "v1.2.3" {
+		t.Errorf("error line not parsed: %+v", nonstd[2])
+	}
+	if len(unknown) != 1 || unknown[0].ModuleID != "mystery.module" {
+		t.Errorf("unknown not parsed: %+v", unknown)
+	}
+}
+
+func TestParseListModulesDistro(t *testing.T) {
+	out := "tls.stek.standard\n\n  Standard modules: 98\n\n  Non-standard modules: 0\n\n  Unknown modules: 0\n"
+	std, nonstd, unknown := ParseListModules(out)
+	if std != 98 || len(nonstd) != 0 || len(unknown) != 0 {
+		t.Errorf("got std=%d nonstd=%v unknown=%v", std, nonstd, unknown)
+	}
+}
+
+func TestParseListModulesBareIDs(t *testing.T) {
+	_, _, unknown := ParseListModules("a.b\nc.d\n")
+	if len(unknown) != 2 {
+		t.Errorf("bare IDs should become unknown: %+v", unknown)
+	}
+}
+
+// TestInspectHostCaddy runs against whatever caddy is on PATH. It is skipped
+// under -short and when no caddy is installed, so the hermetic tests above
+// stay the ones CI relies on.
+func TestInspectHostCaddy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short")
+	}
+	path, err := Find("")
+	if err != nil {
+		t.Skip("no caddy on PATH")
+	}
+	info, err := Inspect(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Version == "" || info.GoVersion == "" || info.StandardCount == 0 {
+		t.Errorf("incomplete info: %+v", info)
+	}
+	if info.HasModuleInfo && !strings.HasPrefix(info.MainVersion, "v") {
+		t.Errorf("module info present but main version is %q", info.MainVersion)
+	}
+	if !info.HasModuleInfo && len(info.Plugins) != 0 {
+		t.Errorf("no module info but plugins listed: %+v", info.Plugins)
+	}
+}
+
+func TestIsCaddyModule(t *testing.T) {
+	cases := map[string]bool{
+		"github.com/caddyserver/caddy/v2":   true,
+		"github.com/caddyserver/caddy/v3":   true,
+		"github.com/caddyserver/caddy":      false, // v1, unsupported
+		"github.com/caddyserver/xcaddy":     false,
+		"github.com/caddy-dns/cloudflare":   false,
+		"github.com/caddyserver/caddy/v2/x": false,
+	}
+	for in, want := range cases {
+		if got := IsCaddyModule(in); got != want {
+			t.Errorf("IsCaddyModule(%q)=%v want %v", in, got, want)
+		}
+	}
+}
+
+func TestParseModuleLineEdgeCases(t *testing.T) {
+	if p := parseModuleLine(" [only an error]"); p.ModuleID != "" || p.Error != "only an error" {
+		t.Errorf("error-only line: %+v", p)
+	}
+	if p := parseModuleLine("a.b v1.0.0+incompatible github.com/x/y"); p.Version != "v1.0.0+incompatible" || p.Package != "github.com/x/y" {
+		t.Errorf("incompatible version: %+v", p)
+	}
+}
+
+func TestApplyBuildInfoPrefersItsReplacementPath(t *testing.T) {
+	// list-modules prints the replacement on a space-separated line, so a
+	// directory with a space comes out of the parser truncated; build info
+	// records it whole and wins, as it does for versions and checksums.
+	plugins := []Plugin{
+		{ModuleID: "a", Package: "github.com/example/a", Version: "v0.0.0-20240101000000-abcdefabcdef", Replace: "../my"},
+		{ModuleID: "b", Package: "github.com/example/b", Version: "v1.2.3"},
+		{ModuleID: "c", Package: "github.com/example/c"},
+	}
+	deps := map[string]*debug.Module{
+		"github.com/example/a": {Path: "github.com/example/a", Version: "v0.0.0-20240101000000-abcdefabcdef", Replace: &debug.Module{Path: "../my plugin", Sum: "h1:dir"}},
+		"github.com/example/b": {Path: "github.com/example/b", Version: "v1.2.4", Sum: "h1:b", Replace: &debug.Module{Path: "github.com/fork/b", Version: "v1.2.4-fork", Sum: "h1:fork"}},
+	}
+	applyBuildInfo(plugins, deps)
+	if plugins[0].Replace != "../my plugin" || plugins[0].Sum != "h1:dir" || plugins[0].ReplaceVersion != "" {
+		t.Errorf("directory replacement from build info: %+v", plugins[0])
+	}
+	if plugins[1].Replace != "github.com/fork/b" || plugins[1].ReplaceVersion != "v1.2.4-fork" || plugins[1].Sum != "h1:fork" || plugins[1].Version != "v1.2.4" {
+		t.Errorf("module replacement and version from build info: %+v", plugins[1])
+	}
+	if plugins[2].Replace != "" || plugins[2].Sum != "" {
+		t.Errorf("a module build info does not know is left alone: %+v", plugins[2])
+	}
+}
