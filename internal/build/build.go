@@ -646,7 +646,7 @@ func commitOutput(tmpBin, tmpLock, output string) (err error) {
 	if err := os.Rename(tmpLock, lockPath); err != nil {
 		// Undo the binary too, so the pair at the output stays a pair.
 		if rmErr := os.Remove(output); rmErr != nil {
-			return errors.Join(fmt.Errorf("moving the new lockfile into place: %w; and the new binary could not be removed from %s again, so it sits there without its lockfile", err, output), rmErr)
+			return errors.Join(fmt.Errorf("moving the new lockfile into place: %w; and the new binary could not be removed from %s again, so it sits there without its lockfile; %s", err, output, asideNote(oldBin, oldLock)), rmErr)
 		}
 		return restored(fmt.Errorf("moving the new lockfile into place: %w", err), oldBin, output, oldLock, lockPath)
 	}
@@ -684,6 +684,20 @@ func moveAside(path string) (string, error) {
 		return "", err
 	}
 	return aside.Name(), nil
+}
+
+// asideNote says where the previous output pair is while it is moved
+// aside, for an error in which it could not be put back automatically.
+func asideNote(oldBin, oldLock string) string {
+	switch {
+	case oldBin == "" && oldLock == "":
+		return "nothing was at the output before"
+	case oldLock == "":
+		return "the previous binary is at " + oldBin + " (it had no lockfile)"
+	case oldBin == "":
+		return "the previous lockfile is at " + oldLock + " (there was no previous binary)"
+	}
+	return "the previous binary is at " + oldBin + " and its lockfile at " + oldLock
 }
 
 // restored puts the previous output pair back after a failed commit and

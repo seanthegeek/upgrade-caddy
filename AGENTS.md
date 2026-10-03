@@ -51,7 +51,8 @@ only state that matters, and the tool is built around that.
   as a pair (`commitOutput`: whatever was there before is moved aside and
   put back if either rename fails, so the output never holds a binary
   beside another build's lockfile; the error says "restored" only when
-  both files came back, and otherwise where each one is).
+  both files came back, and otherwise where each one is, including when
+  the new binary itself could not be removed again).
 - `internal/caddybin` inspects a Caddy binary: Go build info read straight
   from the file, plus `caddy version` and `caddy list-modules` run as
   subprocesses.
@@ -387,7 +388,10 @@ These are implemented in `internal/install`; keep them true.
   nothing from the group database, which is what systemd does
   (`get_supplementary_groups` in `src/core/exec-invoke.c`, v255; a root
   service with a restricted capability set reads files by its groups
-  like anyone else); a `DynamicUser=` unit, whose account exists only
+  like anyone else). An explicit `User=root`, or any `User=` resolving to
+  uid 0, is still that named account: `HOME` and `LOGNAME` are set for it
+  as for any `User=`, and its group database groups apply exactly when its
+  effective group is not 0, since systemd skips `initgroups` for gid 0; a `DynamicUser=` unit, whose account exists only
   while it runs, is validated as the inspection account; a unit user or
   group that cannot be looked up is a refusal. `Account.SameIdentity`
   compares user, group and the full group set (primary folded in), an

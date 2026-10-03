@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -586,6 +587,17 @@ func TestValidateUsesTheUnitEnvironment(t *testing.T) {
 	v = Validation{Config: "/etc/x", WorkDir: dir, From: u.Name, unit: &u}
 	if err := validate(context.Background(), script, v, &log, false); err == nil || !strings.Contains(err.Error(), "gone.env") {
 		t.Errorf("a missing required environment file must fail validation: %v", err)
+	}
+	// An explicit User=root gets HOME and LOGNAME like any User=; a unit
+	// without User= gets neither.
+	ctx := context.Background()
+	env2, err := unitEnviron(ctx, systemd.Unit{User: "root"}, &caddybin.Account{Name: "root", Home: "/root"})
+	if err != nil || !slices.Contains(env2, "HOME=/root") || !slices.Contains(env2, "LOGNAME=root") || !slices.Contains(env2, "USER=root") {
+		t.Errorf("User=root environment: %v %v", env2, err)
+	}
+	env3, err := unitEnviron(ctx, systemd.Unit{}, nil)
+	if err != nil || !slices.Contains(env3, "USER=root") || slices.ContainsFunc(env3, func(s string) bool { return strings.HasPrefix(s, "HOME=") || strings.HasPrefix(s, "LOGNAME=") }) {
+		t.Errorf("no User= environment: %v %v", env3, err)
 	}
 	// A --config validation has no unit and keeps install's environment.
 	os.Remove(envOut)
@@ -1303,8 +1315,21 @@ func TestChooseAccounts(t *testing.T) {
 	// User= naming an account with uid 0 is root under another name.
 	admin := []systemd.Unit{{Name: "a.service", User: "admin", Args: []string{"caddy", "run", "--config", "/etc/a"}}}
 	p = &Plan{Units: admin, Validations: validationsFromUnits(admin)}
-	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err != nil || p.Validations[0].User != "root" || p.Validations[0].account != nil || p.runAs != nil {
+	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err != nil || p.Validations[0].User != "root" || p.runAs != nil {
 		t.Errorf("uid 0 under another name is root: %v %+v", err, p)
+	}
+	// But it is still a named account: systemd sets HOME and LOGNAME for
+	// any User=, and with group 0 takes exactly SupplementaryGroups=.
+	if a := p.Validations[0].account; a == nil || a.UID != 0 || a.GID != 0 || a.Name != "admin" || len(a.Groups) != 0 {
+		t.Errorf("an explicit uid-0 User= keeps its account: %+v", a)
+	}
+	rootUnit := []systemd.Unit{{Name: "r.service", User: "root", SupplementaryGroups: []string{"adm"}, Args: []string{"caddy", "run", "--config", "/etc/r"}}}
+	p = &Plan{Units: rootUnit, Validations: validationsFromUnits(rootUnit)}
+	if _, err := p.chooseAccounts(rootSelf, noSudo, fakeLookups); err != nil {
+		t.Fatal(err)
+	}
+	if a := p.Validations[0].account; a == nil || a.Name != "root" || a.Home != "/root" || !reflect.DeepEqual(a.Groups, []uint32{4}) {
+		t.Errorf("User=root with SupplementaryGroups=: %+v", a)
 	}
 	// A root unit that sets Group= or SupplementaryGroups= still runs with
 	// those groups, and a restricted root reads files by them: validate as

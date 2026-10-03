@@ -848,21 +848,26 @@ func unitNamed(units []systemd.Unit, name string) (systemd.Unit, bool) {
 
 // unitAccount resolves the account a unit's processes run as, the way
 // systemd does (src/core/exec-invoke.c, get_supplementary_groups, v255):
-// with User= set, the user's primary group (or Group=), the user's groups
-// from the group database and SupplementaryGroups=; without User=, root
-// with Group= when set and exactly SupplementaryGroups= as the
-// supplementary groups, nothing from the group database. nil means plain
-// root with nothing set, which needs no switching. A User= naming an
-// account with uid 0 is root under another name and is treated the same.
+// with User= set, that account, root included, with its primary group (or
+// Group=), SupplementaryGroups=, and its groups from the group database
+// unless the effective group is 0, for which systemd skips initgroups;
+// without User=, root with Group= when set and exactly
+// SupplementaryGroups=, nothing from the group database. nil means plain
+// root with nothing set, which needs no switching. An explicit User=root
+// is therefore not nil: systemd sets HOME and LOGNAME for it, since
+// set_user_login_env is true whenever User= is set.
 func unitAccount(u systemd.Unit, lk lookups) (*caddybin.Account, error) {
 	if u.User != "" {
 		a, err := lk.account(u.User, u.Group, u.SupplementaryGroups)
 		if err != nil {
 			return nil, err
 		}
-		if a.UID != 0 {
-			return a, nil
+		if a.UID == 0 && a.GID == 0 {
+			if a.Groups, err = groupIDs(u.SupplementaryGroups, lk); err != nil {
+				return nil, err
+			}
 		}
+		return a, nil
 	}
 	if u.Group == "" && len(u.SupplementaryGroups) == 0 {
 		return nil, nil
@@ -871,15 +876,23 @@ func unitAccount(u systemd.Unit, lk lookups) (*caddybin.Account, error) {
 	if err != nil {
 		return nil, err
 	}
-	a.Groups = nil
-	for _, g := range u.SupplementaryGroups {
+	if a.Groups, err = groupIDs(u.SupplementaryGroups, lk); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// groupIDs resolves SupplementaryGroups= names to IDs.
+func groupIDs(names []string, lk lookups) ([]uint32, error) {
+	var ids []uint32
+	for _, g := range names {
 		gid, err := lk.group(g)
 		if err != nil {
 			return nil, err
 		}
-		a.Groups = append(a.Groups, gid)
+		ids = append(ids, gid)
 	}
-	return a, nil
+	return ids, nil
 }
 
 // invoker is the user who ran sudo, from the SUDO_UID, SUDO_GID and

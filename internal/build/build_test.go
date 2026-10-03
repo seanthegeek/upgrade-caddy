@@ -855,6 +855,19 @@ func TestResolveRefusesVersionPrefixes(t *testing.T) {
 	}
 }
 
+func TestAsideNote(t *testing.T) {
+	for name, c := range map[string]struct{ bin, lock, want string }{
+		"nothing":   {"", "", "nothing was at the output before"},
+		"both":      {"/x/.caddy-previous-1", "/x/.caddy.lock.json-previous-2", "binary is at /x/.caddy-previous-1 and its lockfile at /x/.caddy.lock.json-previous-2"},
+		"bin only":  {"/x/.caddy-previous-1", "", "binary is at /x/.caddy-previous-1 (it had no lockfile)"},
+		"lock only": {"", "/x/.caddy.lock.json-previous-2", "lockfile is at /x/.caddy.lock.json-previous-2"},
+	} {
+		if got := asideNote(c.bin, c.lock); !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q", name, got)
+		}
+	}
+}
+
 func TestRestoredWordsTheOutcome(t *testing.T) {
 	dir := t.TempDir()
 	base := errors.New("rename failed")
