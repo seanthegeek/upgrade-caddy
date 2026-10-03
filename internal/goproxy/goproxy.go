@@ -3,7 +3,6 @@
 package goproxy
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -116,21 +115,22 @@ func readGoEnvFile() map[string]string {
 		}
 		file = filepath.Join(dir, "go", "env")
 	}
-	f, err := os.Open(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	// Read whole and split by hand, as readEnvFile does: a scanner would
+	// stop at its token limit and silently drop a long GOPRIVATE line that
+	// the go command still honours. A line without "=" or not starting
+	// with a capital letter (a comment, a blank, a corrupted line) is
+	// ignored, also as the go command does.
 	vals := map[string]string{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || k == "" || k[0] < 'A' || 'Z' < k[0] {
 			continue
 		}
-		if k, v, ok := strings.Cut(line, "="); ok {
-			vals[strings.TrimSpace(k)] = strings.TrimSpace(v)
-		}
+		vals[k] = v
 	}
 	return vals
 }
@@ -251,10 +251,15 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			// A proxy answer that is not a canonical version compatible
 			// with the module path is a broken proxy, not a version.
 			// Without this a value like "garbage" would sort below every
-			// real version and read as "current". It is an error like any
-			// other, so a "|" separator falls through to the next source.
+			// real version and read as "current", and a short form like
+			// "v1.2" (which module.Check accepts) would go into a plan
+			// that go get resolves to "v1.2.0" and verify then rejects
+			// after a long build. It is an error like any other, so a "|"
+			// separator falls through to the next source.
 			if cerr := module.Check(modPath, info.Version); cerr != nil {
 				err = fmt.Errorf("%s: proxy %s returned an invalid version %q: %w", modPath, redacted(s.URL), info.Version, cerr)
+			} else if c := module.CanonicalVersion(info.Version); c != info.Version {
+				err = fmt.Errorf("%s: proxy %s returned an invalid version %q: not in canonical form (%s)", modPath, redacted(s.URL), info.Version, c)
 			} else {
 				return info, nil
 			}

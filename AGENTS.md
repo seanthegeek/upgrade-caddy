@@ -47,8 +47,10 @@ only state that matters, and the tool is built around that.
   module proxy, so it is tested with a fake one. `Plan.Build` runs xcaddy,
   inspects the result to confirm it matches the plan, checks again that no
   unit runs the output path (the check `Run` made before the build is
-  minutes old by then), moves it into place and writes
-  `<output>.lock.json`.
+  minutes old by then), and moves it and `<output>.lock.json` into place
+  as a pair (`commitOutput`: whatever was there before is moved aside and
+  put back if either rename fails, so the output never holds a binary
+  beside another build's lockfile).
 - `internal/caddybin` inspects a Caddy binary: Go build info read straight
   from the file, plus `caddy version` and `caddy list-modules` run as
   subprocesses.
@@ -165,7 +167,13 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    gets `https://`; the variables are read from the process environment
    and then the `GOENV` file, as `go env` resolves them, and a variable
    that is set but empty counts as unset (`cfg.Getenv` tests `val != ""`),
-   so `GOPRIVATE=` cannot hide a persisted private pattern. One lookup is
+   so `GOPRIVATE=` cannot hide a persisted private pattern. The file is
+   read whole and split by line as `readEnvFile` does, never with a
+   scanner whose token limit would drop a long line. An `@latest` answer
+   must be a canonical version for the path (`module.Check` and
+   `module.CanonicalVersion` agreeing); a short form like `v1.2` is a
+   broken proxy, since `go get` would resolve it to `v1.2.0` and `verify`
+   would then reject the build. One lookup is
    made per Go module, however many Caddy modules it registers. Lookups
    use the proxy's optional
    `@latest` endpoint and do not apply retractions, and the newer-major
@@ -190,8 +198,11 @@ These are implemented in `internal/install`; keep them true.
   failure.
 - The target is resolved through symlinks first and the real file is what
   is replaced; hard-linking and renaming a symlink would leave the referent
-  and every service executing it on the old binary. `swap` refuses a
-  symlink as a second line of defence.
+  and every service executing it on the old binary. A link whose referent
+  does not exist yet is followed by hand (relative links from the link's
+  directory, chains and loops handled), so a first install lands where
+  the link points rather than taking the link itself for the target.
+  `swap` refuses a symlink as a second line of defence.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is
   renamed over the target. There is never an instant without a binary at
@@ -269,7 +280,9 @@ These are implemented in `internal/install`; keep them true.
   the forward ones under a fresh deadline per unit, because the caller's
   context is often already cancelled. Error messages say "rolled back" only
   when the restore succeeded, and add "did not come back up" when the
-  verified restart on the restored binary failed. When the binary itself
+  verified restart on the restored binary failed, and claim the failed
+  binary is kept as `.failed` only when that copy succeeded. When the
+  binary itself
   could not be restored, the target still holds the failed binary, so its
   lockfile is left with it and no unit is restarted again: restarting them
   all on the failed binary would take down the ones that came up before

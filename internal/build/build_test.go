@@ -778,3 +778,58 @@ func TestReplacementSurvivesUpgradeAndWith(t *testing.T) {
 		t.Errorf("major move of a replaced plugin: %+v %+v", pl, p.Replacements)
 	}
 }
+
+func TestCommitOutputKeepsThePairTogether(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "caddy")
+	lock := out + ".lock.json"
+	write := func(path, content string) {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A previous build and its lockfile are replaced together.
+	write(out, "old-bin")
+	write(lock, "old-lock")
+	write(filepath.Join(dir, "tmp-bin"), "new-bin")
+	write(filepath.Join(dir, "tmp-lock"), "new-lock")
+	if err := commitOutput(filepath.Join(dir, "tmp-bin"), filepath.Join(dir, "tmp-lock"), out); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "new-bin" {
+		t.Errorf("binary after commit: %q", b)
+	}
+	if l, _ := os.ReadFile(lock); string(l) != "new-lock" {
+		t.Errorf("lockfile after commit: %q", l)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 2 {
+		t.Errorf("the moved-aside copies must be removed, dir holds %d entries", len(entries))
+	}
+	// A lockfile path that cannot be replaced (a directory) is found before
+	// anything moves, and the previous pair is still there afterwards.
+	write(filepath.Join(dir, "tmp-bin"), "newer-bin")
+	write(filepath.Join(dir, "tmp-lock"), "newer-lock")
+	os.Remove(lock)
+	os.MkdirAll(filepath.Join(lock, "x"), 0o755)
+	err := commitOutput(filepath.Join(dir, "tmp-bin"), filepath.Join(dir, "tmp-lock"), out)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("a directory at the lockfile path must fail before the binary moves: %v", err)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "new-bin" {
+		t.Errorf("the previous binary must be untouched, got %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tmp-bin")); err != nil {
+		t.Error("the staged binary must still be where it was")
+	}
+	// A first build into an empty directory has nothing to move aside.
+	empty := t.TempDir()
+	write(filepath.Join(empty, "b"), "bin")
+	write(filepath.Join(empty, "l"), "lock")
+	if err := commitOutput(filepath.Join(empty, "b"), filepath.Join(empty, "l"), filepath.Join(empty, "caddy")); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(empty); len(entries) != 2 {
+		t.Errorf("first commit leaves exactly the pair, got %d entries", len(entries))
+	}
+}

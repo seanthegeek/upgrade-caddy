@@ -192,6 +192,8 @@ func TestLatestBadResponses(t *testing.T) {
 			w.Write([]byte(`{"Version":"garbage"}`))
 		case "/bad.example/noncanonical/@latest":
 			w.Write([]byte(`{"Version":"1.2.3"}`)) // proxies must return the v-prefixed canonical form
+		case "/bad.example/short/@latest":
+			w.Write([]byte(`{"Version":"v1.2"}`)) // module.Check accepts this, but go get resolves it to v1.2.0
 		case "/bad.example/wrongmajor/@latest":
 			w.Write([]byte(`{"Version":"v3.0.0"}`)) // a v3 version cannot live on a bare path
 		case "/bad.example/wrongmajor/v2/@latest":
@@ -204,7 +206,7 @@ func TestLatestBadResponses(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	c := client(srv.URL, "")
-	for _, m := range []string{"bad.example/json", "bad.example/empty", "bad.example/500", "bad.example/garbage", "bad.example/noncanonical", "bad.example/wrongmajor", "bad.example/wrongmajor/v2"} {
+	for _, m := range []string{"bad.example/json", "bad.example/empty", "bad.example/500", "bad.example/garbage", "bad.example/noncanonical", "bad.example/short", "bad.example/wrongmajor", "bad.example/wrongmajor/v2"} {
 		if _, err := c.Latest(ctx, m); err == nil || errors.Is(err, ErrNotFound) {
 			t.Errorf("%s: want a hard error, got %v", m, err)
 		}
@@ -310,6 +312,18 @@ func TestGoEnvFile(t *testing.T) {
 	reset()
 	if got := GoEnv("GOPRIVATE"); got != "corp.example/*" {
 		t.Errorf("an empty process value must fall through to the GOENV file: %q", got)
+	}
+	// A very long line is read whole: the go command reads the file with
+	// os.ReadFile, and a scanner's token limit would drop it silently.
+	long := "GOPRIVATE=" + strings.Repeat("corp.example/team-", 5000) + "x\n"
+	os.WriteFile(envfile, []byte("GOPROXY=https://proxy.corp.example\n"+long+"# comment\nlowercase=ignored\n"), 0o644)
+	os.Unsetenv("GOPRIVATE")
+	reset()
+	if got := GoEnv("GOPRIVATE"); len(got) < 64*1024 || !strings.HasSuffix(got, "x") {
+		t.Errorf("a line past the scanner limit must still be read, got %d bytes", len(got))
+	}
+	if got := GoEnv("lowercase"); got != "" {
+		t.Errorf("a line that is not a valid env name is ignored as the go command does: %q", got)
 	}
 	// GOENV=off disables the file.
 	os.Unsetenv("GOPRIVATE")

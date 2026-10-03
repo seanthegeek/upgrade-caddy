@@ -567,15 +567,85 @@ func (p *Plan) Build(ctx context.Context, opts Options) (*Result, error) {
 	if err := refuseLive(ctx, p.Output, systemd.UnitsUsing); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tmpPath, p.Output); err != nil {
-		os.Remove(tmpLock)
-		return nil, fmt.Errorf("moving the new binary into place: %w", err)
-	}
 	lockPath := p.Output + ".lock.json"
-	if err := os.Rename(tmpLock, lockPath); err != nil {
-		return nil, fmt.Errorf("the binary is at %s but its lockfile could not be moved into place: %w", p.Output, err)
+	if err := commitOutput(tmpPath, tmpLock, p.Output); err != nil {
+		return nil, err
 	}
 	return &Result{Output: p.Output, Lockfile: lockPath, Built: built}, nil
+}
+
+// commitOutput moves the built binary and its lockfile into place as a
+// pair. Whatever was at the output path before (an earlier build and its
+// lockfile) is moved aside first and put back if either rename fails, so
+// the output never holds a binary beside another build's lockfile, and a
+// failed commit leaves what was there before. The output is never a live
+// binary (refuseLive), so moving it aside is safe.
+func commitOutput(tmpBin, tmpLock, output string) (err error) {
+	lockPath := output + ".lock.json"
+	oldBin, err := moveAside(output)
+	if err != nil {
+		return fmt.Errorf("moving the previous output aside: %w", err)
+	}
+	oldLock, err := moveAside(lockPath)
+	if err != nil {
+		putBack(oldBin, output)
+		return fmt.Errorf("moving the previous lockfile aside: %w", err)
+	}
+	if err := os.Rename(tmpBin, output); err != nil {
+		putBack(oldBin, output)
+		putBack(oldLock, lockPath)
+		return fmt.Errorf("moving the new binary into place: %w", err)
+	}
+	if err := os.Rename(tmpLock, lockPath); err != nil {
+		// Undo the binary too, so the pair at the output stays a pair.
+		os.Remove(output)
+		putBack(oldBin, output)
+		putBack(oldLock, lockPath)
+		return fmt.Errorf("moving the new lockfile into place (the previous output was restored): %w", err)
+	}
+	if oldBin != "" {
+		os.Remove(oldBin)
+	}
+	if oldLock != "" {
+		os.Remove(oldLock)
+	}
+	return nil
+}
+
+// moveAside renames an existing regular file at path to an unpredictable
+// name in its directory and returns that name, or "" when nothing is
+// there. Anything else at the path (a directory, say) is an error, found
+// before the output is touched.
+func moveAside(path string) (string, error) {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%s exists and is not a regular file", path)
+	}
+	aside, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-previous-*")
+	if err != nil {
+		return "", err
+	}
+	aside.Close()
+	if err := os.Rename(path, aside.Name()); err != nil {
+		os.Remove(aside.Name())
+		return "", err
+	}
+	return aside.Name(), nil
+}
+
+// putBack restores a file moved aside by moveAside; a "" means nothing was
+// there, and the restore is best effort on a path already being reported
+// as failed.
+func putBack(aside, path string) {
+	if aside != "" {
+		os.Rename(aside, path) //nolint:errcheck // best effort during error handling; the caller reports the original failure
+	}
 }
 
 // Unplanned lists non-standard Go modules compiled into the binary that the

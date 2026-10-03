@@ -102,7 +102,10 @@ changes unless you say so:
   versions; otherwise the build refuses, because quietly swapping a fork
   for the module proxy's code is a change nobody reviewed.
 - `--allow-major` is required for `--caddy-version` or `--with` to move
-  anything to a different major version. Plugins built for one major do not
+  anything to a different major version, and for `--upgrade` or
+  `--upgrade-all` to take a new major published on the same module path
+  (v0 to v1, or a `+incompatible` release); without it those report the
+  newer major as a note and stay put. Plugins built for one major do not
   compile against the next, so this is always a deliberate step. A branch
   or commit given to `--with` is resolved by `go get` during the build,
   so the resolved version is checked against the same rule afterwards.
@@ -139,7 +142,8 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
 `install` does, in order:
 
 1. Resolves the target (the first `caddy` on `PATH` by default; a symlink
-   is followed and the file it points to is what gets replaced), the systemd units
+   is followed and the file it points to is what gets replaced, even when
+   that file does not exist yet), the systemd units
    whose `ExecStart` runs it (a bare executable name there is looked up
    the way systemd does, in the unit's `ExecSearchPath=` or systemd's
    default search path), and the configs to validate against (every

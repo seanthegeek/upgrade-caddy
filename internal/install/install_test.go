@@ -343,9 +343,16 @@ func TestRollbackRestoresEvenWhenFailedCopyCannotBeKept(t *testing.T) {
 	if keepErr == nil || !strings.Contains(keepErr.Error(), "could not keep the failed binary") {
 		t.Errorf("the diagnostic failure must still be reported: %v", keepErr)
 	}
-	// And the operator-facing summary says the rollback succeeded.
-	if msg := rolledBack(restoreErr); !strings.Contains(msg, "rolled back to the previous binary") {
+	// And the operator-facing summary says the rollback succeeded, without
+	// claiming the failed binary was kept when it was not.
+	if msg := rolledBack(restoreErr, keepErr); !strings.Contains(msg, "rolled back to the previous binary") || !strings.Contains(msg, "could not be kept") || strings.Contains(msg, "is kept") {
 		t.Errorf("summary for a successful restore with a failed diagnostic copy: %q", msg)
+	}
+	if msg := rolledBack(nil, nil); !strings.Contains(msg, "is kept as") {
+		t.Errorf("summary for a clean rollback: %q", msg)
+	}
+	if msg := rolledBack(errors.New("x"), nil); !strings.Contains(msg, "ROLLBACK FAILED") {
+		t.Errorf("summary for a failed restore: %q", msg)
 	}
 }
 
@@ -873,6 +880,28 @@ func TestResolveTargetFollowsSymlinks(t *testing.T) {
 	}
 	if _, _, err := resolveTarget(filepath.Join(dir, "no", "such", "caddy")); err == nil {
 		t.Error("a missing directory is an error, not a first install")
+	}
+	// A dangling link is followed to where it points, so a first install
+	// lands on the referent and the link then works; relative links are
+	// taken from the link's own directory, and chains are followed.
+	os.Symlink(filepath.Join(realDir, "caddy-2.12.0"), filepath.Join(realDir, "dangling-abs"))
+	got, exists, err = resolveTarget(filepath.Join(dir, "linkdir", "dangling-abs"))
+	if err != nil || exists || got != filepath.Join(realDir, "caddy-2.12.0") {
+		t.Errorf("dangling absolute link: %q %v %v", got, exists, err)
+	}
+	os.Symlink("caddy-2.12.0", filepath.Join(realDir, "dangling-rel"))
+	got, exists, err = resolveTarget(filepath.Join(realDir, "dangling-rel"))
+	if err != nil || exists || got != filepath.Join(realDir, "caddy-2.12.0") {
+		t.Errorf("dangling relative link: %q %v %v", got, exists, err)
+	}
+	os.Symlink("dangling-rel", filepath.Join(realDir, "chain"))
+	if got, _, err := resolveTarget(filepath.Join(realDir, "chain")); err != nil || got != filepath.Join(realDir, "caddy-2.12.0") {
+		t.Errorf("chain of dangling links: %q %v", got, err)
+	}
+	os.Symlink("loop-b", filepath.Join(realDir, "loop-a"))
+	os.Symlink("loop-a", filepath.Join(realDir, "loop-b"))
+	if _, _, err := resolveTarget(filepath.Join(realDir, "loop-a")); err == nil {
+		t.Error("a symlink loop is an error")
 	}
 }
 

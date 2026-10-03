@@ -293,7 +293,7 @@ func restartUnits(ctx context.Context, ctl systemd.Controller, units []string, t
 		}
 		fmt.Fprintf(logw, "==> rolling back to %s\n", previous)
 		restoreErr, keepErr := rollback(target, previous)
-		summary := rolledBack(restoreErr)
+		summary := rolledBack(restoreErr, keepErr)
 		var lockErr, recovery error
 		if restoreErr != nil {
 			// The target still holds the failed binary. Its lockfile stays
@@ -338,12 +338,16 @@ func removeIfPresent(path string) error {
 }
 
 // rolledBack words the outcome of a rollback for an error message, so a
-// failed restore is never reported as a success.
-func rolledBack(rbErr error) string {
-	if rbErr == nil {
-		return "rolled back to the previous binary (the failed one is kept as <target>.failed)"
+// failed restore is never reported as a success and the failed binary is
+// said to be kept only when it was.
+func rolledBack(restoreErr, keepErr error) string {
+	if restoreErr != nil {
+		return "ROLLBACK FAILED, the target may still hold the failed binary"
 	}
-	return "ROLLBACK FAILED, the target may still hold the failed binary"
+	if keepErr != nil {
+		return "rolled back to the previous binary (the failed one could not be kept as <target>.failed)"
+	}
+	return "rolled back to the previous binary (the failed one is kept as <target>.failed)"
 }
 
 // Resolve decides what install would do. It inspects the target, refuses
@@ -513,8 +517,16 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 }
 
 // resolveTarget follows symlinks from the requested path to the file that
-// will actually be replaced. A missing final path is a first install.
+// will actually be replaced. A missing final path is a first install; a
+// symlink whose referent is missing is followed too, so the first install
+// lands where the link points and the link then works, instead of the
+// link itself being taken for the target and refused by swap after the
+// build.
 func resolveTarget(path string) (real string, exists bool, err error) {
+	return resolveTargetDepth(path, 0)
+}
+
+func resolveTargetDepth(path string, depth int) (real string, exists bool, err error) {
 	real, err = filepath.EvalSymlinks(path)
 	if errors.Is(err, os.ErrNotExist) {
 		// Resolve the directory so a first install into a symlinked
@@ -523,7 +535,23 @@ func resolveTarget(path string) (real string, exists bool, err error) {
 		if err != nil {
 			return "", false, fmt.Errorf("%s: %w", filepath.Dir(path), err)
 		}
-		return filepath.Join(dir, filepath.Base(path)), false, nil
+		final := filepath.Join(dir, filepath.Base(path))
+		if fi, err := os.Lstat(final); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			// A dangling link: follow it by hand, relative links from the
+			// link's own directory, and resolve from there.
+			if depth >= 40 {
+				return "", false, fmt.Errorf("%s: too many levels of symbolic links", path)
+			}
+			dest, err := os.Readlink(final)
+			if err != nil {
+				return "", false, err
+			}
+			if !filepath.IsAbs(dest) {
+				dest = filepath.Join(dir, dest)
+			}
+			return resolveTargetDepth(dest, depth+1)
+		}
+		return final, false, nil
 	}
 	if err != nil {
 		return "", false, err
@@ -555,7 +583,7 @@ func commitLockfile(target, newLock, previous string) error {
 		return fmt.Errorf("installing the lockfile: %w; the new binary was removed from %s again", err, target)
 	}
 	restoreErr, keepErr := rollback(target, previous)
-	return errors.Join(fmt.Errorf("installing the lockfile: %w; %s", err, rolledBack(restoreErr)), restoreErr, keepErr)
+	return errors.Join(fmt.Errorf("installing the lockfile: %w; %s", err, rolledBack(restoreErr, keepErr)), restoreErr, keepErr)
 }
 
 // validationsFromUnits collects every distinct config the units run the
@@ -1189,7 +1217,7 @@ func swap(target, newPath string, caps []byte) (previous string, err error) {
 	if caps != nil {
 		if err := writeCaps(target, caps); err != nil {
 			restoreErr, keepErr := rollback(target, previous)
-			return "", errors.Join(fmt.Errorf("re-applying file capabilities: %w; %s", err, rolledBack(restoreErr)), restoreErr, keepErr)
+			return "", errors.Join(fmt.Errorf("re-applying file capabilities: %w; %s", err, rolledBack(restoreErr, keepErr)), restoreErr, keepErr)
 		}
 	}
 	return previous, nil
