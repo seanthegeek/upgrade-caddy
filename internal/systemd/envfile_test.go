@@ -69,13 +69,21 @@ func TestLoadEnvironmentMergeOrder(t *testing.T) {
 	if _, err := LoadEnvironment(u); err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Errorf("a missing required file must be an error: %v", err)
 	}
-	// A file that exists but is unreadable is an error even when optional,
-	// as systemd skips only the lookup of a "-" file, not a failed read.
+	// An optional file is skipped on any failure, as systemd continues
+	// past every error of a "-" entry (exec_context_load_environment):
+	// unparsable, unreadable or a relative path. Required, each is an
+	// error.
 	bad := filepath.Join(dir, "bad.env")
 	os.WriteFile(bad, []byte("x=\xff"), 0o644)
-	u.EnvironmentFiles = []EnvFile{{Path: bad, Optional: true}}
-	if _, err := LoadEnvironment(u); err == nil {
-		t.Error("an unparsable optional file must still be an error")
+	u.EnvironmentFiles = []EnvFile{{Path: bad, Optional: true}, {Path: "relative.env", Optional: true}, {Path: one, Optional: true}}
+	if got, err := LoadEnvironment(u); err != nil || !reflect.DeepEqual(got, []string{"A=file1", "D=unit", "B=file1"}) {
+		t.Errorf("optional failures are skipped and the rest still loads: %q %v", got, err)
+	}
+	for name, f := range map[string]EnvFile{"unparsable": {Path: bad}, "relative": {Path: "relative.env"}} {
+		u.EnvironmentFiles = []EnvFile{f}
+		if _, err := LoadEnvironment(u); err == nil {
+			t.Errorf("a required %s file must be an error", name)
+		}
 	}
 	if got, err := LoadEnvironment(Unit{}); err != nil || len(got) != 0 {
 		t.Errorf("no settings, no variables: %q %v", got, err)

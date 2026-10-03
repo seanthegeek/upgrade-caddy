@@ -143,12 +143,11 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		}
 		// The same goes for Environment= (a value with a space) and
 		// EnvironmentFiles= (a path with one): the D-Bus properties keep
-		// them whole.
-		if env, err := environmentFromBus(ctx, u.Name); err == nil {
-			u.Environment = env
-		}
-		if files, err := environmentFilesFromBus(ctx, u.Name); err == nil {
-			u.EnvironmentFiles = files
+		// them whole, and when they cannot be read the lossy rendering is
+		// not good enough to validate a config with.
+		if err := preciseEnvironment(&u, func() ([]string, error) { return environmentFromBus(ctx, u.Name) },
+			func() ([]EnvFile, error) { return environmentFilesFromBus(ctx, u.Name) }); err != nil {
+			return nil, err
 		}
 		for _, c := range u.Commands {
 			if resolves(c.Path, want, search) {
@@ -160,6 +159,31 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 		units = append(units, u)
 	}
 	return units, nil
+}
+
+// preciseEnvironment replaces the environment settings parsed from
+// systemctl show's rendering with the D-Bus properties, which keep each
+// assignment and path whole. If a property cannot be read and the rendering
+// showed settings, that is an error rather than a fall back to the
+// rendering: a value split at a space would validate a config with a
+// different environment from the service's. With nothing rendered there is
+// nothing to get wrong, and the bus is not needed.
+func preciseEnvironment(u *Unit, env func() ([]string, error), files func() ([]EnvFile, error)) error {
+	if len(u.Environment) > 0 {
+		exact, err := env()
+		if err != nil {
+			return fmt.Errorf("%s: reading Environment= over D-Bus: %w (the systemctl show rendering cannot be trusted for values with spaces)", u.Name, err)
+		}
+		u.Environment = exact
+	}
+	if len(u.EnvironmentFiles) > 0 {
+		exact, err := files()
+		if err != nil {
+			return fmt.Errorf("%s: reading EnvironmentFiles= over D-Bus: %w (the systemctl show rendering cannot be trusted for paths with spaces)", u.Name, err)
+		}
+		u.EnvironmentFiles = exact
+	}
+	return nil
 }
 
 // resolveWorkingDirectory turns systemd's rendering of WorkingDirectory

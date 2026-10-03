@@ -23,43 +23,60 @@ type EnvFile struct {
 // settings, in the order systemd merges them (strv_env_merge in
 // src/core/exec-invoke.c, v255, later entries winning): Environment= first,
 // then every EnvironmentFile= in order, each file's later assignments
-// overriding earlier ones. A pattern that matches no file is skipped when
-// the setting is optional and an error otherwise, as systemd skips only the
-// glob failure of a "-" file; a file that exists but cannot be read or
-// parsed is an error either way. The manager's own environment, HOME and
-// friends for User=, PassEnvironment= and UnsetEnvironment= are not part of
-// this list.
+// overriding earlier ones. An optional ("-") file is skipped on any
+// failure, a relative path, no match for its pattern, an unreadable file
+// or one that does not parse, exactly as exec_context_load_environment in
+// src/core/execute.c continues past every error of an "ignore" entry; for
+// a required file each of those is an error, as it fails the unit. The
+// manager's own environment, the login variables for User=,
+// PassEnvironment= and UnsetEnvironment= are not part of this list.
 func LoadEnvironment(u Unit) ([]string, error) {
-	env := mergeEnv(nil, u.Environment)
+	env := MergeEnv(nil, u.Environment)
 	for _, f := range u.EnvironmentFiles {
-		matches, err := filepath.Glob(f.Path)
+		vars, err := loadEnvFile(f.Path)
 		if err != nil {
-			return nil, fmt.Errorf("EnvironmentFile=%s: %w", f.Path, err)
-		}
-		if len(matches) == 0 {
 			if f.Optional {
 				continue
 			}
-			return nil, fmt.Errorf("EnvironmentFile=%s: %w", f.Path, os.ErrNotExist)
+			return nil, fmt.Errorf("EnvironmentFile=%s: %w", f.Path, err)
 		}
-		for _, path := range matches {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return nil, fmt.Errorf("EnvironmentFile=%s: %w", f.Path, err)
-			}
-			vars, err := ParseEnvFile(data)
-			if err != nil {
-				return nil, fmt.Errorf("EnvironmentFile=%s: %w", path, err)
-			}
-			env = mergeEnv(env, vars)
-		}
+		env = MergeEnv(env, vars)
 	}
 	return env, nil
 }
 
-// mergeEnv adds KEY=VALUE entries to env, replacing an existing KEY in place
-// and appending new ones, as strv_env_replace does.
-func mergeEnv(env, add []string) []string {
+// loadEnvFile reads every file an EnvironmentFile= pattern matches, merged
+// in order.
+func loadEnvFile(pattern string) ([]string, error) {
+	if !filepath.IsAbs(pattern) {
+		return nil, errors.New("path is not absolute")
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+	if len(matches) == 0 {
+		return nil, os.ErrNotExist
+	}
+	var env []string
+	for _, path := range matches {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		vars, err := ParseEnvFile(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		env = MergeEnv(env, vars)
+	}
+	return env, nil
+}
+
+// MergeEnv adds KEY=VALUE entries to env, replacing an existing KEY in place
+// and appending new ones, as systemd's strv_env_replace does. It returns
+// env, grown as needed.
+func MergeEnv(env, add []string) []string {
 	for _, kv := range add {
 		k, _, _ := strings.Cut(kv, "=")
 		replaced := false
@@ -126,7 +143,7 @@ func ParseEnvFile(data []byte) ([]string, error) {
 			if !validUTF8(key) || !validUTF8(val) {
 				return errors.New("invalid UTF-8 in environment file")
 			}
-			out = mergeEnv(out, []string{key + "=" + val})
+			out = MergeEnv(out, []string{key + "=" + val})
 			k, v = k[:0], nil
 			lastValueSpace = -1
 			return nil

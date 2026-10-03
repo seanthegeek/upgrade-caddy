@@ -105,6 +105,15 @@ func TestApply(t *testing.T) {
 	if err != nil || cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential.Uid != other.UID {
 		t.Errorf("as root the child gets the account's credentials: %v %+v", err, cmd.SysProcAttr)
 	}
+	if !slices.Contains(cmd.Env, "HOME=/srv/other") {
+		t.Errorf("an inherited environment gets the account's HOME: %v", cmd.Env)
+	}
+	// An environment the caller composed is left alone.
+	composed := exec.Command("true")
+	composed.Env = []string{"HOME=/composed", "X=1"}
+	if err := other.Apply(composed); err != nil || !reflect.DeepEqual(composed.Env, []string{"HOME=/composed", "X=1"}) {
+		t.Errorf("a composed environment must not be rewritten: %v %v", err, composed.Env)
+	}
 }
 
 func TestSameIdentity(t *testing.T) {

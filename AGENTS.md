@@ -63,7 +63,8 @@ only state that matters, and the tool is built around that.
 - `internal/fspath` resolves a path through symbolic links, following a
   final link whose referent does not exist yet; `install` uses it for the
   target and `systemd` for `ExecStart` paths, so both land on the same
-  file.
+  file. Only "not there" means absent; any other failure to look is an
+  error.
 - `internal/pkgmgr` asks dpkg, rpm, pacman, apk, Homebrew or FreeBSD `pkg`
   which package owns a file, failing closed when none can say.
 - `internal/systemd` finds service units whose `ExecStart` runs a binary,
@@ -218,17 +219,26 @@ These are implemented in `internal/install`; keep them true.
   unit is refused for validation rather than validated in the wrong
   place). The environment is the one systemd would give the service, not
   the one install inherited from the operator's shell, because Caddy
-  expands `{env.*}` placeholders while adapting a config: `PATH` from
-  `ExecSearchPath=` or systemd's default search path, then `Environment=`
-  and every `EnvironmentFile=` merged as `strv_env_merge` does (later
-  wins, files after `Environment=`; a required file that is missing is a
-  refusal, an optional "-" one is skipped; files are read when `validate`
-  runs, so an edit during the build is seen), and `HOME`, `USER` and
-  `LOGNAME` from the account. Not applied, and documented as such: the
-  manager's own environment, `PassEnvironment=` and `UnsetEnvironment=`.
-  A `--config` validation has no unit and inherits install's environment.
-  A unit's environment settings are part of the validation key and of the
-  pre-swap recheck. No config known means a warning and no validation,
+  expands `{env.*}` placeholders while adapting a config. In systemd's
+  order (`build_environment` and the `strv_env_merge` call in
+  `src/core/exec-invoke.c`), later entries winning: `PATH` from
+  `ExecSearchPath=` or systemd's default search path, `USER` always (root
+  for a unit without `User=`), `LOGNAME` and `HOME` from the account only
+  for a unit with `User=` or `DynamicUser=`; then `Environment=` and every
+  `EnvironmentFile=`, so an explicit assignment of any of those wins.
+  `Account.Apply` leaves an environment the caller composed alone. A
+  required `EnvironmentFile=` that is missing, relative, unreadable or
+  unparsable is a refusal; an optional "-" one is skipped on any of
+  those, as `exec_context_load_environment` in `src/core/execute.c`
+  continues past every error of an "ignore" entry. Files are read when
+  `validate` runs, so an edit during the build is seen. `Environment=`
+  and `EnvironmentFiles=` come from D-Bus for a matched unit; when the
+  bus cannot be read and `systemctl show` rendered settings, that is an
+  error, not a fall back to the space-split rendering. Not applied, and
+  documented as such: `SHELL`, the manager's own environment,
+  `PassEnvironment=` and `UnsetEnvironment=`. A `--config` validation has
+  no unit and inherits install's environment. A unit's environment
+  settings are part of the validation key and of the pre-swap recheck. No config known means a warning and no validation,
   not a failure.
 - The target is resolved through symlinks first and the real file is what
   is replaced; hard-linking and renaming a symlink would leave the referent

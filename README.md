@@ -189,12 +189,14 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
    directory the service runs in (`/` when the unit sets none, the unit
    user's home for `~`) and as the account the service runs as (its
    `User=`, `Group=` and `SupplementaryGroups=`) and with the environment
-   the service gets (`PATH` as systemd sets it, then `Environment=` and
-   every `EnvironmentFile=` in systemd's order), so the config is read
-   exactly as the service will read it and `{env.*}` placeholders expand
-   to the service's values rather than the operator's. The manager's own
-   environment, `PassEnvironment=` and `UnsetEnvironment=` are not
-   applied. A unit without `User=` runs as
+   the service gets (`PATH`, `USER` and, for a `User=` unit, `HOME` and
+   `LOGNAME` as systemd sets them, then `Environment=` and every
+   `EnvironmentFile=` in systemd's order, explicit assignments winning;
+   an optional `-` file is skipped on any failure, a required one that
+   fails stops the install), so the config is read exactly as the service
+   will read it and `{env.*}` placeholders expand to the service's values
+   rather than the operator's. `SHELL`, the manager's own environment,
+   `PassEnvironment=` and `UnsetEnvironment=` are not applied. A unit without `User=` runs as
    root and is validated as root, which is no more than the service itself
    does, with its `Group=` and `SupplementaryGroups=` still applied when
    it sets them; a `--config` given on the command line is validated as

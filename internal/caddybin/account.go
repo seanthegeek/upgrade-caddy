@@ -98,9 +98,11 @@ func LookupAccount(name, group string, extra []string) (*Account, error) {
 // process must be root, and the child then gets exactly the account's user,
 // group and supplementary groups: an empty list means none, never the
 // parent's, so a binary run as the sudo invoker or as a root service with
-// Group= alone does not keep root's extra groups. HOME, USER and LOGNAME
-// name the account the way systemd sets them for a User= service; the rest
-// of the environment is inherited. A nil account means the current user.
+// Group= alone does not keep root's extra groups. When cmd.Env is unset the
+// inherited environment is used with HOME, USER and LOGNAME naming the
+// account, the way systemd sets them for a User= service; an environment
+// the caller composed is left as it is. A nil account means the current
+// user.
 func (a *Account) Apply(cmd *exec.Cmd) error {
 	if a == nil {
 		return nil
@@ -119,17 +121,19 @@ func (a *Account) Apply(cmd *exec.Cmd) error {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: a.UID, Gid: a.GID, Groups: a.Groups}
-	env := cmd.Env
-	if env == nil {
-		env = os.Environ()
+	// A caller that composed cmd.Env already decided what the account's
+	// variables are (install builds a unit's environment the way systemd
+	// does, where Environment= may override them); only an inherited
+	// environment is rewritten here.
+	if cmd.Env == nil {
+		cmd.Env = a.environ(os.Environ())
 	}
-	cmd.Env = a.environ(env)
 	return nil
 }
 
-// environ rewrites an environment for the account: HOME, USER and LOGNAME
-// name it (HOME only when the account has a home directory) and everything
-// else is kept.
+// environ rewrites an inherited environment for the account: HOME, USER and
+// LOGNAME name it (HOME only when the account has a home directory) and
+// everything else is kept.
 func (a *Account) environ(env []string) []string {
 	kept := make([]string, 0, len(env)+3)
 	for _, kv := range env {

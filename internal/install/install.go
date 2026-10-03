@@ -1114,7 +1114,7 @@ func validate(ctx context.Context, bin string, v Validation, logw io.Writer, ver
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = v.WorkDir
 	if v.unit != nil {
-		env, err := unitEnviron(ctx, *v.unit)
+		env, err := unitEnviron(ctx, *v.unit, v.account)
 		if err != nil {
 			return fmt.Errorf("%s: %w; its config cannot be validated with the environment the service gets", v.From, err)
 		}
@@ -1138,25 +1138,39 @@ func validate(ctx context.Context, bin string, v Validation, logw io.Writer, ver
 // unitEnviron builds the environment validate runs in for a unit's config:
 // what systemd would give the service rather than what install inherited
 // from the operator's shell, so {env.*} placeholders expand to the values
-// the service sees. It is PATH as systemd sets it (ExecSearchPath= when set,
-// else systemd's default search path), then Environment= and every
-// EnvironmentFile= in systemd's merge order (systemd.LoadEnvironment), read
-// now rather than at Resolve so a file edited during the build is seen.
-// HOME, USER and LOGNAME follow from the account (Account.Apply), as they
-// do for a User= service. Not applied: the manager's own environment,
-// PassEnvironment= and UnsetEnvironment=, which are rare on a web server
-// unit and documented as such.
-func unitEnviron(ctx context.Context, u systemd.Unit) ([]string, error) {
+// the service sees. In systemd's order (build_environment and the
+// strv_env_merge call in src/core/exec-invoke.c, v255, later entries
+// winning): first what systemd sets itself, PATH (ExecSearchPath= when set,
+// else systemd's default search path), USER (always; root when the unit
+// sets no User=) and, for a unit with User= or DynamicUser=, LOGNAME and
+// HOME; then Environment= and every EnvironmentFile= (systemd.LoadEnvironment),
+// so an explicit assignment of any of those wins, as it does for the
+// service. The files are read now rather than at Resolve so an edit
+// during the build is seen. Not applied: SHELL (os/user does not expose
+// it), the manager's own environment, PassEnvironment= and
+// UnsetEnvironment=, which are rare on a web server unit and documented
+// as such.
+func unitEnviron(ctx context.Context, u systemd.Unit, account *caddybin.Account) ([]string, error) {
 	path := u.ExecSearchPath
 	if len(path) == 0 {
 		path = systemd.DefaultSearchPath(ctx)
 	}
-	env := []string{"PATH=" + strings.Join(path, ":")}
+	user, home := "root", ""
+	if account != nil {
+		user, home = account.Name, account.Home
+	}
+	env := []string{"PATH=" + strings.Join(path, ":"), "USER=" + user}
+	if u.User != "" || u.DynamicUser {
+		env = append(env, "LOGNAME="+user)
+		if home != "" {
+			env = append(env, "HOME="+home)
+		}
+	}
 	vars, err := systemd.LoadEnvironment(u)
 	if err != nil {
 		return nil, err
 	}
-	return append(env, vars...), nil
+	return systemd.MergeEnv(env, vars), nil
 }
 
 // swapLockfile installs newLock as <target>.lock.json, keeping any existing

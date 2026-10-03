@@ -545,7 +545,7 @@ func TestValidateUsesTheUnitEnvironment(t *testing.T) {
 	os.WriteFile(script, []byte("#!/bin/sh\nenv > "+envOut+"\n"), 0o755)
 	os.WriteFile(filepath.Join(dir, "unit.env"), []byte("TOKEN=from-file\nPORT=9090\n"), 0o644)
 	t.Setenv("LEAKED_FROM_OPERATOR", "yes")
-	u := systemd.Unit{Name: "x.service", Environment: []string{"PORT=8080", "NAME=svc"}, EnvironmentFiles: []systemd.EnvFile{{Path: filepath.Join(dir, "unit.env")}}, ExecSearchPath: []string{"/opt/bin", "/usr/bin"}}
+	u := systemd.Unit{Name: "x.service", Environment: []string{"PORT=8080", "NAME=svc", "HOME=/srv/override"}, EnvironmentFiles: []systemd.EnvFile{{Path: filepath.Join(dir, "unit.env")}}, ExecSearchPath: []string{"/opt/bin", "/usr/bin"}}
 	v := Validation{Config: "/etc/x", WorkDir: dir, From: u.Name, unit: &u}
 	var log strings.Builder
 	if err := validate(context.Background(), script, v, &log, false); err != nil {
@@ -553,17 +553,37 @@ func TestValidateUsesTheUnitEnvironment(t *testing.T) {
 	}
 	got, _ := os.ReadFile(envOut)
 	env := string(got)
-	for _, want := range []string{"PATH=/opt/bin:/usr/bin\n", "PORT=9090\n", "NAME=svc\n", "TOKEN=from-file\n"} {
+	// A unit without User= runs as root: USER is set, HOME and LOGNAME are
+	// not (unless Environment= says so, which wins over systemd's own).
+	for _, want := range []string{"PATH=/opt/bin:/usr/bin\n", "USER=root\n", "HOME=/srv/override\n", "PORT=9090\n", "NAME=svc\n", "TOKEN=from-file\n"} {
 		if !strings.Contains(env, want) {
 			t.Errorf("validate must run with the unit's environment, missing %q in:\n%s", want, env)
 		}
 	}
-	if strings.Contains(env, "LEAKED_FROM_OPERATOR") || strings.Contains(env, "PORT=8080") {
-		t.Errorf("install's own environment and overridden values must not reach validate:\n%s", env)
+	if strings.Contains(env, "LEAKED_FROM_OPERATOR") || strings.Contains(env, "PORT=8080") || strings.Contains(env, "LOGNAME=") {
+		t.Errorf("install's own environment, overridden values and login variables for a root unit must not reach validate:\n%s", env)
+	}
+	// A User= unit gets LOGNAME and HOME from the account, before
+	// Environment= so an explicit assignment still wins; this holds even
+	// when the account is the caller's own, which Apply leaves alone.
+	self, _ := caddybin.Current()
+	self.Name, self.Home = "svc", "/var/lib/svc"
+	withUser := u
+	withUser.User, withUser.Environment = "svc", []string{"PORT=8080"}
+	v = Validation{Config: "/etc/x", WorkDir: dir, From: u.Name, unit: &withUser, account: self}
+	if err := validate(context.Background(), script, v, &log, false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(envOut)
+	for _, want := range []string{"USER=svc\n", "LOGNAME=svc\n", "HOME=/var/lib/svc\n"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("a User= unit gets the login variables of its account, missing %q in:\n%s", want, got)
+		}
 	}
 	// A required EnvironmentFile= that cannot be read stops validation
 	// rather than running it with a different environment.
 	u.EnvironmentFiles = []systemd.EnvFile{{Path: filepath.Join(dir, "gone.env")}}
+	v = Validation{Config: "/etc/x", WorkDir: dir, From: u.Name, unit: &u}
 	if err := validate(context.Background(), script, v, &log, false); err == nil || !strings.Contains(err.Error(), "gone.env") {
 		t.Errorf("a missing required environment file must fail validation: %v", err)
 	}

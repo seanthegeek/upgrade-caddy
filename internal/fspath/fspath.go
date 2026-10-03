@@ -37,8 +37,16 @@ func resolve(path string, depth int) (real string, exists bool, err error) {
 	}
 	final := filepath.Join(dir, filepath.Base(path))
 	fi, err := os.Lstat(final)
-	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
 		return final, false, nil
+	case err != nil:
+		// Only "not there" means a first install; a permission or I/O
+		// failure is an error, never "absent".
+		return "", false, err
+	case fi.Mode()&os.ModeSymlink == 0:
+		// It appeared between the two looks: it exists after all.
+		return final, true, nil
 	}
 	if depth >= maxLinks {
 		return "", false, fmt.Errorf("%s: too many levels of symbolic links", path)

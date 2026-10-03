@@ -238,6 +238,34 @@ func TestParseShowBareNameAndSearchPath(t *testing.T) {
 	}
 }
 
+func TestPreciseEnvironmentFailsClosed(t *testing.T) {
+	boom := errors.New("busctl: no such property")
+	envOK := func() ([]string, error) { return []string{"FOO=a b"}, nil }
+	envBad := func() ([]string, error) { return nil, boom }
+	filesOK := func() ([]EnvFile, error) { return []EnvFile{{Path: "/etc/my env", Optional: true}}, nil }
+	filesBad := func() ([]EnvFile, error) { return nil, boom }
+	// The rendering split "FOO=a b" in two; the bus value replaces it.
+	u := Unit{Name: "x.service", Environment: []string{"FOO=a", "b"}, EnvironmentFiles: []EnvFile{{Path: "/etc/my"}}}
+	if err := preciseEnvironment(&u, envOK, filesOK); err != nil || !reflect.DeepEqual(u.Environment, []string{"FOO=a b"}) || u.EnvironmentFiles[0].Path != "/etc/my env" {
+		t.Errorf("bus values must replace the rendering: %v %+v", err, u)
+	}
+	// With settings rendered and the bus unreadable, refuse rather than
+	// validate with a guessed environment.
+	u = Unit{Name: "x.service", Environment: []string{"FOO=a", "b"}}
+	if err := preciseEnvironment(&u, envBad, filesOK); err == nil || !strings.Contains(err.Error(), "x.service") || !strings.Contains(err.Error(), "Environment=") {
+		t.Errorf("unreadable Environment= with settings rendered must fail: %v", err)
+	}
+	u = Unit{Name: "x.service", EnvironmentFiles: []EnvFile{{Path: "/etc/my"}}}
+	if err := preciseEnvironment(&u, envOK, filesBad); err == nil || !strings.Contains(err.Error(), "EnvironmentFiles=") {
+		t.Errorf("unreadable EnvironmentFiles= with settings rendered must fail: %v", err)
+	}
+	// Nothing rendered: nothing to get wrong, and the bus is not consulted.
+	u = Unit{Name: "x.service"}
+	if err := preciseEnvironment(&u, envBad, filesBad); err != nil || len(u.Environment) != 0 || len(u.EnvironmentFiles) != 0 {
+		t.Errorf("no settings must need no bus: %v %+v", err, u)
+	}
+}
+
 func TestResolvesBareName(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
