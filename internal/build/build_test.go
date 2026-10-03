@@ -842,10 +842,12 @@ func TestResolveRefusesVersionPrefixes(t *testing.T) {
 		}
 	}
 	// Full versions, +incompatible releases, pseudo-versions and branch
-	// names all pass.
-	for _, v := range []string{"v2.11.6", "2.11.6", "v2.11.6-beta.1", "v2.11.6-0.20260101000000-abcdefabcdef", "main", "abcdef123456"} {
-		if _, err := resolve(t, installed(), Options{CaddyVersion: v, AllowMajor: true}); err != nil {
-			t.Errorf("--caddy-version %s: %v", v, err)
+	// names all pass; a semantic version is canonicalised, a branch or
+	// commit reaches xcaddy exactly as given, never as "vmain".
+	for in, want := range map[string]string{"v2.11.6": "v2.11.6", "2.11.6": "v2.11.6", "v2.11.6-beta.1": "v2.11.6-beta.1", "v2.11.6-0.20260101000000-abcdefabcdef": "v2.11.6-0.20260101000000-abcdefabcdef", "main": "main", "abcdef123456": "abcdef123456"} {
+		p, err := resolve(t, installed(), Options{CaddyVersion: in, AllowMajor: true})
+		if err != nil || p.CaddyVersion != want {
+			t.Errorf("--caddy-version %s: got %q %v, want %q", in, p.CaddyVersion, err, want)
 		}
 	}
 	if _, err := resolve(t, installed(), Options{With: []string{"github.com/example/other@v2.0.0+incompatible"}, AllowMajor: true}); err != nil {

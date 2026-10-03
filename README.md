@@ -114,7 +114,9 @@ changes unless you say so:
   or commit given to `--with` is resolved by `go get` during the build,
   so the resolved version is checked against the same rule afterwards.
   Moving a plugin installed at `vN+incompatible` on a bare module path to
-  its `/vN` path is the same major and needs no flag.
+  its `/vN` path is the same major and needs no flag. `--caddy-version`
+  takes a full semantic version (with or without the `v`), a branch name
+  or a commit hash.
 - `--fresh` ignores the installed binary. The plugin set is then only what
   `--with` gives, which is how you build a first custom binary on a machine
   running a distribution package.

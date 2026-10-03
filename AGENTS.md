@@ -322,6 +322,11 @@ These are implemented in `internal/install`; keep them true.
   the staged path after validation is refused rather than installed; the
   window between that check and the rename is the one that remains, and
   closing it would need a target directory nobody else can write.
+- The target's identity (device, inode, size, modification time) is read
+  before `Inspect` runs it and compared right after, and again after its
+  capabilities are read, so the plan is known to describe the file the
+  rechecks later compare against; a replacement during the inspection is a
+  refusal, not a plan from one file checked against another.
 - `Resolve`'s checks are repeated by `recheck` right before validation
   and the swap, because a build can take minutes: the target must resolve
   to the same file (same device, inode, size and modification time), still

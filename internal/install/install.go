@@ -85,6 +85,19 @@ type fileID struct {
 	mtime    time.Time
 }
 
+// still confirms the file at path is the one this identity was read from,
+// and words a refusal with when the change happened otherwise.
+func (id fileID) still(path, when string) error {
+	now, err := identify(path)
+	if err != nil {
+		return fmt.Errorf("rechecking %s: %w", path, err)
+	}
+	if now != id {
+		return fmt.Errorf("%s changed %s; nothing was changed, re-run install", path, when)
+	}
+	return nil
+}
+
 // pairIDs is the identity of a staged binary and its lockfile.
 type pairIDs struct{ bin, lock fileID }
 
@@ -498,8 +511,19 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		if owner != nil {
 			return nil, refuseSystemPackage(p.Target, owner)
 		}
+		// The identity is taken before the inspection and compared after
+		// it, so the plan is known to describe the file whose identity the
+		// later rechecks compare against; a binary replaced during the
+		// inspection would otherwise be planned from one file and checked
+		// against another.
+		if p.targetID, err = identify(p.Target); err != nil {
+			return nil, err
+		}
 		info, err := caddybin.Inspect(ctx, p.Target)
 		if err != nil {
+			return nil, err
+		}
+		if err := p.targetID.still(p.Target, "while it was being inspected"); err != nil {
 			return nil, err
 		}
 		if info.IsDistroBuild() {
@@ -559,7 +583,9 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 		if caps != nil {
 			p.FileCapabilities = describeCaps(ctx, p.Target)
 		}
-		if p.targetID, err = identify(p.Target); err != nil {
+		// The capabilities just read belong to the inspected file, or the
+		// plan would carry one file's bits for another.
+		if err := p.targetID.still(p.Target, "while its capabilities were being read"); err != nil {
 			return nil, err
 		}
 	}

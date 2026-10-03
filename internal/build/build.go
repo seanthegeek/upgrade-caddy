@@ -201,7 +201,13 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		}
 		p.CaddyVersion = info.Version
 	} else {
-		v := semver.Canonical(opts.CaddyVersion)
+		// A semantic version is canonicalised ("2.11.6" becomes "v2.11.6");
+		// a branch name or commit hash is passed to xcaddy as given, since
+		// prefixing it with "v" would name a ref that does not exist.
+		v := opts.CaddyVersion
+		if semver.IsValid(v) {
+			v = semver.Canonical(v)
+		}
 		if err := fullVersion("--caddy-version", v); err != nil {
 			return nil, err
 		}

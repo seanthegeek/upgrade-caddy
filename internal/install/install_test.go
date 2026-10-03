@@ -702,6 +702,29 @@ func TestAttestStagedPair(t *testing.T) {
 	}
 }
 
+func TestFileIDStill(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "caddy")
+	os.WriteFile(path, []byte("one"), 0o755)
+	id, err := identify(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := id.still(path, "while it was being inspected"); err != nil {
+		t.Errorf("an untouched file is still itself: %v", err)
+	}
+	other := filepath.Join(dir, "other")
+	os.WriteFile(other, []byte("one"), 0o755)
+	os.Rename(other, path)
+	if err := id.still(path, "while it was being inspected"); err == nil || !strings.Contains(err.Error(), "while it was being inspected") || !strings.Contains(err.Error(), "re-run install") {
+		t.Errorf("a replaced file must be refused with when it changed: %v", err)
+	}
+	os.Remove(path)
+	if err := id.still(path, "x"); err == nil {
+		t.Error("a vanished file must be refused")
+	}
+}
+
 func TestStagedPairIdentity(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
