@@ -85,6 +85,64 @@ type fileID struct {
 	mtime    time.Time
 }
 
+// pairIDs is the identity of a staged binary and its lockfile.
+type pairIDs struct{ bin, lock fileID }
+
+// pairID reads the identity of both staged files.
+func pairID(binPath, lockPath string) (pairIDs, error) {
+	bin, err := identify(binPath)
+	if err != nil {
+		return pairIDs{}, fmt.Errorf("staged binary: %w", err)
+	}
+	lock, err := identify(lockPath)
+	if err != nil {
+		return pairIDs{}, fmt.Errorf("staged lockfile: %w", err)
+	}
+	return pairIDs{bin: bin, lock: lock}, nil
+}
+
+// unchanged confirms the staged files are still the ones that were
+// inspected and validated. A different inode, size or modification time
+// means something else was put at the path, and installing it would
+// install a file nobody checked.
+func (p pairIDs) unchanged(binPath, lockPath string) error {
+	now, err := pairID(binPath, lockPath)
+	if err != nil {
+		return fmt.Errorf("rechecking the staged files: %w", err)
+	}
+	if now.bin != p.bin {
+		return fmt.Errorf("the staged binary %s changed after it was validated; nothing was changed, re-run install", binPath)
+	}
+	if now.lock != p.lock {
+		return fmt.Errorf("the staged lockfile %s changed after it was checked; nothing was changed, re-run install", lockPath)
+	}
+	return nil
+}
+
+// lockTarget takes an exclusive, cross-process lock for installs of one
+// target, a flock on a lock file beside it, and returns the function that
+// releases it. Another install holding it is a refusal, not a wait: the
+// other one may take minutes, and its outcome changes what this one should
+// do. The lock file itself stays behind; it holds nothing.
+func lockTarget(target string) (release func(), err error) {
+	path := filepath.Join(filepath.Dir(target), "."+filepath.Base(target)+".upgrade-caddy.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("opening the install lock %s: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another upgrade-caddy install of %s is running (it holds %s); wait for it to finish", target, path)
+		}
+		return nil, fmt.Errorf("locking %s: %w", path, err)
+	}
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck // closing releases it anyway
+		f.Close()
+	}, nil
+}
+
 // identify reads a file's identity.
 func identify(path string) (fileID, error) {
 	fi, err := os.Stat(path)
@@ -157,6 +215,15 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		logw = io.Discard
 	}
 
+	// One install of a target at a time, from before anything is staged
+	// until the restart or rollback is over: two at once would both pass
+	// the rechecks and then overwrite each other's .previous copies.
+	release, err := lockTarget(plan.Target)
+	if err != nil {
+		return plan, nil, err
+	}
+	defer release()
+
 	// 1. Obtain the new binary in the target's directory, so the final
 	// rename is atomic.
 	var newPath, newLock string
@@ -175,6 +242,15 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	cleanup := func() {
 		os.Remove(newPath)
 		os.Remove(newLock)
+	}
+	// The staged files are inspected and validated by path, then renamed
+	// by path, so their identity is taken now and checked again right
+	// before the rename: a file swapped in between would be installed
+	// without having been checked.
+	stagedID, err := pairID(newPath, newLock)
+	if err != nil {
+		cleanup()
+		return plan, nil, err
 	}
 	newInfo, err := caddybin.InspectAs(ctx, newPath, plan.runAs)
 	if err != nil {
@@ -217,6 +293,10 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	// applied were read from the file Resolve saw, and must not land on a
 	// file that was replaced or became a package's since.
 	if err := recheck(ctx, plan); err != nil {
+		cleanup()
+		return plan, nil, err
+	}
+	if err := stagedID.unchanged(newPath, newLock); err != nil {
 		cleanup()
 		return plan, nil, err
 	}

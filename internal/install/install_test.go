@@ -702,6 +702,69 @@ func TestAttestStagedPair(t *testing.T) {
 	}
 }
 
+func TestStagedPairIdentity(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	lock := filepath.Join(dir, "bin.lock.json")
+	os.WriteFile(bin, []byte("new"), 0o755)
+	os.WriteFile(lock, []byte("{}"), 0o644)
+	id, err := pairID(bin, lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := id.unchanged(bin, lock); err != nil {
+		t.Errorf("untouched files are unchanged: %v", err)
+	}
+	// Another file renamed over the staged binary has a new inode.
+	other := filepath.Join(dir, "other")
+	os.WriteFile(other, []byte("new"), 0o755)
+	os.Rename(other, bin)
+	if err := id.unchanged(bin, lock); err == nil || !strings.Contains(err.Error(), "staged binary") {
+		t.Errorf("a swapped staged binary must be refused: %v", err)
+	}
+	id, _ = pairID(bin, lock)
+	os.WriteFile(lock, []byte("{\"schema\":1}"), 0o644)
+	if err := id.unchanged(bin, lock); err == nil || !strings.Contains(err.Error(), "staged lockfile") {
+		t.Errorf("a rewritten staged lockfile must be refused: %v", err)
+	}
+	os.Remove(lock)
+	if err := id.unchanged(bin, lock); err == nil {
+		t.Error("a vanished staged file must be refused")
+	}
+	if _, err := pairID(filepath.Join(dir, "missing"), lock); err == nil {
+		t.Error("missing staged files are an error")
+	}
+}
+
+func TestLockTargetIsExclusive(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "caddy")
+	release, err := lockTarget(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTarget(target); err == nil || !strings.Contains(err.Error(), "another upgrade-caddy install") {
+		t.Errorf("a second install of the same target must be refused while the first holds the lock: %v", err)
+	}
+	// Another target in the same directory is independent.
+	otherRelease, err := lockTarget(filepath.Join(dir, "caddy2"))
+	if err != nil {
+		t.Errorf("another target must not be blocked: %v", err)
+	} else {
+		otherRelease()
+	}
+	release()
+	again, err := lockTarget(target)
+	if err != nil {
+		t.Errorf("after release the lock is free: %v", err)
+	} else {
+		again()
+	}
+	if _, err := lockTarget(filepath.Join(dir, "no", "such", "caddy")); err == nil {
+		t.Error("a lock file that cannot be created is an error")
+	}
+}
+
 func TestSwapFirstInstall(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "caddy")

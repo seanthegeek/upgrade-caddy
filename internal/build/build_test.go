@@ -572,6 +572,26 @@ func TestLockfileDescribes(t *testing.T) {
 	if err := good.Describes(built); err != nil {
 		t.Errorf("matching lockfile: %v", err)
 	}
+	// A replaced dependency that registers no Caddy module is part of the
+	// identity too: nil and empty mean the same, anything else must match.
+	withDep := *built
+	withDep.Replacements = map[string]string{"github.com/example/dep": "/srv/dep"}
+	if err := good.Describes(&withDep); err == nil || !strings.Contains(err.Error(), "replacements") {
+		t.Errorf("a binary with a dependency replacement the lockfile lacks must be rejected: %v", err)
+	}
+	withDepLock := *good
+	withDepLock.Replacements = map[string]string{"github.com/example/dep": "/srv/dep"}
+	if err := withDepLock.Describes(&withDep); err != nil {
+		t.Errorf("matching dependency replacements: %v", err)
+	}
+	if err := withDepLock.Describes(built); err == nil {
+		t.Error("a lockfile with a dependency replacement the binary lacks must be rejected")
+	}
+	emptyMap := *good
+	emptyMap.Replacements = map[string]string{}
+	if err := emptyMap.Describes(built); err != nil {
+		t.Errorf("an empty map and none are the same: %v", err)
+	}
 	stale := *good
 	stale.Caddy.Version = "v2.11.4"
 	if err := stale.Describes(built); err == nil {
@@ -749,6 +769,35 @@ func TestReplacementSurvivesUpgradeAndWith(t *testing.T) {
 	}
 	if _, err := resolve(t, nil, Options{Fresh: true, DropReplace: []string{cf}}); err == nil || !strings.Contains(err.Error(), "no installed binary") {
 		t.Errorf("drop with --fresh: %v", err)
+	}
+	// A replaced dependency that registers no Caddy module is covered the
+	// same way: build info records every replace directive, and dropping
+	// one silently would compile different code under the same versions.
+	patched := installed()
+	patched.Replacements = map[string]string{"github.com/example/dep": "/srv/dep-fork"}
+	_, err = resolve(t, patched, Options{})
+	if err == nil || !strings.Contains(err.Error(), "dependency github.com/example/dep replaced") || !strings.Contains(err.Error(), "--drop-replace github.com/example/dep") {
+		t.Errorf("a replaced dependency must be covered: %v", err)
+	}
+	p, err = resolve(t, patched, Options{Replace: []string{"github.com/example/dep=/srv/dep-fork"}})
+	if err != nil || len(p.Replacements) != 1 {
+		t.Errorf("a covered dependency replacement: %v %+v", err, p.Replacements)
+	}
+	p, err = resolve(t, patched, Options{DropReplace: []string{"github.com/example/dep"}})
+	if err != nil || len(p.Replacements) != 0 || len(p.Notes) != 1 || !strings.Contains(p.Notes[0], "github.com/example/dep: replacement by /srv/dep-fork dropped") {
+		t.Errorf("a dropped dependency replacement is noted on the plan: %v %+v", err, p.Notes)
+	}
+	var depText strings.Builder
+	p.WriteText(&depText)
+	if !strings.Contains(depText.String(), "Note:     github.com/example/dep") {
+		t.Errorf("the plan text must show the note:\n%s", depText.String())
+	}
+	// A plugin's own replacement is recorded in both places and asked for
+	// once, by the plugin rule.
+	patched.Plugins[0].Replace = "/srv/cf"
+	patched.Replacements["github.com/caddy-dns/cloudflare"] = "/srv/cf"
+	if _, err := resolve(t, patched, Options{Replace: []string{"github.com/example/dep=/srv/dep-fork"}}); err == nil || !strings.Contains(err.Error(), "a module replacement (=> /srv/cf)") {
+		t.Errorf("a plugin replacement is reported by the plugin rule, once: %v", err)
 	}
 	// Caddy itself can be dropped back to upstream the same way.
 	forked := installed()

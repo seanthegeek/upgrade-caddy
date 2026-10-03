@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,6 +89,7 @@ type Plan struct {
 	Plugins        []Plugin         `json:"plugins"`
 	Replacements   []xcaddy.Replace `json:"replacements,omitempty"`
 	CaddyNote      string           `json:"caddy_note,omitempty"`  // for example, that an installed replacement of Caddy is dropped
+	Notes          []string         `json:"notes,omitempty"`       // about modules that are neither Caddy nor a plugin, such as a dropped dependency replacement
 	AllowMajor     bool             `json:"allow_major,omitempty"` // --allow-major was given, so verify lets a branch or commit resolve to another major
 	Output         string           `json:"output"`
 	HostGoVersion  string           `json:"host_go_version,omitempty"` // the go on PATH; the build may auto-fetch a newer one
@@ -384,6 +386,10 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		} else if name == src.MainPath && src.MainReplace != "" {
 			pkg = src.MainPath
 			p.CaddyNote = "replacement by " + replacedBy(src.MainReplace, src.MainReplaceVer) + " dropped; built from the module proxy"
+		} else if repl, ok := src.Replacements[name]; ok {
+			// A dependency that registers no Caddy module.
+			pkg = name
+			p.Notes = append(p.Notes, name+": replacement by "+repl+" dropped; built from the module proxy")
 		} else {
 			return nil, fmt.Errorf("--drop-replace %s: %s was not built with a replacement for it", name, src.Path)
 		}
@@ -401,6 +407,21 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 	// default rebuild would otherwise quietly swap it for upstream Caddy.
 	if src != nil && src.MainReplace != "" && !covered[src.MainPath] && !dropped[src.MainPath] {
 		return nil, fmt.Errorf("%s was built with Caddy itself replaced (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version> to keep one, --drop-replace %s to build upstream Caddy instead, or --fresh to build without the installed binary", src.Path, replacedBy(src.MainReplace, src.MainReplaceVer), src.MainPath, src.MainPath)
+	}
+	// And so can any other dependency, one that registers no Caddy module
+	// (a patched library, say): build info records every replace directive,
+	// and a rebuild without it would compile different code under the same
+	// module versions.
+	if src != nil {
+		for _, dep := range sortedKeys(src.Replacements) {
+			if dep == src.MainPath || covered[dep] || dropped[dep] {
+				continue
+			}
+			if _, isPlugin := index[dep]; isPlugin {
+				continue // handled above, by the plugin's own replacedBy
+			}
+			return nil, fmt.Errorf("%s was built with its dependency %s replaced (=> %s), which cannot be reproduced automatically; pass --replace %s=<path or module@version> to keep one, or --drop-replace %s to build it from the module proxy instead", src.Path, dep, src.Replacements[dep], dep, dep)
+		}
 	}
 
 	p.AllowMajor = opts.AllowMajor
@@ -479,6 +500,9 @@ func (p *Plan) WriteText(w io.Writer) {
 	}
 	if p.CaddyNote != "" {
 		fmt.Fprintf(w, "          %s\n", p.CaddyNote)
+	}
+	for _, n := range p.Notes {
+		fmt.Fprintf(w, "Note:     %s\n", n)
 	}
 	if p.HostGoVersion != "" {
 		fmt.Fprintf(w, "Host Go:  %s (with GOTOOLCHAIN=auto a newer toolchain is fetched if Caddy requires it)\n", p.HostGoVersion)
@@ -809,12 +833,13 @@ func replacementMatches(pkg, want, got string) error {
 // exact binary (Describes), and the lockfile is then installed beside the
 // target as its attestation.
 type Lockfile struct {
-	Schema       int          `json:"schema"`
-	BuiltAt      time.Time    `json:"built_at"`
-	GoVersion    string       `json:"go_version"` // the toolchain that compiled the binary
-	Caddy        LockModule   `json:"caddy"`
-	Plugins      []LockModule `json:"plugins"`
-	SourceBinary *LockSource  `json:"source_binary,omitempty"`
+	Schema       int               `json:"schema"`
+	BuiltAt      time.Time         `json:"built_at"`
+	GoVersion    string            `json:"go_version"` // the toolchain that compiled the binary
+	Caddy        LockModule        `json:"caddy"`
+	Plugins      []LockModule      `json:"plugins"`
+	Replacements map[string]string `json:"replacements,omitempty"` // every replace directive in the build, module path -> replacement, dependencies that register no Caddy module included
+	SourceBinary *LockSource       `json:"source_binary,omitempty"`
 }
 
 // ReadLockfile parses a lockfile from disk.
@@ -879,6 +904,12 @@ func (lf *Lockfile) Describes(built *caddybin.Info) error {
 			return fmt.Errorf("binary carries %s %d time(s), the lockfile lists it %d time(s)", k, n, want[k])
 		}
 	}
+	// Every replace directive, those of plain dependencies included: a
+	// replaced library changes the compiled code under the same module
+	// versions, so two binaries differing only there are different builds.
+	if !maps.Equal(lf.Replacements, built.Replacements) && (len(lf.Replacements) > 0 || len(built.Replacements) > 0) {
+		return fmt.Errorf("lockfile replacements %v do not match the binary's %v", lf.Replacements, built.Replacements)
+	}
 	return nil
 }
 
@@ -921,6 +952,9 @@ func writeLockfile(f *os.File, p *Plan, built *caddybin.Info) (err error) {
 		GoVersion: built.GoVersion,
 		Caddy:     LockModule{Package: built.MainPath, Version: built.MainVersion, Sum: built.MainSum, ReplacedBy: replacedBy(built.MainReplace, built.MainReplaceVer)},
 		Plugins:   []LockModule{},
+	}
+	if len(built.Replacements) > 0 {
+		lf.Replacements = maps.Clone(built.Replacements)
 	}
 	source := map[string]Source{}
 	for _, pl := range p.Plugins {
