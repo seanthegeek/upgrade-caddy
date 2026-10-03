@@ -169,10 +169,15 @@ upgrade-caddy install [--target PATH] [--config PATH] [--no-restart]
 3. Builds the new binary into the target's directory with the same rules
    and flags as `build`, or stages one from `--from PATH` (a binary that
    `build` produced, with its lockfile beside it; the lockfile must
-   describe that exact binary, versions and checksums included, or it is
-   refused, and every check, the refusal of a binary without module
-   information included, is repeated on the staged copies so the pair
-   that gets installed is the pair that was checked). This lets the build run
+   describe that exact binary, versions, checksums and every module
+   replacement included, or it is refused, and every check, the refusal
+   of a binary without module information included, is repeated on the
+   staged copies so the pair that gets installed is the pair that was
+   checked, and the staged files' identity is checked once more right
+   before the swap). Only one `install` of a target runs at a time: a
+   lock file beside the target, `.<name>.upgrade-caddy.lock`, is held
+   from here to the end, and a second install is refused while it is
+   held. This lets the build run
    as your own user and only the swap run as root:
 
    ```bash

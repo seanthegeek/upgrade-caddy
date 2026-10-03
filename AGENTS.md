@@ -108,10 +108,12 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    (`--upgrade <module>`, `--upgrade-all`, `--with <module@version>`). A
    silent bump is a supply-chain risk the user has not reviewed. The same
    goes for module replacements: one recorded in the installed binary,
-   for a plugin or for Caddy itself, must be kept with `--replace` or
-   dropped with `--drop-replace` (or the whole binary ignored with
-   `--fresh`), whatever `--upgrade` or `--with` say about versions, since
-   choosing a version is not choosing a source. The one exception is
+   for a plugin, for Caddy itself or for any other dependency (build info
+   records every replace directive, and a replaced library compiles
+   different code under the same module versions), must be kept with
+   `--replace` or dropped with `--drop-replace` (or the whole binary
+   ignored with `--fresh`), whatever `--upgrade` or `--with` say about
+   versions, since choosing a version is not choosing a source. The one exception is
    `--with` naming a different major's module path, which is a new source
    outright; the old path's replacement cannot apply and is dropped with a
    note. `verify` checks the output carries exactly the replacements asked
@@ -306,12 +308,20 @@ These are implemented in `internal/install`; keep them true.
   each registration counted (a Go module registering two Caddy modules
   must be listed twice). The replacement matters because a module
   replaced by a local directory has no checksum, so the directory is all
-  that tells two such builds apart. `Resolve` checks the source pair, and
+  that tells two such builds apart. The lockfile also records every
+  replace directive in the build (`Replacements`), those of dependencies
+  that register no Caddy module included, and `Describes` compares that
+  map exactly. `Resolve` checks the source pair, and
   `Run` checks the staged copies again before validating (`checkStaged`:
   the distribution-build refusal too, since a lockfile with empty
   identities would describe a binary with no module information), because
   the source directory is typically writable by a less privileged user and
-  either file could have been replaced between the two.
+  either file could have been replaced between the two. The staged pair's
+  identity (device, inode, size, modification time) is taken right after
+  staging and checked again immediately before the swap, so a file put at
+  the staged path after validation is refused rather than installed; the
+  window between that check and the rename is the one that remains, and
+  closing it would need a target directory nobody else can write.
 - `Resolve`'s checks are repeated by `recheck` right before validation
   and the swap, because a build can take minutes: the target must resolve
   to the same file (same device, inode, size and modification time), still
@@ -351,6 +361,12 @@ These are implemented in `internal/install`; keep them true.
 - `main` cancels the context on SIGINT and SIGTERM, so a service manager,
   CI cancellation or `timeout(1)` lets install roll back instead of dying
   mid-swap.
+- One install of a target at a time: `Run` takes an exclusive `flock` on
+  `<dir>/.<name>.upgrade-caddy.lock` before staging or building and holds
+  it through the restart or rollback, and a second install of the same
+  target is refused, not queued, since the first may take minutes and its
+  outcome changes what the second should do. The lock file stays behind;
+  it holds nothing. `build` to a shared output path is not serialized.
 - The new binary never runs as root before it is installed: a plugin's
   initialisation code runs the moment the binary starts, before the
   service's user and sandbox would apply, and the lockfile beside a
