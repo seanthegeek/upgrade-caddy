@@ -776,12 +776,15 @@ func (p *Plan) chooseAccounts(self *caddybin.Account, getenv func(string) string
 					return nil, err
 				}
 			}
-			if a.SameIdentity(self) {
-				continue // the caller already has exactly that identity
-			}
+			// The account is kept even when the caller already has that
+			// identity, since the unit's environment (USER, LOGNAME, HOME)
+			// is composed from it; only a switch needs root.
 			v.account, v.User = a, a.Name
 			if a.UID == 0 {
 				v.User = "root"
+			}
+			if a.SameIdentity(self) {
+				continue
 			}
 			rootReasons = append(rootReasons, fmt.Sprintf("validate %s as %s, the account %s runs as", v.Config, v.User, v.From))
 		}
@@ -1276,9 +1279,9 @@ func unitEnviron(ctx context.Context, u systemd.Unit, account *caddybin.Account)
 	if len(path) == 0 {
 		path = systemd.DefaultSearchPath(ctx)
 	}
-	user, home := "root", ""
-	if account != nil {
-		user, home = account.Name, account.Home
+	user, home, err := envIdentity(u, account)
+	if err != nil {
+		return nil, err
 	}
 	env := []string{"PATH=" + strings.Join(path, ":"), "USER=" + user}
 	if u.User != "" || u.DynamicUser {
@@ -1292,6 +1295,36 @@ func unitEnviron(ctx context.Context, u systemd.Unit, account *caddybin.Account)
 		return nil, err
 	}
 	return systemd.MergeEnv(env, vars), nil
+}
+
+// envIdentity is the user name and home directory systemd puts in a
+// service's USER, LOGNAME and HOME, which is not always the account the
+// validation runs as. A DynamicUser= unit is validated as the inspection
+// account, because its own account exists only while it runs, but its
+// processes see the dynamic user: User= when set, else the unit name's
+// prefix when that is a valid user name (user_from_unit_name in
+// src/core/unit.c, v255), with home "/" (build_user_json in
+// src/core/core-varlink.c). A prefix that is not a valid name gets a hash
+// of itself as name, which is not reproduced here; that unit is refused
+// rather than validated under a made-up name. A unit with User= takes the
+// account's name and home, and one without runs as root.
+func envIdentity(u systemd.Unit, account *caddybin.Account) (user, home string, err error) {
+	switch {
+	case u.DynamicUser:
+		name := u.User
+		if name == "" {
+			name = systemd.UnitPrefix(u.Name)
+			if !systemd.ValidUserName(name) {
+				return "", "", fmt.Errorf("%s runs as a dynamic user whose name systemd derives by hashing %q, which is not reproduced here; set User= on the unit to validate its config with the environment the service gets", u.Name, name)
+			}
+		}
+		return name, "/", nil
+	case u.User != "" && account != nil:
+		return account.Name, account.Home, nil
+	case u.User != "":
+		return u.User, "", nil
+	}
+	return "root", "", nil
 }
 
 // swapLockfile installs newLock as <target>.lock.json, keeping any existing

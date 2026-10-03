@@ -186,6 +186,41 @@ func preciseEnvironment(u *Unit, env func() ([]string, error), files func() ([]E
 	return nil
 }
 
+// UnitPrefix is the unit name without its type suffix and, for a template
+// instance, without the instance: "caddy@site.service" gives "caddy", as
+// unit_name_to_prefix does.
+func UnitPrefix(name string) string {
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[:i]
+	}
+	if i := strings.IndexByte(name, '@'); i >= 0 {
+		name = name[:i]
+	}
+	return name
+}
+
+// ValidUserName applies systemd's strict user name rule
+// (valid_user_group_name in src/basic/user-util.c, v255, without the
+// relaxed flags): an ASCII letter or underscore first, then ASCII letters,
+// digits, underscores and dashes, at most 31 characters (UT_NAMESIZE - 1).
+// systemd uses it to decide whether a unit's prefix can serve as its
+// dynamic user's name.
+func ValidUserName(name string) bool {
+	if name == "" || len(name) > 31 {
+		return false
+	}
+	for i, c := range []byte(name) {
+		letter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		switch {
+		case letter || c == '_':
+		case i > 0 && ((c >= '0' && c <= '9') || c == '-'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // resolveWorkingDirectory turns systemd's rendering of WorkingDirectory
 // into the directory the service actually starts in, the way
 // apply_working_directory in src/core/exec-invoke.c does: unset means "/"

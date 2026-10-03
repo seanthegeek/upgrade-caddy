@@ -599,6 +599,22 @@ func TestValidateUsesTheUnitEnvironment(t *testing.T) {
 	if err != nil || !slices.Contains(env3, "USER=root") || slices.ContainsFunc(env3, func(s string) bool { return strings.HasPrefix(s, "HOME=") || strings.HasPrefix(s, "LOGNAME=") }) {
 		t.Errorf("no User= environment: %v %v", env3, err)
 	}
+	// A DynamicUser= unit is run as the inspection account but its
+	// processes see the dynamic user: User= or the unit prefix, home "/".
+	dyn := systemd.Unit{Name: "caddy@site.service", DynamicUser: true}
+	env4, err := unitEnviron(ctx, dyn, &caddybin.Account{Name: "sean", Home: "/home/sean", UID: 1000})
+	if err != nil || !slices.Contains(env4, "USER=caddy") || !slices.Contains(env4, "LOGNAME=caddy") || !slices.Contains(env4, "HOME=/") || slices.Contains(env4, "USER=sean") {
+		t.Errorf("DynamicUser= environment: %v %v", env4, err)
+	}
+	dyn.User = "svc"
+	if env5, err := unitEnviron(ctx, dyn, nil); err != nil || !slices.Contains(env5, "USER=svc") || !slices.Contains(env5, "HOME=/") {
+		t.Errorf("DynamicUser= with User=: %v %v", env5, err)
+	}
+	// A prefix that is not a valid user name would be hashed by systemd;
+	// that is a refusal, not a guess.
+	if _, err := unitEnviron(ctx, systemd.Unit{Name: "my.caddy.service", DynamicUser: true}, nil); err == nil || !strings.Contains(err.Error(), "hashing") {
+		t.Errorf("an unrepresentable dynamic user name must be refused: %v", err)
+	}
 	// A --config validation has no unit and keeps install's environment.
 	os.Remove(envOut)
 	if err := validate(context.Background(), script, Validation{Config: "/etc/x", WorkDir: dir, From: "--config"}, &log, false); err != nil {
@@ -1229,6 +1245,11 @@ func TestChooseAccounts(t *testing.T) {
 	p = newPlan()
 	if reasons, err := p.chooseAccounts(caddySelf, sudo, fakeLookups); err != nil || len(reasons) != 1 || !strings.Contains(reasons[0], "root.service") {
 		t.Errorf("a caller who is the unit user needs no root for it: %v %q", err, reasons)
+	}
+	// The account is still recorded, since the unit's USER, LOGNAME and
+	// HOME come from it; no switch is needed, so no root reason.
+	if a := p.Validations[0].account; a == nil || a.UID != 999 || p.Validations[0].User != "caddy" {
+		t.Errorf("a same-identity unit keeps its account for the environment: %+v", p.Validations[0])
 	}
 	// The same user with other groups is another identity: a unit with the
 	// caller's User= but its own Group= or SupplementaryGroups= still

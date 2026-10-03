@@ -292,7 +292,9 @@ func proxyURL(base, endpoint string) (string, error) {
 		return "", errors.New("GOPROXY entry is not a valid URL")
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/") + "/" + endpoint
-	u.RawPath = ""
+	// As newProxyRepo does: the base's own escaping is kept, so a path
+	// element such as "tenant%2Fcache" reaches the proxy as written.
+	u.RawPath = strings.TrimSuffix(u.RawPath, "/") + "/" + strings.ReplaceAll(url.PathEscape(endpoint), "%2F", "/")
 	return u.String(), nil
 }
 

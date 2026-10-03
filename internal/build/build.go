@@ -94,6 +94,8 @@ type Plan struct {
 	AllowMajor     bool             `json:"allow_major,omitempty"` // --allow-major was given, so verify lets a branch or commit resolve to another major
 	Output         string           `json:"output"`
 	HostGoVersion  string           `json:"host_go_version,omitempty"` // the go on PATH; the build may auto-fetch a newer one
+
+	caddyMajor int // the major Caddy is kept within (installed, or 2 for a fresh build); 0 when unknown
 }
 
 // Result is what Build produced.
@@ -473,6 +475,7 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 	}
 
 	p.AllowMajor = opts.AllowMajor
+	p.caddyMajor = installedMajor
 
 	// xcaddy must be able to ask for exactly these modules.
 	for _, pl := range p.Plugins {
@@ -806,6 +809,12 @@ func (p *Plan) verify(built *caddybin.Info) error {
 	}
 	if semver.Major(p.CaddyVersion) >= 0 && built.MainVersion != p.CaddyVersion {
 		return fmt.Errorf("caddy is %s, wanted %s", built.MainVersion, p.CaddyVersion)
+	}
+	// A branch or commit given to --caddy-version is resolved by go get, so
+	// the major it landed on is only known now; the same rule as for a
+	// semantic version applies to the result.
+	if m := semver.Major(built.MainVersion); semver.Major(p.CaddyVersion) < 0 && p.caddyMajor > 0 && !p.AllowMajor && m >= 0 && m != p.caddyMajor {
+		return fmt.Errorf("caddy: %s resolved to %s, a different major from v%d; pass --allow-major to do this deliberately", p.CaddyVersion, built.MainVersion, p.caddyMajor)
 	}
 	have := map[string]string{}
 	for _, bp := range built.Plugins {

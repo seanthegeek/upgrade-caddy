@@ -238,6 +238,23 @@ func TestParseShowBareNameAndSearchPath(t *testing.T) {
 	}
 }
 
+func TestUnitPrefixAndValidUserName(t *testing.T) {
+	for in, want := range map[string]string{"caddy.service": "caddy", "caddy@site.service": "caddy", "my.caddy.service": "my.caddy", "plain": "plain"} {
+		if got := UnitPrefix(in); got != want {
+			t.Errorf("UnitPrefix(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for name, want := range map[string]bool{
+		"caddy": true, "_svc": true, "web-1": true, "Web_2": true,
+		"": false, "1caddy": false, "-caddy": false, "my.caddy": false, "caddy@x": false, "über": false,
+		strings.Repeat("a", 31): true, strings.Repeat("a", 32): false,
+	} {
+		if got := ValidUserName(name); got != want {
+			t.Errorf("ValidUserName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
 func TestPreciseEnvironmentFailsClosed(t *testing.T) {
 	boom := errors.New("busctl: no such property")
 	envOK := func() ([]string, error) { return []string{"FOO=a b"}, nil }

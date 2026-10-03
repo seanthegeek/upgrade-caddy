@@ -415,6 +415,21 @@ func TestVerify(t *testing.T) {
 	if err := p.verify(good); err != nil {
 		t.Errorf("non-semver version should only check presence: %v", err)
 	}
+	// The same goes for Caddy itself: a branch is checked against the major
+	// the plan stays within once go get has resolved it.
+	p.CaddyVersion, p.caddyMajor = "main", 2
+	if err := p.verify(good); err != nil {
+		t.Errorf("a Caddy branch resolving within v2: %v", err)
+	}
+	v3 := &caddybin.Info{HasModuleInfo: true, MainVersion: "v3.0.0-0.20260101000000-abcdefabcdef", Plugins: good.Plugins}
+	if err := p.verify(v3); err == nil || !strings.Contains(err.Error(), "--allow-major") {
+		t.Errorf("a Caddy branch resolving to another major must fail without --allow-major: %v", err)
+	}
+	p.AllowMajor = true
+	if err := p.verify(v3); err != nil {
+		t.Errorf("--allow-major lets the Caddy branch cross: %v", err)
+	}
+	p.AllowMajor, p.CaddyVersion = false, "v2.11.6"
 	// Unless the branch resolved to another major on the same bare path,
 	// which Resolve could not see: that still needs --allow-major.
 	p.Plugins[0].Installed = "v0.2.1"

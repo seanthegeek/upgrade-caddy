@@ -138,9 +138,11 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    the path's, decides what counts as "newer major" and where probing
    starts. A gopkg.in path spells its major out, `.v0` included, and
    `.v0` is major 0, so that `.v1` counts as newer. A branch or commit
-   given to `--with` is resolved by `go get` after `Resolve` has run, so
-   `verify` applies the same rule to the resolved version: on a bare path
-   it may not land in another major than the installed one without
+   given to `--with` or `--caddy-version` is resolved by `go get` after
+   `Resolve` has run, so `verify` applies the same rule to the resolved
+   version: a plugin on a bare path may not land in another major than
+   the installed one, and Caddy may not land outside the major the plan
+   stays within (the installed one, or v2 for a fresh build), without
    `--allow-major`. A `vN+incompatible` release on the bare path and a
    `/vN` module path are one major: `check` counts it once, and `--with`
    may move a plugin installed at `vN+incompatible` to the `/vN` path
@@ -203,8 +205,9 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    that is only whitespace is set: `proxyList` trims entries, not the
    value, so `GOPROXY=" "` is "contains no entries", never the default
    public proxy. The request URL is built as `newProxyRepo` builds it, by
-   parsing the base and appending the module path to its path, so a base
-   with a query string keeps it as a query. The file is
+   parsing the base and appending the module path to both its path and
+   its escaped path, so a base with a query string keeps it as a query and
+   an escaped byte in the base path stays escaped. The file is
    read whole and split by line as `readEnvFile` does, never with a
    scanner whose token limit would drop a long line. An `@latest` answer
    must be a canonical version for the path (`module.Check` and
@@ -241,10 +244,20 @@ These are implemented in `internal/install`; keep them true.
   order (`build_environment` and the `strv_env_merge` call in
   `src/core/exec-invoke.c`), later entries winning: `PATH` from
   `ExecSearchPath=` or systemd's default search path, `USER` always (root
-  for a unit without `User=`), `LOGNAME` and `HOME` from the account only
-  for a unit with `User=` or `DynamicUser=`; then `Environment=` and every
-  `EnvironmentFile=`, so an explicit assignment of any of those wins.
-  `Account.Apply` leaves an environment the caller composed alone. A
+  for a unit without `User=`), `LOGNAME` and `HOME` only for a unit with
+  `User=` or `DynamicUser=`; then `Environment=` and every
+  `EnvironmentFile=`, so an explicit assignment of any of those wins. The
+  identity those variables name (`envIdentity`) is the service's, not
+  necessarily the account validate runs as: for `User=` the account's
+  name and home; for `DynamicUser=`, which is validated as the inspection
+  account, the dynamic user systemd would create, `User=` or the unit
+  prefix when it is a valid user name (`user_from_unit_name` in
+  `src/core/unit.c`, strict `valid_user_group_name`), with home `/`
+  (`build_user_json` in `src/core/core-varlink.c`); a prefix systemd would
+  hash into a name is a refusal, not a guess. Without root the account is
+  kept for this even when the caller already has that identity; only a
+  switch needs root. `Account.Apply` leaves an environment the caller
+  composed alone. A
   required `EnvironmentFile=` that is missing, relative, unreadable or
   unparsable is a refusal; an optional "-" one is skipped on any of
   those, per matched file, so one bad file in an optional glob does not

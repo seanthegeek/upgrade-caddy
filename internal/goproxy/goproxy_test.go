@@ -116,6 +116,23 @@ func TestProxyURLKeepsQuery(t *testing.T) {
 	if u, err := proxyURL("https://proxy.example/p", "example.com/m/@latest"); err != nil || u != "https://proxy.example/p/example.com/m/@latest" {
 		t.Errorf("plain base: %q %v", u, err)
 	}
+	// An escaped byte in the base path stays escaped, as the go command
+	// keeps RawPath.
+	if u, err := proxyURL("https://proxy.example/tenant%2Fcache/", "example.com/m/@latest"); err != nil || u != "https://proxy.example/tenant%2Fcache/example.com/m/@latest" {
+		t.Errorf("escaped base path: %q %v", u, err)
+	}
+	var gotEscaped string
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEscaped = r.URL.EscapedPath()
+		w.Write([]byte(`{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}`))
+	}))
+	t.Cleanup(srv2.Close)
+	if _, err := client(srv2.URL+"/tenant%2Fcache", "").Latest(context.Background(), "example.com/m"); err != nil {
+		t.Fatal(err)
+	}
+	if gotEscaped != "/tenant%2Fcache/example.com/m/@latest" {
+		t.Errorf("the proxy received %q, want the base's escaping kept", gotEscaped)
+	}
 	if _, err := proxyURL("https://user:hunter2@[::1/", "x"); err == nil || strings.Contains(err.Error(), "hunter2") {
 		t.Errorf("an unparsable base is an error that does not echo it: %v", err)
 	}
