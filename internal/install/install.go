@@ -126,7 +126,9 @@ func (p pairIDs) unchanged(binPath, lockPath string) error {
 // do. The lock file itself stays behind; it holds nothing.
 func lockTarget(target string) (release func(), err error) {
 	path := filepath.Join(filepath.Dir(target), "."+filepath.Base(target)+".upgrade-caddy.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	// Opened read-only: flock needs no write access, nothing is ever
+	// written to the file, and so closing it can lose nothing.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("opening the install lock %s: %w", path, err)
 	}
