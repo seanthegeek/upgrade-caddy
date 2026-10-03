@@ -515,6 +515,13 @@ func TestValidationsFromUnits(t *testing.T) {
 	if got := validationsFromUnits(units); len(got) != 3 || got[2].From != "c.service" {
 		t.Errorf("one config under two users must be validated twice, got %+v", got)
 	}
+	// DynamicUser= is another account too: the unit is validated as the
+	// inspection account, not as a static user of the same name.
+	units[2].User = ""
+	units[2].DynamicUser = true
+	if got := validationsFromUnits(units); len(got) != 3 || got[2].From != "c.service" {
+		t.Errorf("a DynamicUser= unit must not fold into a static one, got %+v", got)
+	}
 }
 
 func TestSwapPreservesSetIDAndStickyBits(t *testing.T) {

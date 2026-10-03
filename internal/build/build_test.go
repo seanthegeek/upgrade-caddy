@@ -779,6 +779,59 @@ func TestReplacementSurvivesUpgradeAndWith(t *testing.T) {
 	}
 }
 
+func TestResolveRefusesVersionPrefixes(t *testing.T) {
+	// "v2.11" is a prefix query to go get (the highest v2.11.x), not a
+	// version a plan can pin; the build would fail verification afterwards.
+	for name, opts := range map[string]Options{
+		"--caddy-version":   {CaddyVersion: "v2.11"},
+		"--with":            {With: []string{"github.com/caddy-dns/cloudflare@v0.2"}},
+		"--with unprefixed": {With: []string{"github.com/caddy-dns/cloudflare@0.2"}},
+	} {
+		_, err := resolve(t, installed(), opts)
+		if err == nil || !strings.Contains(err.Error(), "spelled out in full") || !strings.Contains(err.Error(), "highest") {
+			t.Errorf("%s with a version prefix must be refused up front: %v", name, err)
+		}
+	}
+	// Full versions, +incompatible releases, pseudo-versions and branch
+	// names all pass.
+	for _, v := range []string{"v2.11.6", "2.11.6", "v2.11.6-beta.1", "v2.11.6-0.20260101000000-abcdefabcdef", "main", "abcdef123456"} {
+		if _, err := resolve(t, installed(), Options{CaddyVersion: v, AllowMajor: true}); err != nil {
+			t.Errorf("--caddy-version %s: %v", v, err)
+		}
+	}
+	if _, err := resolve(t, installed(), Options{With: []string{"github.com/example/other@v2.0.0+incompatible"}, AllowMajor: true}); err != nil {
+		t.Errorf("+incompatible is a full version: %v", err)
+	}
+}
+
+func TestRestoredWordsTheOutcome(t *testing.T) {
+	dir := t.TempDir()
+	base := errors.New("rename failed")
+	// Nothing was there before: say so.
+	if err := restored(base, "", filepath.Join(dir, "caddy"), "", filepath.Join(dir, "caddy.lock.json")); err == nil || !strings.Contains(err.Error(), "nothing was at") {
+		t.Errorf("first build failure: %v", err)
+	}
+	// Both aside copies come back: "restored".
+	os.WriteFile(filepath.Join(dir, "aside-bin"), []byte("b"), 0o644)
+	os.WriteFile(filepath.Join(dir, "aside-lock"), []byte("l"), 0o644)
+	err := restored(base, filepath.Join(dir, "aside-bin"), filepath.Join(dir, "caddy"), filepath.Join(dir, "aside-lock"), filepath.Join(dir, "caddy.lock.json"))
+	if err == nil || !strings.Contains(err.Error(), "the previous output was restored") {
+		t.Errorf("successful restore: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "caddy")); string(b) != "b" {
+		t.Errorf("binary not put back: %q", b)
+	}
+	// An aside copy that cannot be put back is named with its location,
+	// and the error never claims a restore.
+	err = restored(base, filepath.Join(dir, "gone"), filepath.Join(dir, "caddy"), "", filepath.Join(dir, "caddy.lock.json"))
+	if err == nil || strings.Contains(err.Error(), "was restored") || !strings.Contains(err.Error(), "could not be fully restored") || !strings.Contains(err.Error(), filepath.Join(dir, "gone")) {
+		t.Errorf("failed restore must be reported with the file's location: %v", err)
+	}
+	if !errors.Is(err, base) {
+		t.Error("the original failure must stay in the chain")
+	}
+}
+
 func TestCommitOutputKeepsThePairTogether(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "caddy")

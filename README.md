@@ -94,7 +94,11 @@ changes unless you say so:
   it). Repeatable.
 - `--upgrade-all` bumps every plugin.
 - `--with MODULE[@VERSION]` adds a plugin, or overrides the version of one
-  already present. Without a version the latest is used.
+  already present. Without a version the latest is used. A version must be
+  spelled out in full (`v0.2.4`, not `v0.2`): to `go get` a prefix means
+  "the highest matching version", which a plan cannot pin. The same goes
+  for `--caddy-version`. Branch names and commit hashes are passed through
+  for `go get` to resolve.
 - `--replace OLD=NEW` passes a module replacement (a fork, a local checkout)
   to xcaddy. A replacement recorded in the installed binary, for a plugin
   or for Caddy itself, must be kept with `--replace` or dropped with

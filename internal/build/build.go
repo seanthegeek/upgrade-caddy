@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/xcaddy"
+	"golang.org/x/mod/module"
 
 	"github.com/seanthegeek/upgrade-caddy/internal/caddybin"
 	"github.com/seanthegeek/upgrade-caddy/internal/goproxy"
@@ -137,6 +138,19 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	return plan, res, err
 }
 
+// fullVersion refuses a semantic version that is not spelled out in full.
+// To go get, "v2.11" is a prefix query for the highest v2.11.x (Go modules
+// reference, "Version queries"), which a plan cannot pin: the build would
+// come back as some v2.11.x and verify would reject it against the literal
+// "v2.11". Branch names and commit hashes are not semantic versions and
+// pass through for go get to resolve.
+func fullVersion(flag, v string) error {
+	if semver.IsValid(v) && !semver.IsFull(v) {
+		return fmt.Errorf("%s %s: a version must be spelled out in full (for example %s); go would treat %s as \"the highest %s.x\", which cannot be pinned in a plan", flag, v, module.CanonicalVersion(v), v, v)
+	}
+	return nil
+}
+
 // refuseLive stops a build whose output path is run by a service: build
 // never replaces a live binary, that is install's job. If systemd cannot be
 // asked, the guarantee cannot be kept, and that stops the build too. Run
@@ -186,6 +200,9 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		p.CaddyVersion = info.Version
 	} else {
 		v := semver.Canonical(opts.CaddyVersion)
+		if err := fullVersion("--caddy-version", v); err != nil {
+			return nil, err
+		}
 		// Major 0 is a major like any other: v0.x would make xcaddy build
 		// from the bare Caddy module path.
 		if m := semver.Major(v); m >= 0 && m != installedMajor && !opts.AllowMajor {
@@ -285,6 +302,9 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 		// left for go get to resolve.
 		if version != "" && semver.IsValid(version) {
 			version = semver.Canonical(version)
+			if err := fullVersion("--with "+path, version); err != nil {
+				return nil, err
+			}
 		}
 		if version == "" {
 			info, err := proxy.Latest(ctx, path)
@@ -592,16 +612,14 @@ func commitOutput(tmpBin, tmpLock, output string) (err error) {
 		return fmt.Errorf("moving the previous lockfile aside: %w", err)
 	}
 	if err := os.Rename(tmpBin, output); err != nil {
-		putBack(oldBin, output)
-		putBack(oldLock, lockPath)
-		return fmt.Errorf("moving the new binary into place: %w", err)
+		return restored(fmt.Errorf("moving the new binary into place: %w", err), oldBin, output, oldLock, lockPath)
 	}
 	if err := os.Rename(tmpLock, lockPath); err != nil {
 		// Undo the binary too, so the pair at the output stays a pair.
-		os.Remove(output)
-		putBack(oldBin, output)
-		putBack(oldLock, lockPath)
-		return fmt.Errorf("moving the new lockfile into place (the previous output was restored): %w", err)
+		if rmErr := os.Remove(output); rmErr != nil {
+			return errors.Join(fmt.Errorf("moving the new lockfile into place: %w; and the new binary could not be removed from %s again, so it sits there without its lockfile", err, output), rmErr)
+		}
+		return restored(fmt.Errorf("moving the new lockfile into place: %w", err), oldBin, output, oldLock, lockPath)
 	}
 	if oldBin != "" {
 		os.Remove(oldBin)
@@ -639,13 +657,31 @@ func moveAside(path string) (string, error) {
 	return aside.Name(), nil
 }
 
-// putBack restores a file moved aside by moveAside; a "" means nothing was
-// there, and the restore is best effort on a path already being reported
-// as failed.
-func putBack(aside, path string) {
-	if aside != "" {
-		os.Rename(aside, path) //nolint:errcheck // best effort during error handling; the caller reports the original failure
+// restored puts the previous output pair back after a failed commit and
+// words the error from what actually happened: "the previous output was
+// restored" only when both files came back, otherwise where each one is.
+func restored(err error, oldBin, output, oldLock, lockPath string) error {
+	binErr := putBack(oldBin, output)
+	lockErr := putBack(oldLock, lockPath)
+	if binErr == nil && lockErr == nil {
+		if oldBin == "" && oldLock == "" {
+			return fmt.Errorf("%w; nothing was at %s before and nothing is there now", err, output)
+		}
+		return fmt.Errorf("%w; the previous output was restored", err)
 	}
+	return errors.Join(fmt.Errorf("%w; and the previous output could not be fully restored, see below", err), binErr, lockErr)
+}
+
+// putBack restores a file moved aside by moveAside; a "" means nothing was
+// there. A failure says where the file is, so nothing is lost silently.
+func putBack(aside, path string) error {
+	if aside == "" {
+		return nil
+	}
+	if err := os.Rename(aside, path); err != nil {
+		return fmt.Errorf("the previous %s is at %s: %w", filepath.Base(path), aside, err)
+	}
+	return nil
 }
 
 // Unplanned lists non-standard Go modules compiled into the binary that the

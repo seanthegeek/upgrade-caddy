@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/seanthegeek/upgrade-caddy/internal/fspath"
 )
 
 // UnresolvedHome is what WorkingDirectory holds when the unit runs in its
@@ -96,7 +98,10 @@ func UnitsUsing(ctx context.Context, binary string) ([]Unit, error) {
 	if !Available() {
 		return nil, nil
 	}
-	want, err := filepath.EvalSymlinks(binary)
+	// Links are followed even to a referent that does not exist yet, as
+	// install resolves its target, so a first install through a dangling
+	// link still finds the unit whose ExecStart is that link.
+	want, _, err := fspath.Resolve(binary)
 	if err != nil {
 		want = binary
 	}
@@ -244,7 +249,7 @@ func resolves(path, want string, search []string) bool {
 		}
 		path = found
 	}
-	if r, err := filepath.EvalSymlinks(path); err == nil {
+	if r, _, err := fspath.Resolve(path); err == nil {
 		path = r
 	}
 	return path == want

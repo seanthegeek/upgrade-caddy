@@ -24,6 +24,7 @@ import (
 
 	"github.com/seanthegeek/upgrade-caddy/internal/build"
 	"github.com/seanthegeek/upgrade-caddy/internal/caddybin"
+	"github.com/seanthegeek/upgrade-caddy/internal/fspath"
 	"github.com/seanthegeek/upgrade-caddy/internal/pkgmgr"
 	"github.com/seanthegeek/upgrade-caddy/internal/systemd"
 )
@@ -518,43 +519,15 @@ func Resolve(ctx context.Context, opts Options) (*Plan, error) {
 
 // resolveTarget follows symlinks from the requested path to the file that
 // will actually be replaced. A missing final path is a first install; a
-// symlink whose referent is missing is followed too, so the first install
-// lands where the link points and the link then works, instead of the
-// link itself being taken for the target and refused by swap after the
-// build.
+// symlink whose referent is missing is followed too (fspath.Resolve), so
+// the first install lands where the link points and the link then works,
+// instead of the link itself being taken for the target and refused by
+// swap after the build. systemd matches ExecStart paths the same way, so
+// the unit running such a link is found.
 func resolveTarget(path string) (real string, exists bool, err error) {
-	return resolveTargetDepth(path, 0)
-}
-
-func resolveTargetDepth(path string, depth int) (real string, exists bool, err error) {
-	real, err = filepath.EvalSymlinks(path)
-	if errors.Is(err, os.ErrNotExist) {
-		// Resolve the directory so a first install into a symlinked
-		// directory still lands in the real one.
-		dir, err := filepath.EvalSymlinks(filepath.Dir(path))
-		if err != nil {
-			return "", false, fmt.Errorf("%s: %w", filepath.Dir(path), err)
-		}
-		final := filepath.Join(dir, filepath.Base(path))
-		if fi, err := os.Lstat(final); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			// A dangling link: follow it by hand, relative links from the
-			// link's own directory, and resolve from there.
-			if depth >= 40 {
-				return "", false, fmt.Errorf("%s: too many levels of symbolic links", path)
-			}
-			dest, err := os.Readlink(final)
-			if err != nil {
-				return "", false, err
-			}
-			if !filepath.IsAbs(dest) {
-				dest = filepath.Join(dir, dest)
-			}
-			return resolveTargetDepth(dest, depth+1)
-		}
-		return final, false, nil
-	}
-	if err != nil {
-		return "", false, err
+	real, exists, err = fspath.Resolve(path)
+	if err != nil || !exists {
+		return real, exists, err
 	}
 	fi, err := os.Stat(real)
 	if err != nil {
@@ -599,7 +572,9 @@ func validationsFromUnits(units []systemd.Unit) []Validation {
 		}
 		// Two units reading one config as different users are two
 		// validations: what the file looks like depends on who opens it.
-		key := strings.Join(append([]string{cfg, adapter, u.WorkingDirectory, u.User, u.Group, strings.Join(u.SupplementaryGroups, " ")}, env...), "\x00")
+		// DynamicUser= changes the account too (such a unit is validated
+		// as the inspection account), so it is part of the key.
+		key := strings.Join(append([]string{cfg, adapter, u.WorkingDirectory, u.User, u.Group, strings.Join(u.SupplementaryGroups, " "), strconv.FormatBool(u.DynamicUser)}, env...), "\x00")
 		if seen[key] {
 			continue
 		}

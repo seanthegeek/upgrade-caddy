@@ -50,13 +50,20 @@ only state that matters, and the tool is built around that.
   minutes old by then), and moves it and `<output>.lock.json` into place
   as a pair (`commitOutput`: whatever was there before is moved aside and
   put back if either rename fails, so the output never holds a binary
-  beside another build's lockfile).
+  beside another build's lockfile; the error says "restored" only when
+  both files came back, and otherwise where each one is).
 - `internal/caddybin` inspects a Caddy binary: Go build info read straight
   from the file, plus `caddy version` and `caddy list-modules` run as
   subprocesses.
 - `internal/goproxy` `@latest` lookups and newer-major probing against a Go
   module proxy.
-- `internal/semver` version comparison, including Go pseudo-versions.
+- `internal/semver` version comparison, including Go pseudo-versions, and
+  `IsFull`, which tells a version spelled out in full from a prefix such
+  as `v1.2` (a query to `go get`, not a version).
+- `internal/fspath` resolves a path through symbolic links, following a
+  final link whose referent does not exist yet; `install` uses it for the
+  target and `systemd` for `ExecStart` paths, so both land on the same
+  file.
 - `internal/pkgmgr` asks dpkg, rpm, pacman, apk, Homebrew or FreeBSD `pkg`
   which package owns a file, failing closed when none can say.
 - `internal/systemd` finds service units whose `ExecStart` runs a binary,
@@ -173,7 +180,11 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    must be a canonical version for the path (`module.Check` and
    `module.CanonicalVersion` agreeing); a short form like `v1.2` is a
    broken proxy, since `go get` would resolve it to `v1.2.0` and `verify`
-   would then reject the build. One lookup is
+   would then reject the build. The same goes for user input: a
+   `--caddy-version` or `--with` version must be spelled out in full
+   (`semver.IsFull`), because to `go get` a prefix like `v2.11` means "the
+   highest v2.11.x" (Go modules reference, "Version queries"), which a
+   plan cannot pin; branch names and commit hashes still pass through. One lookup is
    made per Go module, however many Caddy modules it registers. Lookups
    use the proxy's optional
    `@latest` endpoint and do not apply retractions, and the newer-major
@@ -199,9 +210,11 @@ These are implemented in `internal/install`; keep them true.
 - The target is resolved through symlinks first and the real file is what
   is replaced; hard-linking and renaming a symlink would leave the referent
   and every service executing it on the old binary. A link whose referent
-  does not exist yet is followed by hand (relative links from the link's
-  directory, chains and loops handled), so a first install lands where
-  the link points rather than taking the link itself for the target.
+  does not exist yet is followed too (`fspath.Resolve`: relative links
+  from the link's directory, chains and loops handled), so a first install
+  lands where the link points rather than taking the link itself for the
+  target, and `systemd.UnitsUsing` resolves `ExecStart` paths the same way
+  so the unit running that link is found, validated and restarted.
   `swap` refuses a symlink as a second line of defence.
 - The new binary is produced or staged in the target's own directory, the
   current one is hard-linked to `<target>.previous`, then the new one is

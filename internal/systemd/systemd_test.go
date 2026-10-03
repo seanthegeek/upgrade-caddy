@@ -234,6 +234,10 @@ func TestResolvesBareName(t *testing.T) {
 	caddy := filepath.Join(bin, "caddy")
 	os.WriteFile(caddy, []byte("x"), 0o755)
 	want, _ := filepath.EvalSymlinks(caddy)
+	linkToCaddy := filepath.Join(bin, "link")
+	os.Symlink("caddy", linkToCaddy)
+	dangling := filepath.Join(bin, "dangling")
+	os.Symlink("caddy-next", dangling)
 	// A non-executable file earlier in the path is skipped, as systemd
 	// skips it; a relative entry is ignored; an absent name never matches.
 	os.WriteFile(filepath.Join(sbin, "caddy"), []byte("x"), 0o644)
@@ -249,7 +253,15 @@ func TestResolvesBareName(t *testing.T) {
 		{"bare name, no search path", "caddy", nil, false},
 		{"bare name, only the non-executable copy", "caddy", []string{sbin}, false},
 		{"absolute path ignores the search path", caddy, nil, true},
+		{"link to the binary", linkToCaddy, nil, true},
+		{"dangling link to the future binary, other target", dangling, nil, false},
 		{"relative path with a slash is not searched", "bin/caddy", search, false},
+	}
+	// A unit whose ExecStart is a link to a binary that is about to be
+	// installed for the first time is found when the install target
+	// resolves to the same future file.
+	if !resolves(dangling, filepath.Join(bin, "caddy-next"), nil) {
+		t.Error("a dangling ExecStart link must match the future binary it points to")
 	}
 	for _, c := range cases {
 		if got := resolves(c.path, want, c.search); got != c.want {

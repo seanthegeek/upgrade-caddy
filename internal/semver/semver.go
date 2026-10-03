@@ -31,6 +31,15 @@ func IsValid(v string) bool {
 	return xsemver.IsValid(Canonical(v))
 }
 
+// IsFull reports whether v is a valid semantic version spelled out in full
+// (major, minor and patch), as module.CanonicalVersion would leave it. A
+// short form such as "v1.2" is valid to the semver package but is a prefix
+// query to the go command, not a version.
+func IsFull(v string) bool {
+	v = Canonical(v)
+	return xsemver.IsValid(v) && module.CanonicalVersion(v) == v
+}
+
 // IsPseudo reports whether v is a Go pseudo-version (e.g.
 // v0.0.0-20240814120000-0123456789ab), which means the module was pinned
 // to an untagged commit. Build metadata such as +incompatible or Go 1.24's
