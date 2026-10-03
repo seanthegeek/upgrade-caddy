@@ -278,6 +278,15 @@ func resolves(path, want string, search []string) bool {
 				found = candidate
 				break
 			}
+			// Nothing there yet, but the binary about to be installed
+			// would be: that is where systemd will find the name once it
+			// exists, unless an earlier directory holds one by then. A
+			// first install's unit is found this way, and build refuses
+			// an output path a bare-name unit would start using.
+			if r, exists, err := fspath.Resolve(candidate); err == nil && !exists && r == want {
+				found = candidate
+				break
+			}
 		}
 		if found == "" {
 			return false

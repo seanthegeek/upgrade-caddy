@@ -85,6 +85,20 @@ func TestLoadEnvironmentMergeOrder(t *testing.T) {
 			t.Errorf("a required %s file must be an error", name)
 		}
 	}
+	// Within one optional glob, a bad file is passed over and the good
+	// matches still count, as systemd checks "ignore" per matched file.
+	globDir := t.TempDir()
+	os.WriteFile(filepath.Join(globDir, "a.conf"), []byte("A=a\n"), 0o644)
+	os.WriteFile(filepath.Join(globDir, "b.conf"), []byte("B=\xff\n"), 0o644)
+	os.WriteFile(filepath.Join(globDir, "c.conf"), []byte("C=c\n"), 0o644)
+	u = Unit{EnvironmentFiles: []EnvFile{{Path: filepath.Join(globDir, "*.conf"), Optional: true}}}
+	if got, err := LoadEnvironment(u); err != nil || !reflect.DeepEqual(got, []string{"A=a", "C=c"}) {
+		t.Errorf("one bad file in an optional glob must not drop the others: %q %v", got, err)
+	}
+	u.EnvironmentFiles[0].Optional = false
+	if _, err := LoadEnvironment(u); err == nil || !strings.Contains(err.Error(), "b.conf") {
+		t.Errorf("required, the bad file is an error naming it: %v", err)
+	}
 	if got, err := LoadEnvironment(Unit{}); err != nil || len(got) != 0 {
 		t.Errorf("no settings, no variables: %q %v", got, err)
 	}

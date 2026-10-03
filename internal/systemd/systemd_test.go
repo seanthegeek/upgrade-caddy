@@ -304,6 +304,21 @@ func TestResolvesBareName(t *testing.T) {
 	if !resolves(dangling, filepath.Join(bin, "caddy-next"), nil) {
 		t.Error("a dangling ExecStart link must match the future binary it points to")
 	}
+	// So is a bare name whose future file is the install target: systemd
+	// will find it in that directory once it exists. An executable of that
+	// name earlier in the search path still wins, and a future file in
+	// another directory than the target's is not it.
+	future := filepath.Join(bin, "caddy-new")
+	if !resolves("caddy-new", future, []string{sbin, bin}) {
+		t.Error("a bare name must match the target about to be installed in its search path")
+	}
+	os.WriteFile(filepath.Join(sbin, "caddy-new"), []byte("x"), 0o755)
+	if resolves("caddy-new", future, []string{sbin, bin}) {
+		t.Error("an existing executable earlier in the search path wins over the future target")
+	}
+	if resolves("caddy-new", filepath.Join(dir, "elsewhere", "caddy-new"), []string{bin}) {
+		t.Error("a future file outside the search path is not a match")
+	}
 	for _, c := range cases {
 		if got := resolves(c.path, want, c.search); got != c.want {
 			t.Errorf("%s: resolves(%q)=%v want %v", c.name, c.path, got, c.want)

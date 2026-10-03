@@ -79,7 +79,12 @@ only state that matters, and the tool is built around that.
   bare executable name in `ExecStart` (`caddy run`, allowed since systemd
   239) is looked up the way systemd does before running it: in the unit's
   `ExecSearchPath=` when set, else systemd's compiled-in default path
-  (`systemd-path search-binaries-default`), never the unit's `PATH`.
+  (`systemd-path search-binaries-default`), never the unit's `PATH`. A
+  directory on that path holding no such executable yet still matches
+  when the file that would be there is the install target, so a first
+  install finds its bare-name unit and `build` refuses an output path
+  such a unit would start using; an executable earlier on the path still
+  wins.
 - `README.md` user-facing docs.
 - `.github/workflows/ci.yml` runs the hermetic checks on every push to
   main and every pull request, then `ci/integration.sh` on throwaway Ubuntu
@@ -140,7 +145,15 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    `/vN` module path are one major: `check` counts it once, and `--with`
    may move a plugin installed at `vN+incompatible` to the `/vN` path
    without `--allow-major`, because the installed version's major, not
-   the path's, is the one being left.
+   the path's, is the one being left. The xcaddy library cannot request
+   such a module as installed: its `versionedModulePath` (builder.go,
+   v0.4.7) appends `/vN` to any path not already ending in one when the
+   version's major is 2 or more, so a bare path at `vN+incompatible` or a
+   `gopkg.in/name.vN` path would be requested from a different module.
+   `Resolve` refuses those (`xcaddyRepresentable`) before any build, with
+   the `--with <path>/vN@<version>` move as the hint for the bare-path
+   case; `check` still reports them. A documented limitation, not a bug
+   to paper over.
 4. **Never use Caddy's download/build server.** Builds go through the xcaddy
    library on the local machine. The build server is the thing upstream is
    removing.
@@ -189,7 +202,9 @@ These are deliberate decisions, several made for supply-chain reasons. Don't
    so `GOPRIVATE=` cannot hide a persisted private pattern, while a value
    that is only whitespace is set: `proxyList` trims entries, not the
    value, so `GOPROXY=" "` is "contains no entries", never the default
-   public proxy. The file is
+   public proxy. The request URL is built as `newProxyRepo` builds it, by
+   parsing the base and appending the module path to its path, so a base
+   with a query string keeps it as a query. The file is
    read whole and split by line as `readEnvFile` does, never with a
    scanner whose token limit would drop a long line. An `@latest` answer
    must be a canonical version for the path (`module.Check` and
@@ -232,8 +247,10 @@ These are implemented in `internal/install`; keep them true.
   `Account.Apply` leaves an environment the caller composed alone. A
   required `EnvironmentFile=` that is missing, relative, unreadable or
   unparsable is a refusal; an optional "-" one is skipped on any of
-  those, as `exec_context_load_environment` in `src/core/execute.c`
-  continues past every error of an "ignore" entry. Files are read when
+  those, per matched file, so one bad file in an optional glob does not
+  drop the others, as `exec_context_load_environment` in
+  `src/core/execute.c` continues past every error of an "ignore" entry
+  inside its loop over the matches. Files are read when
   `validate` runs, so an edit during the build is seen. `Environment=`
   and `EnvironmentFiles=` come from D-Bus for a matched unit; when the
   bus cannot be read and `systemctl show` rendered settings, that is an

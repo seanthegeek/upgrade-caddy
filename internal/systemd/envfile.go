@@ -33,11 +33,8 @@ type EnvFile struct {
 func LoadEnvironment(u Unit) ([]string, error) {
 	env := MergeEnv(nil, u.Environment)
 	for _, f := range u.EnvironmentFiles {
-		vars, err := loadEnvFile(f.Path)
+		vars, err := loadEnvFile(f.Path, f.Optional)
 		if err != nil {
-			if f.Optional {
-				continue
-			}
 			return nil, fmt.Errorf("EnvironmentFile=%s: %w", f.Path, err)
 		}
 		env = MergeEnv(env, vars)
@@ -46,26 +43,45 @@ func LoadEnvironment(u Unit) ([]string, error) {
 }
 
 // loadEnvFile reads every file an EnvironmentFile= pattern matches, merged
-// in order.
-func loadEnvFile(pattern string) ([]string, error) {
+// in order. For an optional setting every failure is skipped where systemd
+// skips it: a relative or unmatched pattern yields nothing, and one matched
+// file that cannot be read or parsed is passed over while the others still
+// count (exec_context_load_environment checks "ignore" inside its loop
+// over the matches). For a required setting each is an error.
+func loadEnvFile(pattern string, optional bool) ([]string, error) {
 	if !filepath.IsAbs(pattern) {
+		if optional {
+			return nil, nil
+		}
 		return nil, errors.New("path is not absolute")
 	}
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
+		if optional {
+			return nil, nil
+		}
 		return nil, err
 	}
 	if len(matches) == 0 {
+		if optional {
+			return nil, nil
+		}
 		return nil, os.ErrNotExist
 	}
 	var env []string
 	for _, path := range matches {
 		data, err := os.ReadFile(path)
 		if err != nil {
+			if optional {
+				continue
+			}
 			return nil, err
 		}
 		vars, err := ParseEnvFile(data)
 		if err != nil {
+			if optional {
+				continue
+			}
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		env = MergeEnv(env, vars)

@@ -850,8 +850,13 @@ func TestResolveRefusesVersionPrefixes(t *testing.T) {
 			t.Errorf("--caddy-version %s: got %q %v, want %q", in, p.CaddyVersion, err, want)
 		}
 	}
-	if _, err := resolve(t, installed(), Options{With: []string{"github.com/example/other@v2.0.0+incompatible"}, AllowMajor: true}); err != nil {
+	// +incompatible is a full version to the version rule; what refuses a
+	// bare-path one is xcaddy's path rewriting, named as such.
+	if err := fullVersion("--with x", "v2.0.0+incompatible"); err != nil {
 		t.Errorf("+incompatible is a full version: %v", err)
+	}
+	if _, err := resolve(t, installed(), Options{With: []string{"github.com/example/other@v2.0.0+incompatible"}, AllowMajor: true}); err == nil || !strings.Contains(err.Error(), "cannot be built with") {
+		t.Errorf("a bare-path +incompatible plugin is refused for xcaddy's sake, not the version's: %v", err)
 	}
 }
 
@@ -865,6 +870,46 @@ func TestAsideNote(t *testing.T) {
 		if got := asideNote(c.bin, c.lock); !strings.Contains(got, c.want) {
 			t.Errorf("%s: %q", name, got)
 		}
+	}
+}
+
+func TestXcaddyRepresentable(t *testing.T) {
+	// xcaddy appends "/vN" to a module path that does not end in it when
+	// the version's major is 2 or more, so these cannot be requested as
+	// installed and are refused before the build.
+	for pkg, ver := range map[string]string{
+		"github.com/example/plugin": "v2.0.0+incompatible",
+		"gopkg.in/yaml.v3":          "v3.0.1",
+		"github.com/example/old":    "v4.1.0+incompatible",
+	} {
+		err := xcaddyRepresentable(pkg, ver)
+		if err == nil || !strings.Contains(err.Error(), "cannot be built with") || !strings.Contains(err.Error(), "xcaddy") {
+			t.Errorf("%s@%s must be refused: %v", pkg, ver, err)
+		}
+	}
+	if err := xcaddyRepresentable("github.com/example/plugin", "v2.0.0+incompatible"); err == nil || !strings.Contains(err.Error(), "--with github.com/example/plugin/v2@") {
+		t.Errorf("a bare +incompatible path gets the /vN hint: %v", err)
+	}
+	// Everything xcaddy passes through unchanged is fine.
+	for pkg, ver := range map[string]string{
+		"github.com/example/plugin":       "v0.9.0",
+		"github.com/example/other":        "v1.3.0",
+		"github.com/example/plugin/v2":    "v2.0.1",
+		"github.com/caddyserver/caddy/v2": "v2.11.6",
+		"github.com/example/branch":       "main",
+		"github.com/example/commit":       "abcdef123456",
+		"github.com/example/pseudo":       "v0.0.0-20260101000000-abcdefabcdef",
+	} {
+		if err := xcaddyRepresentable(pkg, ver); err != nil {
+			t.Errorf("%s@%s must pass: %v", pkg, ver, err)
+		}
+	}
+	// Resolve applies it to the installed set, so the refusal comes
+	// before any build starts.
+	src := installed()
+	src.Plugins[0] = caddybin.Plugin{ModuleID: "x", Package: "github.com/example/plugin", Version: "v2.0.0+incompatible"}
+	if _, err := resolve(t, src, Options{}); err == nil || !strings.Contains(err.Error(), "cannot be built with") {
+		t.Errorf("an installed plugin xcaddy cannot request must be refused: %v", err)
 	}
 }
 

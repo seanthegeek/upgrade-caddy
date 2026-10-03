@@ -96,6 +96,31 @@ func client(goproxy, noProxy string) *Client {
 	return &Client{Sources: ParseGOPROXY(goproxy), NoProxy: noProxy}
 }
 
+func TestProxyURLKeepsQuery(t *testing.T) {
+	// The go command appends the module path to the base URL's path, so a
+	// base with a query string (an access token, say) still asks for
+	// <base path>/<module>/@latest?<query>.
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		w.Write([]byte(`{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := client(srv.URL+"/base/?token=abc", "")
+	if _, err := c.Latest(context.Background(), "example.com/M"); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/base/example.com/!m/@latest" || gotQuery != "token=abc" {
+		t.Errorf("request went to %q?%s, want /base/example.com/!m/@latest?token=abc", gotPath, gotQuery)
+	}
+	if u, err := proxyURL("https://proxy.example/p", "example.com/m/@latest"); err != nil || u != "https://proxy.example/p/example.com/m/@latest" {
+		t.Errorf("plain base: %q %v", u, err)
+	}
+	if _, err := proxyURL("https://user:hunter2@[::1/", "x"); err == nil || strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("an unparsable base is an error that does not echo it: %v", err)
+	}
+}
+
 func TestLatestAndNotFound(t *testing.T) {
 	srv := newServer(t, map[string]string{"/example.com/m/@latest": "v1.2.3"})
 	ctx := context.Background()

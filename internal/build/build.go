@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -138,6 +139,47 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	}
 	res, err := plan.Build(ctx, opts)
 	return plan, res, err
+}
+
+// xcaddyRepresentable refuses a module that the xcaddy library would not
+// request as given. Its versionedModulePath (builder.go, v0.4.7) appends
+// "/vN" to any module path that does not already end in "/vN" when the
+// version's major is 2 or more, so a bare path at vN+incompatible would be
+// requested from "<path>/vN", a module that may not exist or may be
+// different code, and a gopkg.in path spelling its major as ".vN" would
+// become "<path>.vN/vN". Neither can be reproduced through xcaddy, and a
+// plan that cannot be built is refused here rather than after the build
+// fails or verify rejects the result. A branch or commit is left alone by
+// xcaddy and passes.
+func xcaddyRepresentable(pkg, version string) error {
+	major := semver.Major(version)
+	if major < 2 {
+		return nil
+	}
+	suffix := fmt.Sprintf("/v%d", major)
+	if strings.HasSuffix(pkg, suffix) {
+		return nil
+	}
+	hint := ""
+	if !strings.Contains(version, "+incompatible") {
+		hint = ""
+	} else if _, pathMajor := goproxy.SplitMajor(pkg); pathMajor == 1 {
+		hint = fmt.Sprintf("; if the module also publishes a %s%s path, --with %s%s@<version> moves to it within the same major", pkg, suffix, pkg, suffix)
+	}
+	return fmt.Errorf("%s@%s cannot be built with %s: it would request %s%s instead, because xcaddy adds the major version to any module path that does not end in %s%s", pkg, version, xcaddyVersion(), pkg, suffix, suffix, hint)
+}
+
+// xcaddyVersion names the xcaddy library this binary was built with, for
+// messages about its behaviour.
+func xcaddyVersion() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, d := range bi.Deps {
+			if d.Path == "github.com/caddyserver/xcaddy" {
+				return "xcaddy " + d.Version
+			}
+		}
+	}
+	return "the xcaddy library"
 }
 
 // fullVersion refuses a semantic version that is not spelled out in full.
@@ -431,6 +473,13 @@ func Resolve(ctx context.Context, src *caddybin.Info, opts Options) (*Plan, erro
 	}
 
 	p.AllowMajor = opts.AllowMajor
+
+	// xcaddy must be able to ask for exactly these modules.
+	for _, pl := range p.Plugins {
+		if err := xcaddyRepresentable(pl.Package, pl.Version); err != nil {
+			return nil, err
+		}
+	}
 
 	// Output path. Never the binary we are reproducing.
 	out := opts.Output

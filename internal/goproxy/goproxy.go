@@ -246,8 +246,10 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 			err = perr
 		} else if isFile {
 			info, err = c.fetchFile(dir+"/"+escaped+"/@latest", modPath)
+		} else if u, uerr := proxyURL(s.URL, escaped+"/@latest"); uerr != nil {
+			err = uerr
 		} else {
-			info, err = c.fetch(ctx, s.URL+"/"+escaped+"/@latest", modPath)
+			info, err = c.fetch(ctx, u, modPath)
 		}
 		if err == nil {
 			// A proxy answer that is not a canonical version compatible
@@ -276,6 +278,22 @@ func (c *Client) Latest(ctx context.Context, modPath string) (Info, error) {
 		return Info{}, err
 	}
 	return Info{}, lastErr
+}
+
+// proxyURL joins a proxy endpoint onto a GOPROXY base the way the go
+// command does (newProxyRepo and getBody in cmd/go/internal/modfetch/
+// proxy.go): the base is parsed and the endpoint appended to its path, so
+// a base carrying a query string keeps it as a query instead of having the
+// module path glued onto it. The base is referred to by position in errors,
+// since url.Parse's error echoes its input, credentials included.
+func proxyURL(base, endpoint string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", errors.New("GOPROXY entry is not a valid URL")
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/" + endpoint
+	u.RawPath = ""
+	return u.String(), nil
 }
 
 func (c *Client) fetch(ctx context.Context, url, modPath string) (Info, error) {
